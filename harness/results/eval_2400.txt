@@ -1,0 +1,5 @@
+                                   strong      mid         weak        madLo  madHi  noise-false  candidates   time
+dump1090-fa 2.4 (reference)         94.8%/0     94.3%/0     36.5%/0     1623   1516    1      nan/s     4.3s
+new 2.4 demodulator (default)       96.0%/0     96.1%/0     36.8%/0     1646   1571    0     1950/s     2.6s
++ soft rescue                       96.2%/0     96.4%/0     43.4%/0     1715   1685    0     1950/s     3.0s
++ soft + 2-bit, known-address gate  96.0%/0     96.1%/0     36.8%/0     1755   1718    0     1950/s     3.0s

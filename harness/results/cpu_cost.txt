@@ -1,0 +1,24 @@
+Decoder cost in instructions per input sample (2026-11-10)
+
+Method: valgrind --tool=callgrind on host builds (x86-64), total instructions
+minus a start-up-only run, divided by the number of input samples. Inputs:
+1 s of pure noise (sigma 7.8 LSB per rail) and a 1 s simulated scenario with
+1481 messages, each resampled to the decoder's rate through the 8-bit model.
+
+                                         noise    busy
+ours, 2.0 Msps, -O2                         50      47
+ours, 2.0 Msps, -Og (firmware setting)      54      50
+dump1090-fa demodulator, 2.4 Msps, -O3      76      77
+
+Where ours spends it (busy, -O2): IQ-to-magnitude conversion 49.6 %,
+preamble scan / bit slicing (mode_s_detect) 44.8 %, frame decode and CRC 1.7 %.
+
+Per second: ours 2.0 Msps x 48 = 96 M instructions; reference 2.4 Msps x 77 =
+184 M (1.9x). These are x86 instruction counts, not ESP32-P4 cycles.
+
+New 2.4 Msps demodulator (mode_s_2400.c), same method, -O2:
+                                         noise    busy
+first version (16-chip timing correlation on every gated sample)   114     120
+final (sliding gate, joint gate, pulse-energy ranking,
+       full preamble test on the best two offsets)                  70      77
+Per second: 2.4 Msps x ~74 = 177 M instructions, 1.8x the 2.0 Msps demodulator.

@@ -15,11 +15,9 @@ menu "Example Configuration"
         string "Set an upper cased letter on which the drive will accessible (e.g. 65 for 'A')"
         default "65"
 
-    # 外部解码图片缓冲空间设置大小为：宽度 × 高度 × 4
+    # External decode image cache: width x height x 4
     config LV_CACHE_DEF_SIZE
         string "Default image cache size. 0 to disable caching"
-        # # H0405S002T002-V0
-        # default "2522880"
         # H0410S001AMT001-V0
         default "2799104"
 
@@ -122,107 +120,59 @@ menu "Example Configuration"
             bool "t_display_p4_keyboard"
     endchoice
 
-    choice
-        prompt "Select the example to build"
-        default EXAMPLE_BUILD_LVGL_9_UI
-            config EXAMPLE_BUILD_AW86224
-                bool "aw86224"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_BQ27220
-                bool "bq27220"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_DEEP_SLEEP
-                bool "deep_sleep"
-                depends on BOARD_TYPE_T_DISPLAY_P4 || BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-            config EXAMPLE_BUILD_ES8311
-                bool "es8311"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_ES8311_SD_WAV
-                bool "es8311_sd_wav"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_ESP32C6_AT_HOST_SDIO_UART
-                bool "esp32c6_at_host_sdio_uart"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_ESP32C6_AT_HOST_SDIO_WIFI
-                bool "esp32c6_at_host_sdio_wifi"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_SCREEN_CAMERA
-                bool "screen_camera"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_SCREEN_LVGL
-                bool "screen_lvgl"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_SCREEN_LVGL_TOUCH_DRAW
-                bool "screen_lvgl_touch_draw"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_ICM20948
-                bool "icm20948"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_IIC_SCAN
-                bool "iic_scan"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_L76K
-                bool "l76k"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_LVGL_9_UI
-                bool "lvgl_9_ui"
-                depends on BOARD_TYPE_T_DISPLAY_P4 || BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-            config EXAMPLE_BUILD_PCF8563
-                bool "pcf8563"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_SGM38121
-                bool "sgm38121"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_SX1262_GFSK_SEND_RECEIVE
-                bool "sx1262_gfsk_send_receive"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_SX1262_LORA_SEND_RECEIVE
-                bool "sx1262_lora_send_receive"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_SX1262_TX_CONTINUOUS_WAVE
-                bool "sx1262_tx_continuous_wave"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_TUSB_SERIAL_DEVICE
-                bool "tusb_serial_device"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_XL9535
-                bool "xl9535"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_AFE
-                bool "afe"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_RADIOLIB_SX1262_SEND_RECEIVE
-                bool "radiolib_sx1262_send_receive"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_ESP_HOSTED_MCU_SDIO_WIFI
-                bool "esp_hosted_mcu_sdio_wifi"
-                depends on BOARD_TYPE_T_DISPLAY_P4
-            config EXAMPLE_BUILD_XL9555
-                bool "xl9555"
-                depends on BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-            config EXAMPLE_BUILD_TCA8418
-                bool "tca8418"
-                depends on BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-            config EXAMPLE_BUILD_RADIOLIB_CC1101_SEND_RECEIVE
-                bool "radiolib_cc1101_send_receive"
-                depends on BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-            config EXAMPLE_BUILD_RADIOLIB_NRF24L01_SEND_RECEIVE
-                bool "radiolib_nrf24l01_send_receive"
-                depends on BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-            config EXAMPLE_BUILD_ST25R3916
-                bool "st25r3916"
-                depends on BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-            config EXAMPLE_BUILD_SCREEN_TCA8418_LVGL_TOUCH_DRAW
-                bool "screen_tca8418_lvgl_touch_draw"
-                depends on BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-            config EXAMPLE_BUILD_BQ25896
-                bool "bq25896"
-                depends on BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
+    choice ADSB_DEMOD
+        prompt "ADS-B demodulator"
+        default ADSB_DEMOD_2400
+        help
+            Which demodulator runs, and with it the RTL-SDR sample rate.
+            See docs/DECODER.md section 5.
+
+        config ADSB_DEMOD_2400
+            bool "2.4 Msps (mode_s_2400.c)"
+            help
+                Slices each bit from fractional sample positions, so frames
+                decode whatever their timing relative to the sample clock.
+                Thresholds are ratios to the noise level, not fixed values.
+                In the harness it decodes about 96% of strong frames (the
+                2.0 Msps demodulator: 68%) and about 60% more frames on a
+                real capture. 20% more USB data and roughly 1.8x the decode
+                CPU of the 2.0 Msps demodulator.
+
+        config ADSB_DEMOD_2000
+            bool "2.0 Msps (original)"
+            help
+                The original two-samples-per-bit demodulator. Cheaper, but
+                loses about a third of frames to sample timing at any
+                signal strength.
     endchoice
 
-    # config ESP_HOSTED_SDIO_GPIO_RESET_SLAVE
-    #     int "CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE"
-    #     default -1
-    #     range -1 -1
+    config ADSB_DECODE_FIX2
+        bool "Extra error correction for extended squitter (experimental)"
+        default n
+        help
+            Enables exact 2-bit CRC error correction for DF17/DF18 frames,
+            with strict CA/CF field validation and a known-address gate: a
+            repair is accepted only for an aircraft that was heard
+            error-free within the last 60 seconds, so repairs extend
+            existing tracks and never create one.
+
+            With the 2.4 Msps demodulator it also enables the soft rescue:
+            a frame that fails its CRC is repaired if flipping some of its
+            eight least confident bits, and only those, accounts exactly
+            for the CRC error. Same known-address gate.
+
+            Measured in harness/ (see docs/DECODER.md): about +7% frames on
+            a real capture at 2.4 Msps, no false decodes in simulation. Off
+            by default until it has been soaked on hardware.
+
+    # adsb-scope: this repo builds exactly one application.  The upstream
+    # LilyGo tree offered ~30 examples here; the historical sdkconfig
+    # selector CONFIG_EXAMPLE_BUILD_LVGL_9_UI is gone — see VENDOR.md.
+    choice
+        prompt "Select the application to build"
+        default EXAMPLE_BUILD_ADSB_RECEIVER
+        config EXAMPLE_BUILD_ADSB_RECEIVER
+            bool "adsb_receiver (ADS-B Scope)"
+    endchoice
 
 endmenu

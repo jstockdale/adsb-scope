@@ -1,0 +1,12 @@
+(Recorded output of the run of 2026-11-10; this file was re-created from that record after a
+sandbox reset, not from a new run. Regenerate: experiments/prep_2400.py, then experiments/toa_error.py.)
+time-of-arrival error vs simulator truth; one 12 MHz tick = 83.3 ns; timing quantised to 1 tick has a floor of 24.1 ns rms
+[strong]
+  new 2.4 Msps demodulator   n= 1323  spread  59.4 ns rms (robust  52.2)  95% within  131.2 ns  off by >3 ticks:  0.0%  (constant offset +2.17 ticks)
+  dump1090-fa (reference)    n= 1307  spread  49.8 ns rms (robust  49.6)  95% within  105.9 ns  off by >3 ticks:  0.0%  (constant offset +2400.19 ticks)
+[mid]
+  new 2.4 Msps demodulator   n= 1373  spread  52.9 ns rms (robust  48.7)  95% within  113.7 ns  off by >3 ticks:  0.0%  (constant offset +2.26 ticks)
+  dump1090-fa (reference)    n= 1346  spread  41.1 ns rms (robust  40.6)  95% within   80.1 ns  off by >3 ticks:  0.0%  (constant offset +2400.60 ticks)
+[weak]
+  new 2.4 Msps demodulator   n=  508  spread  41.7 ns rms (robust  42.6)  95% within   83.8 ns  off by >3 ticks:  0.0%  (constant offset +2.35 ticks)
+  dump1090-fa (reference)    n=  504  spread  43.8 ns rms (robust  44.3)  95% within   83.4 ns  off by >3 ticks:  0.0%  (constant offset +2401.15 ticks)

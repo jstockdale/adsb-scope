@@ -1608,6 +1608,27 @@ int rtlsdr_reset_buffer(rtlsdr_dev_t *dev)
     return 0;
 }
 
+/* Continuous capture (usb_stream.h): the reader task's interface to the
+ * bulk endpoint. */
+int rtlsdr_stream_start(struct rtlsdr_dev *dev, adsb_stream_cb_t cb, void *ctx)
+{
+    if (!dev || !dev->driver_obj)
+        return -1;
+    return esp_libusb_stream_start(dev->driver_obj, 0x81, cb, ctx);
+}
+
+void rtlsdr_stream_poll(struct rtlsdr_dev *dev, uint32_t timeout_ticks)
+{
+    if (dev && dev->driver_obj)
+        esp_libusb_stream_poll(dev->driver_obj, timeout_ticks);
+}
+
+void rtlsdr_stream_stop(struct rtlsdr_dev *dev)
+{
+    if (dev && dev->driver_obj)
+        esp_libusb_stream_stop(dev->driver_obj);
+}
+
 int rtlsdr_read_sync(rtlsdr_dev_t *dev, void *buf, int len, int *n_read)
 {
     if (!dev)

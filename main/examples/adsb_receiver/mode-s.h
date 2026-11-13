@@ -1,14 +1,29 @@
+#pragma once
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <math.h>
 #include <sys/time.h>
+#include <time.h>
 
 #define MODE_S_ICAO_CACHE_LEN 1024 // Power of two required
 #define MODE_S_LONG_MSG_BYTES (112 / 8)
 #define MODE_S_UNIT_FEET 0
 #define MODE_S_UNIT_METERS 1
+
+// Streaming detection (mode_s_detect_stream): magnitude samples carried
+// between chunks = one full frame ((8 us preamble + 112 us payload) at
+// 2 samples/us) + 2 samples of look-behind for the out-of-phase test.
+// The caller's magnitude buffer must hold MODE_S_STREAM_TAIL + chunk/2.
+#define MODE_S_STREAM_TAIL 242
+
+// 2.4 Msps demodulator (mode_s_2400.c). A frame is 120 us = 288 samples;
+// MODE_S_2400_SPAN is how far past its first sample the demodulator may read.
+#define MODE_S_2400_SPAN 296
+#define MODE_S_STREAM_TAIL_2400 (MODE_S_2400_SPAN + 2)
+// Largest tail of any demodulator: size magnitude buffers with this.
+#define MODE_S_STREAM_TAIL_MAX MODE_S_STREAM_TAIL_2400
 
 // Program state
 typedef struct
@@ -34,6 +49,48 @@ typedef struct
     // SNR proxy — higher = cleaner signal. Noise floor at 2550 (10×255).
     // Divide sum by stat_crc_ok for average.
     volatile uint64_t stat_delta_sum;
+
+    // ---- decoder-m1090 extensions -------------------------------------
+    // Every field below is 0 after mode_s_init(), and with all of them 0
+    // the decoder behaves exactly as it did historically (apart from the
+    // DF18/DF24+ frame-length fix, see MODE_S_DF18_FIX in mode-s.c).
+    int fix2;                // Exact 2-bit correction for DF17/18 (independent of 'aggressive')
+    int strict_es;           // Reject DF17/18 frames whose CA/CF field holds a reserved value
+    int fix2_known_icao;     // Accept a 2-bit repair only for an address recently heard error-free
+    int pass_df18;           // Deliver DF18 frames to the callback (default: decode and count only)
+    uint32_t fix2_min_delta; // Min per-frame bit delta (same scale as the stat_delta_sum terms;
+                             // the detector's own floor is 2550) to attempt a 2-bit repair. 0 = ungated
+    uint32_t last_delta;        // Set by mode_s_detect(): bit delta of the frame being decoded
+    uint32_t last_frame_offset; // Set by mode_s_detect(): index of that frame's preamble in mag[]
+    volatile uint32_t stat_fix1;           // frames repaired by 1-bit correction
+    volatile uint32_t stat_fix2;           // frames repaired by 2-bit correction
+    volatile uint32_t stat_fix2_icao_rej;  // 2-bit repairs refused by fix2_known_icao
+    volatile uint32_t stat_strict_rej;     // CRC-ok frames refused by strict_es
+    volatile uint32_t stat_df18;           // CRC-ok DF18 frames decoded (delivered or not)
+    volatile uint32_t stat_df18_cf[8];     // ... by CF field: 0/1 ADS-B from non-transponder devices
+                                           // (ICAO / other address), 2/3/5 TIS-B (fine / coarse / fine
+                                           // with non-ICAO address), 4 management, 6 ADS-R, 7 reserved
+    volatile uint64_t stat_fail_delta_sum; // sum of bit deltas of CRC-failed frames (noise reference)
+
+    // Streaming state, owned by mode_s_detect_stream()
+    uint32_t detect_start;   // mode_s_detect() starts scanning at this index, then clears it
+    uint32_t detect_resume;  // set by mode_s_detect(): samples by which the scan overran its limit
+    uint32_t stream_tail;    // magnitude samples carried at the front of the stream buffer
+    uint64_t stream_samples; // IQ samples consumed since mode_s_stream_reset()
+    uint32_t cache_clock_rate; // 0: the ICAO cache ages by wall-clock time (default);
+                               // otherwise by the sample count, at this many samples a second
+    uint64_t stream_base;    // absolute sample index of mag[0] in the current stream call
+
+    // 2.4 Msps demodulator (mode_s_2400.c). Defaults set by mode_s_init().
+    uint16_t d24_gate_x100;  // preamble gate: each pulse pair over the quiet level, x100
+    uint16_t d24_gate2_x100; // preamble gate: mean of the four pulse pairs over the quiet level, x100
+    uint16_t d24_pre_x100;   // preamble accept: pulse-chip mean over quiet-chip mean, x100
+    uint8_t d24_tries;       // sub-sample timing offsets sliced per candidate (1-5)
+    uint8_t soft_fix;        // soft rescue: how many least-confident bits it may flip among
+                             // (0 = off, max 8). DF17/18 only; honours fix2_known_icao.
+    volatile uint32_t stat_soft_fix; // frames repaired by the soft rescue
+    uint8_t last_frame_phase; // set by the 2.4 Msps demodulator with last_frame_offset: the frame's
+                              // sub-sample timing in fifths of a sample (0-4). 0 at 2.0 Msps.
 } mode_s_t;
 
 // The struct we use to store information about a decoded message
@@ -88,4 +145,64 @@ void mode_s_init(mode_s_t *self);
 void mode_s_compute_magnitude_vector(unsigned char *data, uint16_t *mag, uint32_t size);
 void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_callback_t);
 void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg);
+
+// CRC-24 over the whole frame (data + parity), one table step per byte.
+// 0 exactly when the frame is valid; otherwise the error syndrome.
+uint32_t mode_s_crc_syndrome(const unsigned char *msg, int bits);
+
+// Streaming front end. Feed successive chunks of raw IQ (interleaved
+// unsigned 8-bit I,Q). Unlike calling mode_s_compute_magnitude_vector() +
+// mode_s_detect() per chunk, frames that straddle a chunk boundary are
+// decoded, and the result is identical to processing the whole stream as
+// one buffer. 'mag' must persist between calls and hold at least
+// MODE_S_STREAM_TAIL + iq_bytes/2 samples. Call mode_s_stream_reset()
+// whenever the sample stream is discontinuous (start, dongle restart).
+void mode_s_stream_reset(mode_s_t *self);
+void mode_s_detect_stream(mode_s_t *self, unsigned char *iq, uint32_t iq_bytes,
+                          uint16_t *mag, mode_s_callback_t cb);
+
+// How the cache of recently seen ICAO addresses tells time. Normally by
+// the wall clock (sample_rate_hz = 0). When a recording is replayed faster
+// or slower than it was made, the wall clock is the wrong clock: pass the
+// recording's sample rate and the cache ages by samples consumed instead,
+// which also makes a replay give the same result every time. The cache is
+// emptied on every call.
+void mode_s_cache_clock(mode_s_t *self, uint32_t sample_rate_hz);
+
+// The sample stream lost samples at this point (the receiver was not
+// reading, or a buffer overflowed). The carried tail is dropped, so no
+// frame is assembled from samples that were not adjacent on air, and the
+// sample count moves on by lost_samples, so the times of later frames stay
+// on the receiver's sample clock. Pass 0 if the number lost is not known.
+// The frames decoded are exactly those of decoding the two sides of the
+// loss as separate streams (harness/check_stream.py proves it).
+void mode_s_stream_gap(mode_s_t *self, uint64_t lost_samples);
+
+// The same for IQ sampled at 2.4 Msps (mode_s_2400.c). 'mag' must hold
+// MODE_S_STREAM_TAIL_2400 + iq_bytes/2 samples. mode_s_detect_2400() is the
+// one-shot form, the counterpart of mode_s_detect().
+void mode_s_detect_2400(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_callback_t cb);
+void mode_s_detect_stream_2400(mode_s_t *self, unsigned char *iq, uint32_t iq_bytes,
+                               uint16_t *mag, mode_s_callback_t cb);
+
+// Shared with mode_s_2400.c
+int mode_s_msg_len_by_type(int type);
+int icao_addr_was_recently_seen(mode_s_t *self, uint32_t addr);
+
+// Absolute sample index (counted from mode_s_stream_reset) of the preamble
+// of the frame being delivered. Valid inside the callback for frames that
+// arrive via mode_s_detect_stream(). This is the time-of-arrival hook.
+static inline uint64_t mode_s_frame_sample_index(const mode_s_t *self)
+{
+    return self->stream_base + self->last_frame_offset;
+}
+
+// The same instant in 12 MHz ticks (2.4 Msps demodulator: 5 ticks per
+// sample plus the sub-sample timing). This is the clock Beast-format
+// timestamps use; here it marks the START of the preamble, in the
+// receiver's own sample clock, counted from mode_s_stream_reset().
+static inline uint64_t mode_s_frame_ticks_12mhz(const mode_s_t *self)
+{
+    return mode_s_frame_sample_index(self) * 5u + self->last_frame_phase;
+}
 void runme();

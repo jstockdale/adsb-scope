@@ -1,0 +1,41 @@
+[strong 88-100 dB-Hz] 1378 ES truth frames
+  ours 2.0 Msps, single grid                          67.6%           932  false 0
+  ours 2.0 Msps, dual grid (cubic)                    95.9%          1322  false 0
+  ours 2.0 Msps, dual grid (sinc8)                    95.9%          1322  false 0
+  ours 2.0 Msps, single grid +2-bit fix               68.8%           948  false 0
+  ours 2.0 Msps, dual grid (cubic) +2-bit fix          96.2%          1325  false 0
+  ours 2.0 Msps, dual grid (sinc8) +2-bit fix          96.2%          1325  false 0
+  dump1090-fa 2.4 Msps (1-bit fix)                    94.8%          1307  false 0
+  dump1090-fa 2.4 Msps (2-bit fix)                    94.8%          1307  false 0
+[mid 78.5-88 dB-Hz] 1428 ES truth frames
+  ours 2.0 Msps, single grid                          62.3%           890  false 0
+  ours 2.0 Msps, dual grid (cubic)                    89.7%          1281  false 0
+  ours 2.0 Msps, dual grid (sinc8)                    93.1%          1329  false 0
+  ours 2.0 Msps, single grid +2-bit fix               64.1%           915  false 0
+  ours 2.0 Msps, dual grid (cubic) +2-bit fix          92.4%          1319  false 0
+  ours 2.0 Msps, dual grid (sinc8) +2-bit fix          95.0%          1357  false 0
+  dump1090-fa 2.4 Msps (1-bit fix)                    94.3%          1346  false 0
+  dump1090-fa 2.4 Msps (2-bit fix)                    94.3%          1346  false 0
+[weak 70.5-78.5 dB-Hz] 1380 ES truth frames
+  ours 2.0 Msps, single grid                          17.3%           239  false 0
+  ours 2.0 Msps, dual grid (cubic)                    20.0%           276  false 0
+  ours 2.0 Msps, dual grid (sinc8)                    22.8%           315  false 0
+  ours 2.0 Msps, single grid +2-bit fix               20.7%           285  false 0
+  ours 2.0 Msps, dual grid (cubic) +2-bit fix          24.5%           338  false 0
+  ours 2.0 Msps, dual grid (sinc8) +2-bit fix          28.2%           389  false 0
+  dump1090-fa 2.4 Msps (1-bit fix)                    36.5%           504  false 0
+  dump1090-fa 2.4 Msps (2-bit fix)                    36.5%           504  false 0
+auto scale: K=452.9 at 2.0 Msps, K=145.9 at 2.4 Msps
+[madrid.sigmf-meta] (no ground truth)
+  ours 2.0 Msps, single grid                    1018 frames    652 unique  
+  ours 2.0 Msps, dual grid (cubic)              1396 frames    838 unique  
+  ours 2.0 Msps, dual grid (sinc8)              1437 frames    868 unique  
+  ours 2.0 Msps, single grid +2-bit fix         1073 frames    684 unique  
+  ours 2.0 Msps, dual grid (cubic) +2-bit fix    1461 frames    873 unique  
+  ours 2.0 Msps, dual grid (sinc8) +2-bit fix    1522 frames    915 unique  
+  dump1090-fa 2.4 Msps (1-bit fix)              1624 frames    965 unique  
+  dump1090-fa 2.4 Msps (2-bit fix)              1683 frames   1005 unique  
+
+Gain check on the Madrid capture (the auto-scaler chose different gains per rate):
+  dump1090-fa 2.4 Msps at K=453 (the gain our 2.0 run used):   1516 frames, 906 unique (0.33% of rail samples clipped)
+  ours 2.0 Msps at K=146 (the gain the 2.4 run used):           648 frames single grid, 923 dual grid (sinc8)

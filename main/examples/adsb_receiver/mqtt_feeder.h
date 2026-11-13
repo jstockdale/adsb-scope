@@ -1,7 +1,11 @@
 // mqtt_feeder.h — MQTT publisher for ADS-B aircraft data
 //
 // Connects to an MQTT broker over TLS and publishes:
-//   adsb/{device_id}/aircraft  — batched aircraft positions (JSON, QoS 0)
+//   adsb/{device_id}/aircraft  – batched aircraft positions (JSON, QoS 0):
+//                                 every 2 s, the latest state of each aircraft
+//                                 heard since the previous batch, each aircraft
+//                                 once, split over as many messages as needed
+//                                 to keep each one under 4 KB (see mqtt_batch.h)
 //   adsb/{device_id}/status    — receiver status heartbeat (JSON, QoS 1)
 //   adsb/{device_id}/meta      — device metadata on connect (JSON, QoS 1, retained)
 //
@@ -77,7 +81,9 @@ void mqtt_feeder_pause(void);
 // Call from WiFi got-IP handler. Safe to call if not initialized.
 void mqtt_feeder_resume(void);
 
-// Queue an aircraft update from the decode loop.
+// Record the latest state of an aircraft, from the decode loop: call it
+// for every decoded message. Updates for the same aircraft between two
+// batches replace each other, so the batch carries each aircraft once.
 // Returns immediately if not connected — zero overhead on the decode path.
 // Mutex wait is capped at 5ms; drops the update if lock isn't available.
 void mqtt_feeder_update_aircraft(const mqtt_aircraft_t *ac);
@@ -94,6 +100,54 @@ bool mqtt_feeder_is_connected(void);
 // Get the device ID string (e.g. "p4-0ad603404ad3"). Generated from MAC address
 // on first call. Always available, even without WiFi/MQTT.
 const char *mqtt_feeder_device_id(void);
+
+// Publish an acknowledgement for an admin command on adsb/{device_id}/cmd/ack
+// (QoS 1). reason and version may be NULL; version defaults to the running one.
+void mqtt_feeder_publish_ack(const char *cmd, const char *status,
+                             const char *reason, const char *version);
+
+// ─── Counters (shown by the `mqtt status` console command) ───────────────────
+// All counters run from boot and survive stop/init cycles.
+
+typedef struct {
+    // Aircraft updates offered by the decoder while connected
+    uint32_t updates;           // calls accepted for batching
+    uint32_t coalesced;         // ... that replaced an unsent older state of the same aircraft
+    uint32_t dropped_full;      // ... dropped: more aircraft in one interval than there are slots
+    uint32_t dropped_busy;      // ... dropped: feeder lock not available within 5 ms
+
+    // Batches
+    uint32_t flushes;           // non-empty batches
+    uint32_t messages;          // MQTT messages published for them
+    uint64_t bytes;             // JSON payload bytes published
+    uint32_t aircraft_sent;     // aircraft entries published
+    uint32_t aircraft_unsent;   // collected but not sent because a publish failed
+    uint32_t publish_failures;  // publish calls the MQTT client rejected or could not write
+    uint32_t publish_max_ms;    // longest time one publish call blocked
+    uint32_t publish_slow;      // publish calls that blocked for more than 1 s
+    uint32_t flush_gap_max_ms;  // longest time between two batches while connected (nominal 2000)
+    uint32_t last_aircraft;     // the most recent batch: aircraft,
+    uint32_t last_messages;     //                        messages,
+    uint32_t last_bytes;        //                        payload bytes
+
+    // Link
+    uint32_t connects;          // successful connections to the broker
+    uint32_t disconnects;       // established connections lost (broker or network)
+    uint32_t connect_failures;  // connection attempts that did not complete
+    uint32_t wifi_pauses;       // times the client was stopped because WiFi went down
+    uint32_t connected_s;       // how long the current connection has been up, 0 if down
+    uint32_t last_drop_ago_s;   // seconds since a connection was last lost (if any was)
+    uint32_t last_drop_up_s;    // ... and how long that connection had lasted
+    // Details of the MQTT client's most recent error event; 0 = none seen
+    int      last_error_type;   // 1 transport, 2 connection refused, 3 subscribe failed
+    int      last_sock_errno;   // socket errno
+    int      last_tls_err;      // esp-tls error code
+    int      last_tls_stack_err;// TLS library error code
+    int      last_connect_rc;   // CONNACK return code when refused
+    uint32_t last_error_ago_s;  // seconds since that error event
+} mqtt_feeder_stats_t;
+
+void mqtt_feeder_get_stats(mqtt_feeder_stats_t *out);
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,474 @@
+# UPLINK.md – the receiver and its uplink under heavy traffic (r7 to r9)
+
+Status as of 2026-11-13. Sections 1 to 4 were written with r7, section 6
+with r8; section 7 describes r9, which fixes finding 2.2, and section 8
+lists what is planned next. Written in answer to a field report; records what
+the code showed, what r7 changes, what is still not explained, and what to
+capture in the next test. Nothing here has run on a device.
+
+## 1. The report
+
+The unit was receiving more than 100 aircraft, uplinking by MQTT over a 5G
+hotspot. It worked well until the aircraft count passed about 60 to 70;
+above that the uplink was "dropping".
+
+## 2. Findings
+
+Three, in decreasing order of certainty.
+
+### 2.1 The feeder sent 64 messages every 2 s, not 64 aircraft (certain; fixed in r7)
+
+`on_msg()` in `class_driver.c` calls `mqtt_feeder_update_aircraft()` once
+for every decoded message. Up to r6 the feeder appended each call to a
+64-entry buffer (`MAX_AIRCRAFT`), flushed it every 2 s, and dropped
+everything that arrived while it was full. Nothing merged two messages
+from the same aircraft.
+
+So the uplink carried at most 32 messages a second. Past that, each batch
+held the first 64 messages decoded after the previous flush – a short
+slice of the 2 s – and the strong, frequently heard aircraft took most of
+the slots, several times each, while others were absent. The limit is on
+messages, so it is reached well below 64 aircraft; but 64 entries per 2 s
+is also a hard ceiling on how many aircraft can be kept current at that
+rate, and it sits where the report puts the trouble.
+
+`harness/feeder/coverage_sim.py` puts numbers on it
+(`harness/results/feeder_coverage.txt`). It is a model with assumed
+message rates, not a measurement:
+
+| aircraft | old feeder: share of them in an average batch | aircraft with a gap over 30 s between uplinked updates in 10 min (old / what the decoded stream allows) |
+| ---: | ---: | ---: |
+| 40 | 63 % | 6 / 1 |
+| 60 | 49 % | 21 / 7 |
+| 80 | 43 % | 32 / 8 |
+| 100 | 37 % | 48 / 14 |
+| 150 | 30 % | 82 / 18 |
+
+(Rates spread from 0.1 to 6 decoded messages per second per aircraft. With
+every aircraft at 2 per second the shares are 81 %, 66 %, 55 %, 47 %, 35 %
+and no aircraft has a 30 s gap until 150.) Decline is steady, not a cliff;
+whether it looks like one depends on how quickly the consumer drops an
+aircraft it has not heard about.
+
+Once the buffer saturates the feeder's traffic stops growing: 64 entries,
+10.7 kB as one MQTT message every 2 s, measured with ESP-IDF's own cJSON
+for aircraft with every field known (`make old_batch_size` in `harness/`).
+That matters for 2.3.
+
+### 2.2 The receiver is deaf while the decoder works, and the log line is most of that work under load (certain from the code; size not measured)
+
+Not in the MQTT code, but it limits everything the uplink can carry.
+
+- Samples are fetched with one synchronous USB transfer at a time
+  (`esp_libusb_bulk_transfer()`): eight transfers of 16,384 bytes fill a
+  buffer – 27.3 ms of signal at 2.4 Msps – and then `demodulate()` runs
+  in the same task. No transfer is pending while it runs, so the dongle is
+  not read, and what it produces in that time is lost apart from whatever
+  its own small buffer holds. **Time inside the decoder is air time not
+  received.** The `Decode: N% of one core` figure added in r4 is therefore
+  also, roughly, the share of traffic the receiver never sees. The harness
+  figures in `DECODER.md` are for a continuous sample stream.
+- Inside the decoder, `on_msg()` prints one log line per decoded message.
+  The console is UART0 at 115200 baud with no UART driver installed, and
+  in that configuration ESP-IDF writes each character with a busy-wait
+  when the 128-byte transmit FIFO is full (`uart_tx_char()` in
+  `esp_driver_uart/src/uart_vfs.c`, v5.4.1). 115200 baud is 11,520 bytes
+  a second. A line for an aircraft with its full state is 135 to 150
+  bytes: about 12 ms each, about 80 lines a second at most.
+- All lines of one buffer are printed back to back and the FIFO holds less
+  than one line, so every message beyond the first costs about 12 ms of
+  deafness, in addition to the decoding itself, the SD log line and two
+  great-circle calculations.
+
+Worked example, with one assumed number (15 ms of decode time per buffer;
+the real figure is not known) and 140-byte lines:
+
+| decodable messages per second on air | share of air time received | messages decoded per second |
+| ---: | ---: | ---: |
+| 0 | 65 % | – |
+| 100 | 42 % | 42 |
+| 200 | 28 % | 56 |
+| 400 | 17 % | 67 |
+| 800 | 9 % | 74 |
+
+The decoded rate levels off near what the UART can print, whatever the
+traffic. This is progressive too. It is an estimate until r7's `Capture:`
+figure (section 3.3) is read on a device.
+
+In command mode (after Ctrl+C on the console) log lines are held in
+memory instead of printed, so the decoder is not slowed by them. A unit
+left in command mode should receive visibly more than one streaming its
+log.
+
+### 2.3 Not found: a reason for the connection itself to drop
+
+If "dropping" meant the MQTT or WiFi link going down on the device, the
+code does not explain it:
+
+- The feeder's traffic is constant above 32 decoded messages a second
+  (2.1), so nothing about the MQTT connection changes between 20 aircraft
+  and 100.
+- esp-mqtt at the commit ESP-IDF v5.4.1 pins (`cac1552`) fragments large
+  publishes and handles partial writes correctly. It drops the connection
+  only when a write fails, when a write makes no progress for 10 s, or
+  when a PINGRESP is missed.
+- WiFi up/down handling is driven by events only; nothing in it depends on
+  load.
+
+Things that do grow with traffic and that the code cannot rule out: the SD
+log, written per message on SPI beside the SDIO WiFi link (the contention
+`PATCHES.md` describes); internal DMA-capable memory, which the hardware
+AES in TLS needs; the hotspot or the broker. r7 logs enough to tell these
+apart (3.3).
+
+### 2.4 Seen in passing, not changed
+
+- When WiFi drops, `mqtt_feeder_pause()` stops the MQTT client from the
+  system event task. If the feeder is inside a publish that is waiting on
+  the dead link, that call – and every other event handler behind it –
+  waits for the client's 10 s network timeout. A WiFi blip can therefore
+  cost up to 10 s more than it needs to.
+- `aircraft_expire()` in `class_driver.c` is defined and never called;
+  stale table entries are filtered where the table is read.
+
+## 3. What r7 changes
+
+### 3.1 The feeder (`mqtt_batch.c`, `mqtt_feeder.c`)
+
+- **One slot per aircraft.** 256 slots (the size of the decoder's aircraft
+  table), keyed by ICAO address; a later message replaces the aircraft's
+  pending state. A batch carries every aircraft heard since the previous
+  batch exactly once, with its latest state.
+- **Bounded messages.** A batch is serialised into as many MQTT messages
+  as it needs, each a complete JSON document of at most 3,800 bytes: it
+  fits the client's 4,096-byte output buffer, one TLS record and the TCP
+  send buffer in one piece. 100 aircraft are four messages (14 kB), 256
+  are ten (36 kB).
+- No allocation per batch (the old code allocated a copy and a cJSON tree
+  every 2 s); the receiver position is read under its lock; a batch
+  collected before a disconnect is discarded on reconnect instead of being
+  sent stale; if a publish fails the rest of that batch is dropped and
+  counted.
+- `mqtt_feeder_stop()` asks the task to finish and frees its PSRAM stack.
+  It used to delete the task wherever it was – in the middle of a publish
+  that would have left the MQTT client locked – and leaked the stack on
+  every `mqtt` settings change from the console.
+
+`mqtt_batch.c` has no ESP-IDF dependencies and is tested on a PC
+(`make check` in `harness/`): 417 batches, 8,663 messages and 53,103
+aircraft entries – typical, adversarial and random inputs – each parsed
+with Python's JSON parser and checked for one entry per aircraft, key
+order, value ranges and size.
+
+### 3.2 What changes on the wire
+
+Topic, envelope, key names, key order and the rules for when a key is
+present are unchanged. Three things differ, and the consumer should be
+checked against them:
+
+1. **Each aircraft appears at most once per batch.** Before, a busy
+   aircraft could appear several times and others not at all.
+2. **A batch can be several messages**, published back to back on
+   `adsb/<id>/aircraft`, each with its own `rx_lat`/`rx_lon`. A consumer
+   that updates aircraft by `icao` needs no change. One that treats each
+   message as the complete picture would now see partial pictures – though
+   it never received complete ones.
+3. **Numbers are shorter.** `lat`, `lon`, `rx_lat`, `rx_lon` have 6
+   decimals (0.11 m) instead of 15 to 17 significant digits; `dist` has 2.
+   A position that is not a finite coordinate in range is omitted, and so
+   is a non-finite distance.
+
+Kept as it was, though arguably wrong: `hdg` and `brg` are sent as 0 when
+unknown, because the tracker's "unknown" is 0 and the feeder sends
+anything that is not negative.
+
+### 3.3 Counters, so the next test is conclusive
+
+`mqtt status` (console) now also prints:
+
+```
+  Link:      up 512 s; since boot 3 connects, 2 disconnects, 0 failed attempts, 0 WiFi drops
+             last drop 512 s ago, after 1307 s up
+             last error 514 s ago: type 1, errno 113 (...), esp-tls 0x8008, TLS -0x0000, CONNACK 0
+  Updates:   184220 from the decoder, 171003 merged into a pending one, dropped: 0 (slots full) 0 (busy)
+  Batches:   610 sent as 1830 messages, 6582100 bytes; aircraft entries sent 46930, not sent 0
+             last batch: 97 aircraft in 4 messages, 13650 bytes
+  Publish:   0 failed, 0 slow (over 1 s), longest 212 ms; longest gap between batches 2250 ms (nominal 2000)
+```
+
+(Example values.) `disconnects` are broker or network losses with WiFi
+still up; `WiFi drops` are the WiFi layer reporting a disconnect. A long
+`longest` publish or a large gap between batches means the link or the CPU
+was holding the feeder up. On a disconnect the log gains one line with how
+long the link had been up and the state of these counters, and transport
+errors are logged with their errno and TLS codes.
+
+`adsb status` (console) gained a `Capture` figure in r7 and a fuller set
+of lines in r9; they are described in section 7.3. Once a minute the same
+figures go to the log as a `LOAD:` line, so a recorded session shows them
+over time.
+
+## 4. What to capture in the next test
+
+With r9 flashed, in traffic like the reported session:
+
+1. Let it run for a few minutes, then on the console: `adsb status`,
+   `mqtt status`, `top`. Keep the output.
+2. Keep the session log. The lines that matter: `LOAD:` (once a minute),
+   `MQTT: Disconnected from broker` and the `Link was up` line after it,
+   `Transport error` / `Transport detail`, `Slow publish`, `Publish
+   failed`, the `MEM:` heartbeat, and any `WRITE_DIAG` from the SD path.
+3. Note what "dropping" looks like if it happens: aircraft missing or
+   stale on the server while the device shows them, or the device
+   reporting the link down.
+
+Reading the result:
+
+| observation | meaning |
+| --- | --- |
+| `disconnects` stays 0, server tracks the device | 2.1 was the cause |
+| `Capture` near 100 %, `Decode` well under 100 % | r9 works: the receiver hears everything it can decode |
+| `Decode` near 100 %, `Ring` dropping transfers | the decoder cannot keep up on one core: section 8, item 1 |
+| `USB delivered` clearly under 100 %, `endpoint ran dry` climbing | the reader is being held up: section 7.4 |
+| `Log` dropping lines | expected in heavy traffic: the console is full (7.2) |
+| `disconnects` climbing, `WiFi drops` 0 | broker or network: read the error line and `longest` publish |
+| `WiFi drops` climbing | below MQTT: WiFi link, ESP-Hosted, SD/SDIO contention |
+| `dropped (slots full)` not 0 | more than 256 aircraft in 2 s |
+
+## 5. What was agreed after r7
+
+Samples go through a ring buffer in PSRAM, filled by a reader task that
+does nothing else; the log line leaves the decoder task; and internal
+DMA-capable RAM, which is short on this board, is not to grow. r9
+(section 7) does this. A faster console (921,600 baud or more) was left
+for later: it needs the web app to open the port at the same speed.
+
+## 6. Aircraft limits (r8)
+
+The 64 in section 2.1 was the only limit of that size, and r7 removed it.
+r8 brings the remaining limits to one number, `ADSB_MAX_AIRCRAFT` = 256 in
+`class_driver.h`:
+
+| stage | before r8 | from r8 | sized by |
+| --- | ---: | ---: | --- |
+| decoder aircraft table, CPR cache | 256 | 256 | `AIRCRAFT_TABLE_SIZE`, `CPR_CACHE_SIZE` = `ADSB_MAX_AIRCRAFT` |
+| scope: aircraft drawn | 128 | 256 | `MAX_SCOPE_AIRCRAFT` = `ADSB_MAX_AIRCRAFT` |
+| scope: trails kept | 128, never reused | 256, reused | `SCOPE_TRAIL_MAX` |
+| ADS-B app list | about 108 rows | 256 rows | `ADSB_LIST_BUF_SIZE` |
+| MQTT batch | 64 messages (r6), 256 aircraft (r7) | 256 aircraft | `MQTT_BATCH_SLOTS`, checked at compile time |
+
+Beyond 256 live aircraft the decoder evicts the one heard longest ago.
+
+Also fixed: a trail slot, once given to an aircraft, was never released,
+so after 128 different aircraft with a position since boot no new aircraft
+got a trail on the scope. A slot is now reused once its trail has had no
+new point for 180 s, the age at which the scope stops drawing the
+aircraft.
+
+The scope's "Max Aircraft" setting gains 192; "All" now means 256.
+
+Cost. PSRAM: trails 3.7 MB (was 1.85 MB), everything else about 45 kB
+more. `ARCHITECTURE.md` gives about 16 MB of PSRAM free in steady state;
+the `MEM:` heartbeat line shows the real figure. Internal RAM: 10.7 kB
+**less**, because the list buffer and the scope's per-aircraft work arrays
+moved from internal `.bss` to PSRAM (`EXT_RAM_BSS_ATTR`; placement checked
+in the linked image). This is the first use of PSRAM-placed static data in
+this firmware. It is a standard ESP-IDF feature that the configuration
+already enabled, and it has not run on the device.
+
+Not measured: how long the scope takes to draw 256 aircraft. Each one is a
+dot, a heading line and a text label, and trail drawing is budgeted, so
+the cost should grow roughly in proportion; the scope lowers its own frame
+rate when a frame takes long (down to 1 per second), and the info line
+shows the rate. If it is too slow at full load, "Max Aircraft" caps it.
+
+## 7. Continuous capture (r9)
+
+Fixes finding 2.2. Up to r8 one task read 27 ms of samples and then
+decoded them, and the dongle was not read while it decoded or printed.
+
+### 7.1 The sample path
+
+```
+dongle --USB--> 3 transfers, always queued --> reader task --> ring (PSRAM, 1.08 MB) --> decoder task
+```
+
+- **USB (`usb_stream.h`, `esp_libusb.c`).** Three transfers of 5,632
+  bytes are kept queued on the bulk endpoint and each is queued again
+  from its completion callback. The host controller driver starts the
+  next queued transfer from its interrupt handler (`hcd_dwc.c`, ESP-IDF
+  v5.4.1), so the dongle is read without a break as long as the reader
+  task answers within two transfer periods, 2.3 ms. The three use 16.9 kB
+  of DMA-capable internal RAM where the single transfer before used
+  17.4 kB.
+- **Reader task** (the former read-and-decode task, now priority 11). It
+  copies each finished transfer into the ring and queues the transfer
+  again, about 850 times a second, and makes the tuner and bias-T writes
+  other tasks ask for. Nothing else. The USB host library task, which
+  hands it the transfers, moves from priority 4 to 12 so that MQTT (5) and
+  audio (6) cannot hold either of them up.
+- **Ring (`sample_ring.c`).** 192 slots, one transfer each: 225 ms of
+  signal. One writer, one reader, no lock. The decoder works on the
+  samples in place, so there is one copy between the USB buffer and the
+  decoder where there were two. When the ring is full the newest transfer
+  is dropped and counted.
+- **Decoder task** (new, priority 3, PSRAM stack). Takes runs of up to 23
+  transfers from the ring and decodes them; runs the adaptive gain loop.
+  If it cannot keep up it still rests for one tick every 200 ms, so it
+  never holds a core for good.
+- **Losses are declared, not hidden.** A dropped transfer, or the endpoint
+  running dry, is passed to the decoder as a gap with the number of
+  samples lost (exact for the ring, an estimate for USB). The decoder then
+  restarts cleanly – it does not build a frame from samples that were not
+  adjacent on air – and its sample count moves on by that number, so frame
+  times stay on the sample clock (`mode_s_stream_gap()`). Before r9 the
+  gaps between reads were invisible to it.
+
+### 7.2 The log line
+
+`on_msg()` no longer writes to the console. Its lines – one per message,
+plus the `ICAO:`, `CPR:`, `DF18:` and `LOAD:` lines – go into a 16 kB
+queue and a task of their own (priority 2) writes them. The line format
+and time stamps are unchanged; the stamp is taken when the message is
+decoded. The console UART is polled, so a writer that simply printed
+would spin on it and take a core from the display whenever the log is
+busy; this one works out when the UART will have room for the next line
+and sleeps until then.
+
+**What changes for anything reading the log:** when messages arrive
+faster than the console carries them (about 80 lines a second at 115200
+baud), the queue fills and lines are dropped and counted. Before r9 every
+decoded message was printed, because the decoder slowed down to the
+console's speed and lost the radio samples instead. The SD log, the
+display and the MQTT feeder get every message.
+
+**What changes for the SD log:** it now records every decoded message, so
+in heavy traffic it grows several times faster than before.
+
+### 7.3 `adsb status`
+
+```
+  Decode:    43.0% of one core, peak 61.2% (last 5 s; must stay under 100% to keep up; 'top' shows all tasks)
+             of which SD log 1.9%
+  Capture:   99.8% of air time decoded, lowest 97.3% (USB delivered 99.8%)
+  USB:       3 transfers queued, endpoint ran dry 14 times
+  Ring:      4% full now, 31% at most; 0 transfers dropped; 14 gaps passed to the decoder
+  Log:       79 lines/s, 11020 B/s written (console carries 11520 B/s); dropped 18230, 1240 in the last 5 s
+```
+
+(Example values, not measurements.) `Capture` is measured: sample bytes
+that reached the decoder against what the dongle produces at the
+configured rate. `USB delivered` is the same ratio taken where the
+transfers arrive. The `LOAD:` log line, once a minute, carries the same
+figures.
+
+### 7.4 Not verified
+
+Nothing here has run on the device. What the code cannot tell:
+
+- **Whether the decoder keeps up.** It needs less than one second of one
+  core per second of signal. The instruction counts in `DECODER.md` 5.5
+  suggest it does, with unknown margin; `Decode` shows it. If it does not,
+  the ring overflows steadily and `Capture` settles at whatever the
+  decoder can manage – still far more than before r9 in traffic.
+- **Whether 2.3 ms is enough for the reader.** Tasks above it can still
+  delay it: the network stack, the ESP-Hosted tasks, and timer callbacks
+  (the scope's once-a-second trail recorder runs there and takes the
+  aircraft lock). Flash writes stop everything for their duration. Each
+  such delay costs a millisecond or two and is counted as `endpoint ran
+  dry`. If the count is high, a fourth transfer (5.6 kB more DMA RAM) buys
+  another 1.2 ms.
+- **The three-transfer allocation at boot** fits the 20 kB hole the
+  firmware reserves for it; with fewer than three the firmware runs and
+  says so in the boot log (`only N of 3 bulk transfers allocated`).
+- **Behaviour on unplugging the dongle, on `adsb off`, and in USB mass
+  storage mode**: the stream is cancelled, the decoder task is stopped and
+  the device closed, in that order. Reviewed, not exercised.
+- **Gain changes on the RTL-SDR Blog V4**, whose control requests stall
+  and are retried with a 50 ms wait: the stream is kept fed during the
+  wait, but each gain step may still cost a few milliseconds.
+
+Tested on a PC (`make check` in `harness/`): the ring – directed cases, a
+random run against a model, and a two-thread run in which the writer
+outruns the reader on purpose, checking that every byte delivered is the
+right one and every byte not delivered is covered by a declared gap of
+exactly that size; and `mode_s_stream_gap()` – at both sample rates, five
+loss patterns and three chunk sizes the frames decoded are identical to
+decoding the two sides of the loss as separate streams.
+
+## 8. Planned next
+
+The plan is in `ROADMAP-AVIATION.md` section 5.0, which is the single
+plan: r11 update slots, crash dumps and sealed commands; r12 WiFi
+self-healing and several saved networks; r13 whatever r9's numbers call
+for on the capture path; r14 console speed; then the instrument work.
+
+## 9. Instruments for testing (r10)
+
+### 9.1 `diag`
+
+One console command that prints, between `===== DIAG BEGIN =====` and
+`===== DIAG END =====`: firmware version, the reason for the last reset,
+how often the task watchdog fired, memory, GPS, `adsb status`, the last
+replay, `mqtt status`, `wifi status` (no passwords), `top`, and the
+checks below. A field report is that block and the session log.
+
+### 9.2 The checks
+
+`diag` ends with the pass criteria proposed in `ROADMAP-AVIATION.md` 5.0,
+evaluated on the device:
+
+```
+  Checks over the last 01:02:11 – proposed pass criteria (docs/ROADMAP-AVIATION.md 5.0)
+  [PASS] capture never below 99.0% (lowest 99.6%)
+  [FAIL] decode never above 80.0% of one core (peak 91.2%)
+  [PASS] no transfers dropped by the ring (0)
+  [INFO] endpoint ran dry 14 times; 1820 log lines dropped
+  [PASS] no MQTT disconnects (0; WiFi drops 0, failed publishes 0)
+  [PASS] task watchdog has not fired since boot (0)
+```
+
+(Example values.) They cover the time since `diag mark`, since the last
+replay, or since boot, whichever is latest; run `diag mark` when the test
+conditions are in place. The thresholds are constants at the top of the
+`diag` code in `serial_console.c`.
+
+### 9.3 Replay: `adsb replay <file>`
+
+Feeds a recording from the SD card through the sample ring, the decoder
+and the tracker in place of the dongle. The file is raw unsigned 8-bit
+I/Q at 2.4 Msps – what the capture block in `ROADMAP-AVIATION.md` 5.1
+writes (`rtl_sdr -s 2400000`). `adsb replay` with no argument shows
+progress, `adsb replay stop` ends it, and the result is logged:
+
+```
+REPLAY: /sdcard/adsb-capture-2400.cu8: 288000000 bytes, 60.0 s of signal, 61234 messages, decoder busy 23400 ms = 39.0% of one core at real time, 0 transfers dropped, took 183 s
+```
+
+(Example values.) What it gives:
+
+- **What decoding costs**, at a known input: decoder time against the
+  length of the recording. Under 100 % of one core means the decoder
+  keeps up with a live dongle in that traffic; the margin is how much
+  busier it can get.
+- **A repeatable test of the r9 path.** The file is fed only as fast as
+  the decoder takes it, so nothing is dropped, and the cache of recently
+  seen addresses is aged by the recording's sample count instead of the
+  wall clock. The same file gives the same message count every time.
+- **A cross-check against the PC.** In `harness/`:
+  `./host_mode_s FILE --rate 2.4 --stream 1 --df18 0 --cache-clock 1 | grep -c '^MSG'`
+  runs the same decoder on the same samples. The device's count should
+  equal it, less any frames with an all-zero address. I expect equality
+  and have not seen it demonstrated; a difference would be a finding.
+
+While a replay runs: live samples are discarded (the dongle keeps being
+read); nothing is sent to MQTT, written to the SD log or printed per
+message; the adaptive gain loop is paused; the aircraft on the display are
+the recording's. The aircraft table is cleared when it starts and when it
+ends, and the checks of 9.2 restart when it ends. It needs the receiver
+running – the dongle attached – because it borrows its decoder. The card
+delivers samples more slowly than the dongle does, so a minute of
+recording takes several minutes to replay.
+
+Not verified: any of it on a device, as before. In particular how fast
+the card reads, and that live reception resumes cleanly afterwards.

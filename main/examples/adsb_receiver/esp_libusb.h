@@ -1,4 +1,5 @@
 #include "usb/usb_host.h"
+#include "usb_stream.h"
 
 #ifndef portMAX_DELAY
 #define portMAX_DELAY (TickType_t)0xffffffffUL
@@ -31,7 +32,8 @@ typedef struct
     bool is_success;
     bool stall_detected;    // EP0 STALL detected — needs pipe recovery
     int bytes_transferred;
-    usb_transfer_t *transfer;      // bulk transfer - allocated once, never freed
+    usb_transfer_t *transfer;      // first stream transfer (also serves the synchronous read)
+    usb_transfer_t *stream_xfer[ADSB_USB_XFER_COUNT]; // bulk transfers - allocated once, never freed
     usb_transfer_t *ctrl_transfer; // control transfer - pre-allocated once in init_adsb_dev
 } class_adsb_dev;
 
@@ -43,3 +45,6 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
 int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout);
 void esp_libusb_get_string_descriptor_ascii(const usb_str_desc_t *str_desc, char *str);
 void alloc_adsb_transfer(void);
+int  esp_libusb_stream_start(class_driver_t *driver_obj, unsigned char endpoint, adsb_stream_cb_t cb, void *ctx);
+void esp_libusb_stream_poll(class_driver_t *driver_obj, uint32_t timeout_ticks);
+void esp_libusb_stream_stop(class_driver_t *driver_obj);

@@ -1,8 +1,21 @@
-.devcontainer
-.vscode
-build
+build/
+managed_components/
 sdkconfig
 sdkconfig.old
-dependencies.lock
-managed_components
+latest.version.json
+__pycache__/
+*.pyc
+.vscode/
+.devcontainer/
 .clangd
+
+# harness build products
+harness/host_mode_s
+harness/host_mode_s_df18off
+harness/host_mode_s_baseline
+harness/test_fix_c
+harness/test_batch
+harness/test_ring
+harness/old_batch_size
+harness/*.so
+harness/results/work/

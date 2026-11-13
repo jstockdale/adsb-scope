@@ -145,7 +145,83 @@ typedef struct {
     uint32_t avg_signal;        // avg preamble signal level of CRC-ok messages (0–65167)
     uint32_t avg_delta;         // avg bit delta / SNR proxy of CRC-ok messages (noise floor ~2550)
     char     dongle_model[64];  // human-readable RTL-SDR dongle description (e.g. "RTL-SDR Blog V4 (R828D)")
+    // DF18: extended squitter from non-transponder sources. Decoded and
+    // counted since the receiver started; not shown as aircraft.
+    uint32_t df18_total;        // all CRC-ok DF18 frames
+    uint32_t df18_last_min;     // ... in the most recent complete 60 s window
+    uint32_t df18_tisb;         // CF 2/3/5: TIS-B (radar targets relayed by ground stations)
+    uint32_t df18_adsr;         // CF 6: ADS-R (ground rebroadcast of traffic on another link)
+    uint32_t df18_adsb_nt;      // CF 0/1: ADS-B from non-transponder devices
+    uint32_t df18_other;        // CF 4 (TIS-B/ADS-R management) and CF 7 (reserved)
+    float    decode_load;       // share of one core spent in the decoder, 0.0-1.0: wall time
+                                // inside demodulate() over the last ~5 s (includes any time the
+                                // decoder task was preempted there, so it is an upper bound).
+                                // The decoder keeps up with the dongle as long as this stays
+                                // below 1.0.
+    float    sdlog_load;        // ... of which in the SD log
+    float    peak_decode_load;  // highest decode_load of any window since boot
+    // How much of the air time reaches the decoder. Samples flow
+    //   dongle -> USB transfers -> ring (PSRAM) -> decoder
+    // and can be lost in two places: at the dongle, if no USB transfer is
+    // pending (usb_capture below 1.0, usb_starved counting the events), and
+    // at the ring, if the decoder falls behind by more than it holds
+    // (ring_dropped). capture is what is left after both.
+    float    capture;           // sample bytes decoded / produced at the sample rate, last ~5 s
+    float    usb_capture;       // sample bytes received over USB / produced, last ~5 s
+    float    min_capture;       // lowest capture of any window since boot
+    uint32_t usb_xfers;         // USB transfers kept queued (ADSB_USB_XFER_COUNT unless memory was short)
+    uint32_t usb_starved;       // times the endpoint was found with no transfer pending, since boot
+    uint32_t ring_fill_pct;     // ring in use now
+    uint32_t ring_max_pct;      // ... and the most it has ever been
+    uint32_t ring_dropped;      // USB transfers dropped because the ring was full, since boot
+    uint32_t stream_gaps;       // losses the decoder was told about (it restarts cleanly after each)
+    // The log: one line per message, written by its own task. When the
+    // console cannot take them all, lines are dropped, not samples.
+    uint32_t log_lines_s;       // lines written per second, last ~5 s
+    uint32_t log_bytes_s;       // ... and bytes, line endings included
+    uint32_t log_dropped;       // lines dropped since boot
+    uint32_t log_dropped_win;   // ... of which in the last ~5 s
+    // The extremes above (peak_decode_load, min_capture) and the three
+    // counts below run from the last adsb_stats_mark(), or from boot.
+    uint32_t mark_age_s;        // seconds since the mark
+    uint32_t ring_dropped_mark; // transfers dropped by the ring since the mark
+    uint32_t usb_starved_mark;  // endpoint found dry since the mark
+    uint32_t log_dropped_mark;  // log lines dropped since the mark
 } adsb_stats_t;
+
+// Start a fresh observation period: the extremes and the "since the mark"
+// counts in adsb_stats_t restart from now. Used by `diag mark`, and after a
+// replay, which distorts them.
+void adsb_stats_mark(void);
+
+// ---- Replay: a recorded sample file decoded on the device ----
+// The file is raw unsigned 8-bit I/Q at ADSB_SAMPLE_RATE (what `rtl_sdr`
+// writes). It is fed through the sample ring to the decoder and tracker in
+// place of the dongle, as fast as the SD card delivers it and never faster
+// than the decoder takes it, so nothing is dropped and the same file gives
+// the same result every time. While it runs: live samples are discarded,
+// nothing is sent to MQTT or written to the SD log or the serial log, the
+// adaptive gain loop is paused, and the aircraft on screen are the
+// recording's. The receiver must be running (dongle attached): the replay
+// borrows its decoder.
+typedef struct {
+    bool     running;
+    bool     done;            // a replay has finished (see ok / error)
+    bool     ok;
+    char     path[128];
+    char     error[64];
+    uint64_t file_bytes;
+    uint64_t fed_bytes;
+    uint32_t signal_ms;       // length of what was fed, at the sample rate
+    uint32_t wall_ms;         // how long the replay took
+    uint32_t decode_busy_ms;  // time spent inside the decoder for it
+    uint32_t messages;        // messages decoded
+    uint32_t ring_dropped;    // must be 0
+} adsb_replay_status_t;
+
+bool adsb_replay_start(const char *path, char *err, size_t err_len);
+void adsb_replay_stop(void);
+void adsb_replay_get(adsb_replay_status_t *out);
 
 extern adsb_stats_t adsb_get_stats(void);
 
@@ -185,8 +261,19 @@ extern void adsb_set_bias_tee(bool on);
 // Free bulk transfer on disconnect — allows re-alloc on reconnect
 extern void free_adsb_transfer(void);
 
+// How many aircraft the device handles at a time. One number for the whole
+// chain – tracked by the decoder, drawn on the scope, listed in the ADS-B
+// app, uplinked in one MQTT batch – so that no stage silently shows or
+// sends fewer than the one before it.
+#define ADSB_MAX_AIRCRAFT 256
+
 // Aircraft data for scope radar display
-#define MAX_SCOPE_AIRCRAFT 128
+#define MAX_SCOPE_AIRCRAFT ADSB_MAX_AIRCRAFT
+
+// Text buffer for adsb_format_aircraft_list(): one row of ADSB_LIST_ROW_LEN
+// characters per aircraft, plus the margin the formatter keeps free.
+#define ADSB_LIST_ROW_LEN  37
+#define ADSB_LIST_BUF_SIZE (ADSB_MAX_AIRCRAFT * ADSB_LIST_ROW_LEN + 128)
 
 typedef struct {
     uint32_t icao;

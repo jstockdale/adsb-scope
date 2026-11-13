@@ -95,7 +95,12 @@ meshy_channel_store_t g_meshy_channels;
 #include "screenshot.h"
 
 #define CONFIG_APP_QUIT_PIN 0
-#define HOST_LIB_TASK_PRIORITY 4
+// The USB host library task passes every finished sample transfer to the
+// ADS-B reader task, about 850 times a second, and a delay of more than
+// 2 ms there loses samples (usb_stream.h). It was 4, where MQTT (5) and
+// audio (6) could hold it up; it now runs above the application tasks and
+// below the network stack. Its work per transfer is a few microseconds.
+#define HOST_LIB_TASK_PRIORITY 12
 #define CLASS_TASK_PRIORITY 4
 #define APP_QUIT_PIN CONFIG_APP_QUIT_PIN
 
@@ -1809,6 +1814,16 @@ void device_at_task(void *arg)
                     (unsigned long)stats.total_messages, stats.msg_rate);
                 status_str += buf;
 
+                // DF18 (TIS-B / ADS-R / non-transponder ADS-B): counted, not shown as aircraft
+                snprintf(buf, sizeof(buf), "\nDF18: %lu  (%lu in last min)\n  TIS-B %lu  ADS-R %lu  NT %lu\n",
+                    (unsigned long)stats.df18_total, (unsigned long)stats.df18_last_min,
+                    (unsigned long)stats.df18_tisb, (unsigned long)stats.df18_adsr,
+                    (unsigned long)stats.df18_adsb_nt);
+                status_str += buf;
+
+                snprintf(buf, sizeof(buf), "\nDecode load: %.0f%% of one core\n", stats.decode_load * 100.0f);
+                status_str += buf;
+
                 // Aircraft count
                 snprintf(buf, sizeof(buf), "\nAircraft tracked: %d\n", stats.active_aircraft);
                 status_str += buf;
@@ -1870,7 +1885,9 @@ void device_adsb_app_task(void *arg)
 
     // Buffers for formatting — allocated once on task stack
     static char stats_buf[512];
-    static char list_buf[4096];
+    // One row per aircraft, up to ADSB_MAX_AIRCRAFT. In PSRAM: it was 4 kB
+    // of internal RAM for about 108 rows.
+    static EXT_RAM_BSS_ATTR char list_buf[ADSB_LIST_BUF_SIZE];
 
     size_t cycle_time = 0;
 
@@ -1901,6 +1918,11 @@ void device_adsb_app_task(void *arg)
                 pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
                     "\nAircraft: %d   Messages: %lu",
                     stats.active_aircraft, (unsigned long)stats.total_messages);
+
+                // DF18 (TIS-B / ADS-R / non-transponder ADS-B): counted, not shown as aircraft
+                pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                    "\nDF18: %lu  (%lu/min)",
+                    (unsigned long)stats.df18_total, (unsigned long)stats.df18_last_min);
 
                 // GPS line
                 if (rx.fix_valid) {

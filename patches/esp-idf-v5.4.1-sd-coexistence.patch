@@ -1,0 +1,469 @@
+diff --git a/components/esp_driver_sdmmc/src/sdmmc_host.c b/components/esp_driver_sdmmc/src/sdmmc_host.c
+index ac8f00b..79f42cc 100644
+--- a/components/esp_driver_sdmmc/src/sdmmc_host.c
++++ b/components/esp_driver_sdmmc/src/sdmmc_host.c
+@@ -1112,8 +1112,21 @@ esp_err_t sdmmc_host_io_int_wait(int slot, TickType_t timeout_ticks)
+  * may be dropped. We ignore this problem for now, since the there are no other
+  * interesting events which can get lost due to this.
+  */
++// ── ADS-B Scope: ISR diagnostics ─────────────────────────────────────
++static volatile uint32_t s_sdmmc_isr_count = 0;
++static volatile int64_t  s_sdmmc_isr_last_us = 0;
++
++void sdmmc_host_get_isr_stats(uint32_t *count, int64_t *last_us)
++{
++    if (count)   *count   = s_sdmmc_isr_count;
++    if (last_us) *last_us = s_sdmmc_isr_last_us;
++}
++
+ static void sdmmc_isr(void *arg)
+ {
++    s_sdmmc_isr_count++;
++    s_sdmmc_isr_last_us = esp_timer_get_time();
++
+     QueueHandle_t queue = (QueueHandle_t) arg;
+     sdmmc_event_t event;
+     int higher_priority_task_awoken = pdFALSE;
+@@ -1195,3 +1208,71 @@ esp_err_t sdmmc_host_get_state(sdmmc_host_state_t* state)
+ #endif
+     return ESP_OK;
+ }
++
++// ── ADS-B Scope: SDHOST interrupt masking for SPI coexistence ────────
++//
++// On ESP32-P4 with ESP-Hosted (SDIO) and SD card (GP-SPI3), the SDHOST
++// ISR can fire during a GP-SPI3 polling transaction, causing a
++// portYIELD_FROM_ISR() that disrupts the SPI master's internal state
++// (host->polling / cur_cs tracking), resulting in ESP_ERR_INVALID_STATE.
++//
++// These functions allow the SD card driver to mask the SDHOST interrupt
++// during SPI transactions.  The C6 buffers outbound data, and the
++// SDHOST peripheral latches pending interrupts — nothing is lost,
++// just delayed by the duration of the SPI transaction (~20ms max).
++
++esp_err_t sdmmc_host_intr_disable(void)
++{
++    if (s_host_ctx.intr_handle) {
++        return esp_intr_disable(s_host_ctx.intr_handle);
++    }
++    return ESP_ERR_INVALID_STATE;
++}
++
++esp_err_t sdmmc_host_intr_enable(void)
++{
++    if (s_host_ctx.intr_handle) {
++        return esp_intr_enable(s_host_ctx.intr_handle);
++    }
++    return ESP_ERR_INVALID_STATE;
++}
++
++bool sdmmc_host_is_idmac_idle(void)
++{
++    if (!s_host_ctx.hal.dev) return true;  // not initialized
++
++    // IDSTS[16:13] = DMAC FSM state.  0 = DMA_IDLE.
++    uint32_t idsts = s_host_ctx.hal.dev->idsts.val;
++    uint32_t fsm = (idsts >> 13) & 0xF;
++
++    // Also check if card data lines are busy
++    bool data_busy = s_host_ctx.hal.dev->status.data_busy;
++
++    return (fsm == 0) && !data_busy;
++}
++
++// ── ADS-B Scope: SDHOST quiesce/resume for SD write protection ──────
++// Disable the IDMAC DMA engine at the hardware level to eliminate
++// SDHOST AXI bus traffic during GP-SPI3 SD card writes.  Even with
++// IDMAC idle (FSM state 0), the DMA engine's bus interface may still
++// poll for new descriptors.  Disabling BMOD.enable truly silences it.
++//
++// Card clock is NOT touched — the clock update pseudo-command times out
++// when the CIU is in certain states, causing 0x107 errors on every
++// flush.  The card clock doesn't generate AXI bus traffic anyway (it's
++// internal to the SDHOST peripheral).
++//
++// Call quiesce AFTER verifying IDMAC is idle and holding the DMA fence.
++// Call resume BEFORE unmasking the ISR and releasing the DMA fence.
++
++void sdmmc_host_quiesce(void)
++{
++    if (!s_host_ctx.hal.dev) return;
++    sdmmc_ll_enable_dma(s_host_ctx.hal.dev, false);
++}
++
++void sdmmc_host_resume(void)
++{
++    if (!s_host_ctx.hal.dev) return;
++    sdmmc_ll_enable_dma(s_host_ctx.hal.dev, true);
++}
+\ No newline at end of file
+diff --git a/components/esp_driver_sdspi/src/sdspi_host.c b/components/esp_driver_sdspi/src/sdspi_host.c
+index f532dd4..7f110e8 100644
+--- a/components/esp_driver_sdspi/src/sdspi_host.c
++++ b/components/esp_driver_sdspi/src/sdspi_host.c
+@@ -67,6 +67,22 @@ static const char *TAG = "sdspi_host";
+ static const bool use_polling = true;
+ static const bool no_use_polling = true;
+ 
++// ── Garbled response detection ──────────────────────────────────────
++// Set when the SD card returns a data response token that is not a valid
++// SPI protocol value AND not 0xFF (busy).  A garbled response (e.g. 0x80)
++// means AXI bus contention corrupted the SPI transaction — the card's
++// internal state is unknown.  The diskio layer checks this to skip
++// retries and trigger a power cycle instead.
++static volatile bool s_sdspi_garbled_response = false;
++
++bool sdspi_host_had_garbled_response(void) {
++    return s_sdspi_garbled_response;
++}
++
++void sdspi_host_clear_garbled_flag(void) {
++    s_sdspi_garbled_response = false;
++}
++
+ /// Functions to send out different kinds of commands
+ static esp_err_t start_command_read_blocks(slot_info_t *slot, sdspi_hw_cmd_t *cmd,
+                                            uint8_t *data, uint32_t rx_length, bool need_stop_command);
+@@ -784,7 +800,8 @@ static esp_err_t start_command_read_blocks(slot_info_t *slot, sdspi_hw_cmd_t *cm
+             .tx_buffer = rx_data
+         };
+ 
+-        ret = spi_device_transmit(slot->spi_handle, &t_data);
++        // Receive data block — polling mode for deterministic AXI timing
++        ret = spi_device_polling_transmit(slot->spi_handle, &t_data);
+         if (ret != ESP_OK) {
+             return ret;
+         }
+@@ -845,6 +862,11 @@ static esp_err_t start_command_read_blocks(slot_info_t *slot, sdspi_hw_cmd_t *cm
+  * That's why we need ``multi_block``.
+  * It's also different that stop transmission token is not needed in the SDIO mode.
+  */
++// ── ADS-B Scope: diagnostics for SPI/SDHOST coexistence ─────────────
++// Tracks which SPI transaction step fails and correlates with SDHOST ISR
++// activity.  Strip when SD stability is confirmed.
++extern void sdmmc_host_get_isr_stats(uint32_t *count, int64_t *last_us);
++
+ static esp_err_t start_command_write_blocks(slot_info_t *slot, sdspi_hw_cmd_t *cmd,
+                                             const uint8_t *data, uint32_t tx_length, bool multi_block, bool stop_trans)
+ {
+@@ -852,6 +874,11 @@ static esp_err_t start_command_write_blocks(slot_info_t *slot, sdspi_hw_cmd_t *c
+         ESP_LOGW(TAG, "%s: card write protected", __func__);
+         return ESP_ERR_INVALID_STATE;
+     }
++
++    uint32_t isr_count_start = 0;
++    int64_t  isr_last_start  = 0;
++    sdmmc_host_get_isr_stats(&isr_count_start, &isr_last_start);
++
+     // Send the minimum length that is sure to get the complete response
+     // SD cards always return R1 (1bytes), SDIO returns R5 (2 bytes)
+     const int send_bytes = SDSPI_CMD_R5_SIZE + SDSPI_NCR_MAX_SIZE - SDSPI_NCR_MIN_SIZE;
+@@ -863,6 +890,12 @@ static esp_err_t start_command_write_blocks(slot_info_t *slot, sdspi_hw_cmd_t *c
+     };
+     esp_err_t ret = spi_device_polling_transmit(slot->spi_handle, &t_command);
+     if (ret != ESP_OK) {
++        uint32_t isr_now; int64_t isr_last;
++        sdmmc_host_get_isr_stats(&isr_now, &isr_last);
++        ESP_LOGE(TAG, "WRITE_DIAG: step=CMD polling_tx err=0x%x "
++                 "isr_delta=%lu isr_last=%lldus_ago",
++                 ret, (unsigned long)(isr_now - isr_count_start),
++                 (long long)(esp_timer_get_time() - isr_last));
+         return ret;
+     }
+ 
+@@ -884,6 +917,12 @@ static esp_err_t start_command_write_blocks(slot_info_t *slot, sdspi_hw_cmd_t *c
+         };
+         ret = spi_device_polling_transmit(slot->spi_handle, &t_start_token);
+         if (ret != ESP_OK) {
++            uint32_t isr_now; int64_t isr_last;
++            sdmmc_host_get_isr_stats(&isr_now, &isr_last);
++            ESP_LOGE(TAG, "WRITE_DIAG: step=TOKEN polling_tx err=0x%x "
++                     "isr_delta=%lu isr_last=%lldus_ago",
++                     ret, (unsigned long)(isr_now - isr_count_start),
++                     (long long)(esp_timer_get_time() - isr_last));
+             return ret;
+         }
+ 
+@@ -901,13 +940,22 @@ static esp_err_t start_command_write_blocks(slot_info_t *slot, sdspi_hw_cmd_t *c
+             tx_data = tmp;
+         }
+ 
+-        // Write data
++        // Write data block — polling mode avoids the GDMA completion
++        // interrupt, making the transfer more deterministic and reducing
++        // interrupt sources during the AXI-contention-sensitive write.
+         spi_transaction_t t_data = {
+             .length = will_send * 8,
+             .tx_buffer = tx_data,
+         };
+-        ret = spi_device_transmit(slot->spi_handle, &t_data);
++        ret = spi_device_polling_transmit(slot->spi_handle, &t_data);
+         if (ret != ESP_OK) {
++            uint32_t isr_now; int64_t isr_last;
++            sdmmc_host_get_isr_stats(&isr_now, &isr_last);
++            ESP_LOGE(TAG, "WRITE_DIAG: step=DATA poll_tx err=0x%x "
++                     "isr_delta=%lu isr_last=%lldus_ago bounce=%d",
++                     ret, (unsigned long)(isr_now - isr_count_start),
++                     (long long)(esp_timer_get_time() - isr_last),
++                     (tx_data != data) ? 1 : 0);
+             return ret;
+         }
+ 
+@@ -924,27 +972,56 @@ static esp_err_t start_command_write_blocks(slot_info_t *slot, sdspi_hw_cmd_t *c
+ 
+         ret = spi_device_polling_transmit(slot->spi_handle, &t_crc_rsp);
+         if (ret != ESP_OK) {
++            uint32_t isr_now; int64_t isr_last;
++            sdmmc_host_get_isr_stats(&isr_now, &isr_last);
++            ESP_LOGE(TAG, "WRITE_DIAG: step=CRC polling_tx err=0x%x "
++                     "isr_delta=%lu isr_last=%lldus_ago",
++                     ret, (unsigned long)(isr_now - isr_count_start),
++                     (long long)(esp_timer_get_time() - isr_last));
+             return ret;
+         }
+ 
+         uint8_t data_rsp = t_crc_rsp.rx_data[2];
+         if (!SD_SPI_DATA_RSP_VALID(data_rsp)) {
++            if (data_rsp != 0xFF) {
++                // Garbled response (e.g. 0x80) — AXI bus contention
++                // corrupted the SPI transaction.  Card state is unknown.
++                // Flag so diskio skips retries and triggers power cycle.
++                s_sdspi_garbled_response = true;
++                ESP_LOGE(TAG, "WRITE_DIAG: step=RSP GARBLED data_rsp=0x%02x "
++                         "— card state unknown, needs power cycle", data_rsp);
++            } else {
++                // 0xFF — card didn't respond (busy).  Transient, safe to retry.
++                ESP_LOGE(TAG, "WRITE_DIAG: step=RSP no_response data_rsp=0xff");
++            }
+             return ESP_ERR_INVALID_RESPONSE;
+         }
+         switch (SD_SPI_DATA_RSP(data_rsp)) {
+         case SD_SPI_DATA_ACCEPTED:
+             break;
+         case SD_SPI_DATA_CRC_ERROR:
++            {
++                uint32_t isr_now; int64_t isr_last;
++                sdmmc_host_get_isr_stats(&isr_now, &isr_last);
++                ESP_LOGE(TAG, "WRITE_DIAG: step=RSP card_crc_error "
++                         "isr_delta=%lu isr_last=%lldus_ago bounce=%d",
++                         (unsigned long)(isr_now - isr_count_start),
++                         (long long)(esp_timer_get_time() - isr_last),
++                         (tx_data != data) ? 1 : 0);
++            }
+             return ESP_ERR_INVALID_CRC;
+         case SD_SPI_DATA_WR_ERROR:
++            ESP_LOGE(TAG, "WRITE_DIAG: step=RSP card_wr_error data_rsp=0x%02x", data_rsp);
+             return ESP_FAIL;
+         default:
++            ESP_LOGE(TAG, "WRITE_DIAG: step=RSP unknown data_rsp=0x%02x", data_rsp);
+             return ESP_ERR_INVALID_RESPONSE;
+         }
+ 
+         // Wait for the card to finish writing data
+         ret = poll_busy(slot, cmd->timeout_ms, no_use_polling);
+         if (ret != ESP_OK) {
++            ESP_LOGE(TAG, "WRITE_DIAG: step=BUSY err=0x%x", ret);
+             return ret;
+         }
+ 
+diff --git a/components/fatfs/diskio/diskio_sdmmc.c b/components/fatfs/diskio/diskio_sdmmc.c
+index 5bf9dd2..92ab1d2 100644
+--- a/components/fatfs/diskio/diskio_sdmmc.c
++++ b/components/fatfs/diskio/diskio_sdmmc.c
+@@ -2,6 +2,14 @@
+  * SPDX-FileCopyrightText: 2015-2021 Espressif Systems (Shanghai) CO LTD
+  *
+  * SPDX-License-Identifier: Apache-2.0
++ *
++ * Modified by jstockdale (ADS-B Scope) — added retry logic for transient
++ * CRC errors (0x109) and timeouts (0x107) in ff_sdmmc_write/ff_sdmmc_read.
++ * On ESP32-P4 T-Display-P4, WiFi activity on the co-processor C6 causes
++ * intermittent SPI signal corruption that the SD card detects as CRC
++ * failures.  A brief delay and retry is sufficient to recover from these
++ * transient glitches without propagating the error up to FatFS (which
++ * would cause a short write / partial flush and risk FAT corruption).
+  */
+ 
+ #include "diskio_impl.h"
+@@ -10,12 +18,74 @@
+ #include "sdmmc_cmd.h"
+ #include "esp_log.h"
+ #include "esp_compiler.h"
++#include "esp_err.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
+ 
+ static sdmmc_card_t* s_cards[FF_VOLUMES] = { NULL };
+ static bool s_disk_status_check_en[FF_VOLUMES] = { };
+ 
+ static const char* TAG = "diskio_sdmmc";
+ 
++/* ── Retry configuration ──────────────────────────────────────────── */
++#define DISKIO_MAX_RETRIES        3     /* attempts after the first failure  */
++#define DISKIO_RETRY_DELAY_MS     10    /* ms between retries                */
++
++/* Errors worth retrying — transient signal integrity issues.
++ * ESP_ERR_INVALID_CRC      (0x109) — card detected corrupted data on SPI bus
++ * ESP_ERR_TIMEOUT          (0x107) — card didn't respond (busy / noise)
++ * ESP_ERR_INVALID_STATE    (0x108) — SPI state machine confused / card busy
++ * ESP_ERR_INVALID_RESPONSE (0x106) — card returned 0xFF or garbage response
++ *                                    token (e.g. busy during internal write)
++ */
++static inline bool diskio_err_is_retriable(esp_err_t err)
++{
++    return (err == ESP_ERR_INVALID_CRC ||
++            err == ESP_ERR_TIMEOUT ||
++            err == ESP_ERR_INVALID_STATE ||
++            err == ESP_ERR_INVALID_RESPONSE);
++}
++
++/* ── IO counters (debug diagnostics) ─────────────────────────────── */
++static uint32_t s_diskio_sectors_written = 0;
++static uint32_t s_diskio_sectors_read    = 0;
++static uint32_t s_diskio_write_retries   = 0;
++static uint32_t s_diskio_read_retries    = 0;
++static uint32_t s_diskio_write_fails     = 0;
++static uint32_t s_diskio_read_fails      = 0;
++
++/* ── Card state uncertainty flag ─────────────────────────────────── */
++/* Set when a write encounters a non-CRC error (garbled response, SPI
++ * state confusion, timeout).  CRC errors are "clean" — the card
++ * rejected the write and its state is known.  Everything else leaves
++ * the card in an uncertain state: the card may have partially processed
++ * a garbled command.  The caller should power-cycle and remount.
++ *
++ * Also set when all retries are exhausted (any error type).
++ */
++static volatile bool s_diskio_card_needs_reset = false;
++
++bool diskio_card_needs_reset(void) {
++    return s_diskio_card_needs_reset;
++}
++
++void diskio_clear_card_reset_flag(void) {
++    s_diskio_card_needs_reset = false;
++}
++
++void diskio_sdmmc_get_stats(uint32_t *wr_sectors, uint32_t *rd_sectors,
++                            uint32_t *wr_retries, uint32_t *rd_retries,
++                            uint32_t *wr_fails,   uint32_t *rd_fails)
++{
++    if (wr_sectors) *wr_sectors = s_diskio_sectors_written;
++    if (rd_sectors) *rd_sectors = s_diskio_sectors_read;
++    if (wr_retries) *wr_retries = s_diskio_write_retries;
++    if (rd_retries) *rd_retries = s_diskio_read_retries;
++    if (wr_fails)   *wr_fails   = s_diskio_write_fails;
++    if (rd_fails)   *rd_fails   = s_diskio_read_fails;
++}
++
++
+ //Check if SD/MMC card is present
+ static DSTATUS ff_sdmmc_card_available(BYTE pdrv)
+ {
+@@ -53,9 +123,29 @@ DRESULT ff_sdmmc_read (BYTE pdrv, BYTE* buff, DWORD sector, UINT count)
+     assert(card);
+     esp_err_t err = sdmmc_read_sectors(card, buff, sector, count);
+     if (unlikely(err != ESP_OK)) {
++        /* Retry on transient CRC / timeout errors */
++        if (diskio_err_is_retriable(err)) {
++            for (int retry = 1; retry <= DISKIO_MAX_RETRIES; retry++) {
++                s_diskio_read_retries++;
++                ESP_LOGW(TAG, "sdmmc_read_blocks retry %d/%d (sector=%lu count=%u err=0x%x)",
++                         retry, DISKIO_MAX_RETRIES, (unsigned long)sector, count, err);
++                vTaskDelay(pdMS_TO_TICKS(DISKIO_RETRY_DELAY_MS));
++                err = sdmmc_read_sectors(card, buff, sector, count);
++                if (err == ESP_OK) {
++                    ESP_LOGI(TAG, "sdmmc_read_blocks succeeded on retry %d", retry);
++                    s_diskio_sectors_read += count;
++                    return RES_OK;
++                }
++                if (!diskio_err_is_retriable(err)) {
++                    break;  /* non-transient error — stop retrying */
++                }
++            }
++        }
++        s_diskio_read_fails++;
+         ESP_LOGE(TAG, "sdmmc_read_blocks failed (0x%x)", err);
+         return RES_ERROR;
+     }
++    s_diskio_sectors_read += count;
+     return RES_OK;
+ }
+ 
+@@ -63,11 +153,75 @@ DRESULT ff_sdmmc_write (BYTE pdrv, const BYTE* buff, DWORD sector, UINT count)
+ {
+     sdmmc_card_t* card = s_cards[pdrv];
+     assert(card);
++
++    // Clear garbled flag before each write attempt so we can detect
++    // fresh garbled responses from sdspi_host.
++    extern void sdspi_host_clear_garbled_flag(void);
++    sdspi_host_clear_garbled_flag();
++
+     esp_err_t err = sdmmc_write_sectors(card, buff, sector, count);
+     if (unlikely(err != ESP_OK)) {
+-        ESP_LOGE(TAG, "sdmmc_write_blocks failed (0x%x)", err);
++        esp_err_t original_err = err;
++
++        // Check for garbled SPI response (e.g. 0x80).  This means AXI
++        // bus contention corrupted the transaction — the card's internal
++        // state is unknown.  Do NOT retry: the card needs a power cycle
++        // before any further writes.  The data from this write is lost;
++        // the caller (sd_logger) will detect the failure, trigger a
++        // power cycle + remount, and start fresh log files.
++        extern bool sdspi_host_had_garbled_response(void);
++        if (sdspi_host_had_garbled_response()) {
++            sdspi_host_clear_garbled_flag();
++            s_diskio_card_needs_reset = true;
++            s_diskio_write_fails++;
++            ESP_LOGE(TAG, "sdmmc_write_blocks garbled response (0x%x) — "
++                     "card needs power cycle, NOT retrying", err);
++            return RES_ERROR;
++        }
++
++        /* Retry on transient CRC / timeout errors */
++        if (diskio_err_is_retriable(err)) {
++            for (int retry = 1; retry <= DISKIO_MAX_RETRIES; retry++) {
++                s_diskio_write_retries++;
++                ESP_LOGW(TAG, "sdmmc_write_blocks retry %d/%d (sector=%lu count=%u err=0x%x)",
++                         retry, DISKIO_MAX_RETRIES, (unsigned long)sector, count, err);
++                vTaskDelay(pdMS_TO_TICKS(DISKIO_RETRY_DELAY_MS));
++
++                sdspi_host_clear_garbled_flag();
++                err = sdmmc_write_sectors(card, buff, sector, count);
++
++                if (err == ESP_OK) {
++                    ESP_LOGI(TAG, "sdmmc_write_blocks succeeded on retry %d "
++                             "(original err=0x%x)", retry, original_err);
++                    /* Successful retry = card state is known-good.  The card
++                     * either rejected the bad write cleanly (CRC) or recovered
++                     * from a transient condition (timeout, invalid state).
++                     * No power cycle needed — that would cause more disruption
++                     * than the original error. */
++                    s_diskio_sectors_written += count;
++                    return RES_OK;
++                }
++
++                // Check if THIS retry produced a garbled response
++                if (sdspi_host_had_garbled_response()) {
++                    sdspi_host_clear_garbled_flag();
++                    s_diskio_card_needs_reset = true;
++                    ESP_LOGE(TAG, "Garbled response on retry %d — aborting, card needs power cycle", retry);
++                    break;
++                }
++
++                if (!diskio_err_is_retriable(err)) {
++                    break;  /* non-transient error — stop retrying */
++                }
++            }
++        }
++        /* All retries exhausted or garbled — card state is definitely uncertain */
++        s_diskio_card_needs_reset = true;
++        s_diskio_write_fails++;
++        ESP_LOGE(TAG, "sdmmc_write_blocks failed (0x%x) — card needs reset", err);
+         return RES_ERROR;
+     }
++    s_diskio_sectors_written += count;
+     return RES_OK;
+ }
+ 

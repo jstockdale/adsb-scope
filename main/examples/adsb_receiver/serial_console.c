@@ -287,6 +287,8 @@ static void cmd_help(void) {
         "\n"
         "  \033[33m── Services ──\033[0m\n"
         "  \033[32madsb\033[0m [on|off|status]  ADS-B receiver control\n"
+        "  \033[32madsb replay\033[0m <file>|stop  decode a recorded sample file (raw 8-bit I/Q); no argument: progress\n"
+        "  \033[32mdiag\033[0m [mark]       everything a field report needs, in one block; mark: restart its checks\n"
         "  \033[32mmeshy\033[0m [on|off|status] Meshtastic radio control\n"
         "  \033[32musb\033[0m [status]          USB host status\n"
         "  \033[32mwifi\033[0m [on|off|status|ssid <n>|pass <pw>]  WiFi control\n"
@@ -616,6 +618,31 @@ static void cmd_adsb(const char *subcmd) {
                    (unsigned long)st.total_messages, st.msg_rate);
             printf("  Positions: %.1f/s\n", st.pos_rate);
             printf("  CRC error: %.1f%%\n", st.crc_error_rate * 100.0);
+            printf("  DF18:      %lu total, %lu in last min (decoded, not shown as aircraft)\n",
+                   (unsigned long)st.df18_total, (unsigned long)st.df18_last_min);
+            printf("             TIS-B %lu, ADS-R %lu, ADS-B non-transponder %lu, other %lu\n",
+                   (unsigned long)st.df18_tisb, (unsigned long)st.df18_adsr,
+                   (unsigned long)st.df18_adsb_nt, (unsigned long)st.df18_other);
+            printf("  Decode:    %.1f%% of one core, peak %.1f%% (last 5 s; must stay under 100%% to keep up; 'top' shows all tasks)\n",
+                   st.decode_load * 100.0, st.peak_decode_load * 100.0);
+            printf("             of which SD log %.1f%%\n", st.sdlog_load * 100.0);
+            printf("  Capture:   %.1f%% of air time decoded, lowest %.1f%% (USB delivered %.1f%%)\n",
+                   st.capture * 100.0, st.min_capture * 100.0, st.usb_capture * 100.0);
+            printf("  USB:       %lu transfers queued, endpoint ran dry %lu times\n",
+                   (unsigned long)st.usb_xfers, (unsigned long)st.usb_starved);
+            printf("  Ring:      %lu%% full now, %lu%% at most; %lu transfers dropped; %lu gaps passed to the decoder\n",
+                   (unsigned long)st.ring_fill_pct, (unsigned long)st.ring_max_pct,
+                   (unsigned long)st.ring_dropped, (unsigned long)st.stream_gaps);
+#ifdef CONFIG_ESP_CONSOLE_UART_BAUDRATE
+            printf("  Log:       %lu lines/s, %lu B/s written (console carries %d B/s); dropped %lu, %lu in the last 5 s\n",
+                   (unsigned long)st.log_lines_s, (unsigned long)st.log_bytes_s,
+                   CONFIG_ESP_CONSOLE_UART_BAUDRATE / 10,
+                   (unsigned long)st.log_dropped, (unsigned long)st.log_dropped_win);
+#else
+            printf("  Log:       %lu lines/s, %lu B/s written; dropped %lu, %lu in the last 5 s\n",
+                   (unsigned long)st.log_lines_s, (unsigned long)st.log_bytes_s,
+                   (unsigned long)st.log_dropped, (unsigned long)st.log_dropped_win);
+#endif
             if (st.farthest_dist_nm > 0)
                 printf("  Max range: %.1f nm (%06lX)\n",
                        st.farthest_dist_nm, (unsigned long)st.farthest_icao);
@@ -751,6 +778,63 @@ static void cmd_status(void) {
 
     printf("\n");
 }
+
+// `top`: per-task CPU use over a one-second window, largest first. 100% is
+// one core fully busy; IDLE0 / IDLE1 are the unused share of each core.
+#if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+static void cmd_top(void) {
+    UBaseType_t cap = uxTaskGetNumberOfTasks() + 8;
+    TaskStatus_t *a = (TaskStatus_t *)malloc(cap * sizeof(TaskStatus_t));
+    TaskStatus_t *b = (TaskStatus_t *)malloc(cap * sizeof(TaskStatus_t));
+    uint8_t *done = (uint8_t *)calloc(cap, 1);
+    configRUN_TIME_COUNTER_TYPE ta = 0, tb = 0;
+    if (!a || !b || !done) {
+        printf("  top: out of memory\n");
+        free(a); free(b); free(done);
+        return;
+    }
+    UBaseType_t na = uxTaskGetSystemState(a, cap, &ta);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    UBaseType_t nb = uxTaskGetSystemState(b, cap, &tb);
+    configRUN_TIME_COUNTER_TYPE elapsed = tb - ta;
+    if (na == 0 || nb == 0 || elapsed == 0) {
+        printf("  top: no data (task count changed during the sample; try again)\n");
+        free(a); free(b); free(done);
+        return;
+    }
+    printf("  CPU use over 1 s, as %% of one core (2 cores at %d MHz)\n", CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+    printf("  %-18s %4s %4s %7s\n", "task", "core", "prio", "cpu");
+    for (UBaseType_t k = 0; k < nb; k++) {
+        int best = -1;
+        uint64_t best_d = 0;
+        for (UBaseType_t i = 0; i < nb; i++) {
+            if (done[i]) continue;
+            uint64_t d = 0;
+            for (UBaseType_t j = 0; j < na; j++) {
+                if (a[j].xTaskNumber == b[i].xTaskNumber) {
+                    d = (uint64_t)(configRUN_TIME_COUNTER_TYPE)(b[i].ulRunTimeCounter - a[j].ulRunTimeCounter);
+                    break;
+                }
+            }
+            if (best < 0 || d > best_d) { best = (int)i; best_d = d; }
+        }
+        done[best] = 1;
+        unsigned permille = (unsigned)((best_d * 1000ULL) / (uint64_t)elapsed);
+        char core[12] = "-";
+#if CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID
+        if (b[best].xCoreID == tskNO_AFFINITY) snprintf(core, sizeof(core), "any");
+        else snprintf(core, sizeof(core), "%d", (int)b[best].xCoreID);
+#endif
+        printf("  %-18s %4s %4u %5u.%u%%\n", b[best].pcTaskName, core,
+               (unsigned)b[best].uxCurrentPriority, permille / 10, permille % 10);
+    }
+    free(a); free(b); free(done);
+}
+#else
+static void cmd_top(void) {
+    printf("  top: FreeRTOS run-time stats are not enabled in this build\n");
+}
+#endif
 
 static void cmd_version(void) {
     const esp_app_desc_t *app = esp_app_get_description();
@@ -1617,6 +1701,158 @@ static void cmd_stat(const char *path) {
 }
 
 // ---------------------------------------------------------------------------
+// diag – one block with everything a field report needs – and adsb replay
+// ---------------------------------------------------------------------------
+
+static void dispatch_command(char *line);
+
+// Counted by the task watchdog's interrupt handler each time a watched
+// task (the idle tasks) has not run for the watchdog period.
+static volatile uint32_t s_task_wdt_fired = 0;
+void IRAM_ATTR esp_task_wdt_isr_user_handler(void) {
+    s_task_wdt_fired++;
+}
+
+static const char *reset_reason_name(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "power on";
+        case ESP_RST_EXT:       return "reset pin";
+        case ESP_RST_SW:        return "software restart";
+        case ESP_RST_PANIC:     return "crash (panic)";
+        case ESP_RST_INT_WDT:   return "interrupt watchdog";
+        case ESP_RST_TASK_WDT:  return "task watchdog";
+        case ESP_RST_WDT:       return "other watchdog";
+        case ESP_RST_DEEPSLEEP: return "wake from deep sleep";
+        case ESP_RST_BROWNOUT:  return "brownout";
+        case ESP_RST_SDIO:      return "SDIO";
+        default:                return "unknown";
+    }
+}
+
+// Pass criteria as proposed in docs/ROADMAP-AVIATION.md 5.0. They are
+// evaluated over the time since `diag mark` (or a replay, or boot).
+#define DIAG_MIN_CAPTURE_PCT  99.0
+#define DIAG_MAX_DECODE_PCT   80.0
+#define DIAG_MIN_OBSERVE_S    3600
+
+static mqtt_feeder_stats_t s_diag_mqtt_mark;   // MQTT counters at the last `diag mark`
+
+static const char *verdict(bool pass) { return pass ? "PASS" : "FAIL"; }
+
+static void diag_checks(void) {
+    extern adsb_stats_t adsb_get_stats(void);
+    adsb_stats_t st = adsb_get_stats();
+    mqtt_feeder_stats_t ms;
+    mqtt_feeder_get_stats(&ms);
+    uint32_t age = st.mark_age_s;
+    printf("  Checks over the last %02lu:%02lu:%02lu – proposed pass criteria (docs/ROADMAP-AVIATION.md 5.0)\n",
+           (unsigned long)(age / 3600), (unsigned long)(age % 3600 / 60), (unsigned long)(age % 60));
+    if (!st.rtlsdr_connected) {
+        printf("  [ -- ] receiver not running\n");
+    } else if (age < 15) {
+        printf("  [ -- ] capture and decode: not enough data yet (15 s needed)\n");
+    } else {
+        printf("  [%s] capture never below %.1f%% (lowest %.1f%%)\n",
+               verdict(st.min_capture * 100.0 >= DIAG_MIN_CAPTURE_PCT), DIAG_MIN_CAPTURE_PCT, st.min_capture * 100.0);
+        printf("  [%s] decode never above %.1f%% of one core (peak %.1f%%)\n",
+               verdict(st.peak_decode_load * 100.0 <= DIAG_MAX_DECODE_PCT), DIAG_MAX_DECODE_PCT, st.peak_decode_load * 100.0);
+        printf("  [%s] no transfers dropped by the ring (%lu)\n",
+               verdict(st.ring_dropped_mark == 0), (unsigned long)st.ring_dropped_mark);
+        printf("  [INFO] endpoint ran dry %lu times; %lu log lines dropped\n",
+               (unsigned long)st.usb_starved_mark, (unsigned long)st.log_dropped_mark);
+    }
+    if (!g_settings.mqtt_enabled) {
+        printf("  [ -- ] MQTT disabled\n");
+    } else {
+        uint32_t disc = ms.disconnects - s_diag_mqtt_mark.disconnects;
+        uint32_t wifi = ms.wifi_pauses - s_diag_mqtt_mark.wifi_pauses;
+        uint32_t fail = ms.publish_failures - s_diag_mqtt_mark.publish_failures;
+        printf("  [%s] no MQTT disconnects (%lu; WiFi drops %lu, failed publishes %lu)%s\n",
+               verdict(disc == 0 && wifi == 0 && mqtt_feeder_is_connected()),
+               (unsigned long)disc, (unsigned long)wifi, (unsigned long)fail,
+               mqtt_feeder_is_connected() ? "" : " – not connected now");
+    }
+    printf("  [%s] task watchdog has not fired since boot (%lu)\n",
+           verdict(s_task_wdt_fired == 0), (unsigned long)s_task_wdt_fired);
+    if (age < DIAG_MIN_OBSERVE_S)
+        printf("  [NOTE] the criteria ask for an hour of traffic (24 h for MQTT); this is less\n");
+}
+
+static void print_replay_status(void) {
+    extern void adsb_replay_get(adsb_replay_status_t *out);
+    adsb_replay_status_t r;
+    adsb_replay_get(&r);
+    if (r.running) {
+        unsigned pct = r.file_bytes ? (unsigned)(r.fed_bytes * 100 / r.file_bytes) : 0;
+        printf("  Replay:    running, %s: %llu of %llu bytes (%u%%), %lu messages so far\n",
+               r.path, (unsigned long long)r.fed_bytes, (unsigned long long)r.file_bytes, pct,
+               (unsigned long)r.messages);
+    } else if (r.done && r.ok) {
+        double share = r.signal_ms ? 100.0 * r.decode_busy_ms / r.signal_ms : 0.0;
+        printf("  Replay:    %s: %llu bytes, %.1f s of signal, %lu messages\n",
+               r.path, (unsigned long long)r.fed_bytes, r.signal_ms / 1000.0, (unsigned long)r.messages);
+        printf("             decoder busy %lu ms = %.1f%% of one core at real time; %lu transfers dropped; took %lu s\n",
+               (unsigned long)r.decode_busy_ms, share, (unsigned long)r.ring_dropped,
+               (unsigned long)(r.wall_ms / 1000));
+    } else if (r.done) {
+        printf("  Replay:    %s: failed: %s (%llu bytes fed, %lu messages)\n",
+               r.path, r.error, (unsigned long long)r.fed_bytes, (unsigned long)r.messages);
+    } else {
+        printf("  Replay:    none run since boot\n");
+    }
+}
+
+static void cmd_adsb_replay(const char *arg) {
+    extern bool adsb_replay_start(const char *path, char *err, size_t err_len);
+    extern void adsb_replay_stop(void);
+    if (!arg || !arg[0]) {
+        print_replay_status();
+        return;
+    }
+    if (strcmp(arg, "stop") == 0) {
+        adsb_replay_stop();
+        printf("  Replay: stop requested\n");
+        return;
+    }
+    char resolved[128], err[64];
+    resolve_path(arg, resolved, sizeof(resolved));
+    if (adsb_replay_start(resolved, err, sizeof(err))) {
+        printf("  Replay started: %s\n", resolved);
+        printf("  Live reception, MQTT and logging of aircraft are suspended until it ends.\n");
+        printf("  'adsb replay' shows progress; the result is logged as a REPLAY: line.\n");
+    } else {
+        printf("  Replay not started: %s\n", err);
+    }
+}
+
+static void cmd_diag(const char *sub) {
+    extern void adsb_stats_mark(void);
+    if (sub && strcmp(sub, "mark") == 0) {
+        adsb_stats_mark();
+        mqtt_feeder_get_stats(&s_diag_mqtt_mark);
+        printf("  Observation restarted: the checks in 'diag' run from now.\n");
+        return;
+    }
+    printf("\n===== DIAG BEGIN =====\n");
+    cmd_version();
+    printf("Reset reason:     %s\n", reset_reason_name(esp_reset_reason()));
+    printf("Task watchdog:    fired %lu times since boot\n", (unsigned long)s_task_wdt_fired);
+    cmd_status();
+    printf("--- adsb status ---\n");
+    cmd_adsb("status");
+    print_replay_status();
+    printf("--- mqtt status ---\n");
+    { char l[] = "mqtt status"; dispatch_command(l); }
+    printf("--- wifi status ---\n");
+    { char l[] = "wifi status"; dispatch_command(l); }
+    printf("--- top ---\n");
+    cmd_top();
+    printf("--- checks ---\n");
+    diag_checks();
+    printf("===== DIAG END =====\n\n");
+}
+
+// ---------------------------------------------------------------------------
 // Command dispatcher
 // ---------------------------------------------------------------------------
 static void dispatch_command(char *line) {
@@ -1705,7 +1941,10 @@ static void dispatch_command(char *line) {
 
     // ── Service control ──────────────────────────────────────────────
     } else if (strcmp(cmd, "adsb") == 0) {
-        cmd_adsb(arg1);
+        if (arg1 && strcmp(arg1, "replay") == 0) cmd_adsb_replay(arg2);
+        else cmd_adsb(arg1);
+    } else if (strcmp(cmd, "diag") == 0) {
+        cmd_diag(arg1);
     } else if (strcmp(cmd, "meshy") == 0) {
         cmd_meshy(arg1);
     } else if (strcmp(cmd, "usb") == 0) {
@@ -1713,6 +1952,8 @@ static void dispatch_command(char *line) {
 
     } else if (strcmp(cmd, "status") == 0) {
         cmd_status();
+    } else if (strcmp(cmd, "top") == 0) {
+        cmd_top();
     } else if (strcmp(cmd, "version") == 0 || strcmp(cmd, "ver") == 0) {
         cmd_version();
     } else if (strcmp(cmd, "mount") == 0) {
@@ -2086,6 +2327,37 @@ static void dispatch_command(char *line) {
             printf("  Password: %s\n", g_settings.mqtt_pass[0] ? "(set)" : "(not set)");
             printf("  Device ID: %s\n", g_settings.mqtt_device_id[0] ? g_settings.mqtt_device_id : "(auto from MAC)");
             printf("  Connected: %s\n", mqtt_feeder_is_connected() ? "yes" : "no");
+            {
+                mqtt_feeder_stats_t ms;
+                mqtt_feeder_get_stats(&ms);
+                printf("  Link:      up %lu s; since boot %lu connects, %lu disconnects, %lu failed attempts, %lu WiFi drops\n",
+                       (unsigned long)ms.connected_s, (unsigned long)ms.connects,
+                       (unsigned long)ms.disconnects, (unsigned long)ms.connect_failures,
+                       (unsigned long)ms.wifi_pauses);
+                if (ms.disconnects + ms.wifi_pauses > 0)
+                    printf("             last drop %lu s ago, after %lu s up\n",
+                           (unsigned long)ms.last_drop_ago_s, (unsigned long)ms.last_drop_up_s);
+                if (ms.last_error_type != 0)
+                    printf("             last error %lu s ago: type %d, errno %d (%s), esp-tls 0x%x, TLS -0x%04x, CONNACK %d\n",
+                           (unsigned long)ms.last_error_ago_s, ms.last_error_type,
+                           ms.last_sock_errno, strerror(ms.last_sock_errno),
+                           (unsigned)ms.last_tls_err,
+                           (unsigned)(ms.last_tls_stack_err < 0 ? -ms.last_tls_stack_err : ms.last_tls_stack_err),
+                           ms.last_connect_rc);
+                printf("  Updates:   %lu from the decoder, %lu merged into a pending one, dropped: %lu (slots full) %lu (busy)\n",
+                       (unsigned long)ms.updates, (unsigned long)ms.coalesced,
+                       (unsigned long)ms.dropped_full, (unsigned long)ms.dropped_busy);
+                printf("  Batches:   %lu sent as %lu messages, %llu bytes; aircraft entries sent %lu, not sent %lu\n",
+                       (unsigned long)ms.flushes, (unsigned long)ms.messages,
+                       (unsigned long long)ms.bytes,
+                       (unsigned long)ms.aircraft_sent, (unsigned long)ms.aircraft_unsent);
+                printf("             last batch: %lu aircraft in %lu messages, %lu bytes\n",
+                       (unsigned long)ms.last_aircraft, (unsigned long)ms.last_messages,
+                       (unsigned long)ms.last_bytes);
+                printf("  Publish:   %lu failed, %lu slow (over 1 s), longest %lu ms; longest gap between batches %lu ms (nominal 2000)\n",
+                       (unsigned long)ms.publish_failures, (unsigned long)ms.publish_slow,
+                       (unsigned long)ms.publish_max_ms, (unsigned long)ms.flush_gap_max_ms);
+            }
         } else if (strcmp(arg1, "on") == 0) {
             g_settings.mqtt_enabled = true;
             g_settings_save_pending = true;

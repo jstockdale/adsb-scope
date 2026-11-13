@@ -9,8 +9,13 @@
 #include "device_settings.h"
 #include "aircraft_db.h"
 #include "mqtt_feeder.h"
+#include "mqtt_batch.h"    // MQTT_BATCH_SLOTS, checked against ADSB_MAX_AIRCRAFT
 #include "rtlsdr_i2c.h"
+#include "sample_ring.h"
+#include "usb_stream.h"
 #include <math.h>
+#include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -34,17 +39,28 @@ extern void sd_io_give(void);
 #define RTLSDR_BUF_LEN        (16384 + 512)
 #define CLIENT_NUM_EVENT_MSG  5
 #define CPR_MAX_AGE_US        10000000LL   // 10 seconds
-#define CPR_CACHE_SIZE        256
+#define CPR_CACHE_SIZE        ADSB_MAX_AIRCRAFT
 #define CPR_JUMP_FLOOR_NM     10.0         // minimum threshold (handles GPS jitter, CPR quantization)
 #define CPR_JUMP_RATE_NM_S    1.0          // ~3600 kt — faster than any transponder-equipped aircraft
 #define CPR_SUSPECT_GIVE_UP   5            // consecutive suspect events → reset has_position
 #define CPR_CONSENSUS_COUNT   3            // agreeing globals needed to override bad good_pos
 #define CPR_CONSENSUS_NM      10.0         // max spread between agreeing candidates
-#define AIRCRAFT_TABLE_SIZE   256
+#define AIRCRAFT_TABLE_SIZE   ADSB_MAX_AIRCRAFT
+// The MQTT feeder must have a slot for every aircraft the table can hold,
+// and the list buffer a row for each (the formatter stops 80 bytes short
+// of the end of its buffer).
+_Static_assert(MQTT_BATCH_SLOTS >= ADSB_MAX_AIRCRAFT, "MQTT batch smaller than the aircraft table");
+_Static_assert(ADSB_LIST_BUF_SIZE - 80 > (ADSB_MAX_AIRCRAFT - 1) * ADSB_LIST_ROW_LEN, "aircraft list buffer too small");
 #define AIRCRAFT_MAX_AGE_US   60000000LL   // 60 seconds
 
 #define ADSB_READER_TASK_STACK  (8 * 1024)
-#define ADSB_READER_TASK_PRIO   3
+// The reader only moves finished USB transfers into the sample ring, and
+// has about 2 ms to do it before the endpoint runs dry (usb_stream.h). It
+// therefore runs above every application task – the decoder (3), MQTT (5),
+// audio (6) – and just below the USB host library task that hands it the
+// transfers (HOST_LIB_TASK_PRIORITY in main.cpp). Each wake-up is a 5.6 kB
+// copy, so the tasks below it lose very little.
+#define ADSB_READER_TASK_PRIO   11
 
 // ============================================================
 // ADSB reader task signaling
@@ -63,6 +79,105 @@ static volatile uint8_t s_new_dev_addr = 0;
 
 // Pre-allocated demodulation magnitude buffer (allocated once in reader task)
 static uint16_t *s_mag_buf = NULL;
+
+// Demodulator and sample rate (menuconfig: Example Configuration ->
+// ADS-B demodulator). Both demodulators are always compiled; this picks one.
+#ifdef CONFIG_ADSB_DEMOD_2000
+#define ADSB_SAMPLE_RATE 2000000u
+#define ADSB_DEMOD_IS_2400 0
+#else
+#define ADSB_SAMPLE_RATE 2400000u
+#define ADSB_DEMOD_IS_2400 1
+#endif
+
+// DF18 counters, mirrored from the decoder once per chunk by df18_tick()
+// so adsb_get_stats() can read them without touching the decoder state.
+static volatile uint32_t s_df18_total = 0, s_df18_last_min = 0;
+static volatile uint32_t s_df18_tisb = 0, s_df18_adsr = 0, s_df18_adsb_nt = 0, s_df18_other = 0;
+static uint32_t s_df18_win_base = 0;
+static int64_t  s_df18_win_start = 0;
+
+// Decode load: microseconds spent inside demodulate() in the current
+// window, and the result of the last complete window in thousandths of
+// one core.
+static uint32_t s_decode_busy_us = 0;
+static int64_t  s_decode_win_start = 0;
+static volatile uint32_t s_decode_load_permille = 0;
+
+// Time spent in the SD log inside the decoder, same windows.
+static uint32_t s_sdlog_busy_us = 0;
+static volatile uint32_t s_sdlog_load_permille = 0;
+static volatile uint32_t s_peak_decode_permille = 0;
+// Sample bytes handed to the decoder in the window, for adsb_stats_t.capture
+static uint32_t s_capture_bytes_win = 0;
+static volatile uint32_t s_capture_permille = 0, s_min_capture_permille = 1000;
+static int      s_load_line_windows = 0;
+
+// ---- Sample path (r9): USB reader task -> ring in PSRAM -> decoder task ----
+// 192 transfers of 5632 bytes: 1.08 MB, 225 ms of signal at 2.4 Msps.
+#define ADSB_RING_SLOTS         192
+#define ADSB_DECODE_TASK_STACK  (12 * 1024)
+#define ADSB_DECODE_TASK_PRIO   3
+// The decoder is woken when this many transfers are waiting (9 ms of
+// signal), so it works in a few long runs instead of many short ones.
+#define ADSB_DECODE_BATCH_SLOTS 8
+
+static sample_ring_t     s_ring;
+static void             *s_ring_mem = NULL;       // PSRAM; allocated once and kept
+static TaskHandle_t      s_decode_task_hdl = NULL;
+static volatile bool     s_decode_stop = false;
+static SemaphoreHandle_t s_decode_done = NULL;
+static int               s_usb_xfers = 0;         // USB transfers in use
+static int64_t           s_usb_prev_cb_us = 0;    // reader task only
+static uint64_t          s_usb_bytes_total = 0;   // reader task only
+static volatile uint32_t s_usb_capture_permille = 0;
+static volatile uint32_t s_usb_starved = 0;       // times the endpoint ran dry
+static volatile uint32_t s_decode_gaps = 0;       // discontinuities the decoder was told about
+static volatile int      s_bias_pending = -1;     // -1 none, 0 off, 1 on: applied by the reader task
+
+// ---- Log line queue (r9) ----
+// The decoder used to print one line per message itself and so ran at the
+// speed of the console (docs/UPLINK.md 2.2). Lines now go into this queue
+// and a low-priority task writes them. When the console cannot keep up the
+// queue fills and lines are dropped and counted; the decoder never waits.
+#define ADSB_LOGQ_BYTES      16384   // power of two; about 1.4 s of console output at 115200 baud
+#define ADSB_LOG_LINE_MAX    400
+#define ADSB_LOG_TASK_STACK  (6 * 1024)
+#define ADSB_LOG_TASK_PRIO   2
+
+static char        *s_logq = NULL;                // PSRAM
+static atomic_uint  s_logq_head, s_logq_tail;     // free-running byte counts; producer / consumer
+static TaskHandle_t s_log_task_hdl = NULL;
+static volatile uint32_t s_log_lines_total = 0, s_log_bytes_total = 0, s_log_dropped_total = 0;
+static uint32_t s_win_log_lines0 = 0, s_win_log_bytes0 = 0, s_win_log_dropped0 = 0;
+static volatile uint32_t s_log_lines_s = 0, s_log_bytes_s = 0, s_log_dropped_win = 0;
+
+static void adsb_logq_push(const char *line, int len);
+static void adsb_logq_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+// ---- Observation mark (adsb_stats_mark) ----
+static volatile int64_t  s_mark_us = 0;
+static volatile bool     s_window_restart = false;  // the decoder starts a fresh 5 s window
+static volatile uint32_t s_mark_ring_dropped = 0, s_mark_usb_starved = 0, s_mark_log_dropped = 0;
+
+// ---- Replay (r10) – see adsb_replay_status_t in class_driver.h ----
+// s_replay_feed      the replay task owns the ring's input; the USB
+//                    callback discards live samples
+// s_replay_phase     hand-over with the decoder task, which makes every
+//                    change to decoder state itself, when the ring is empty:
+//                    1 start requested -> 2 replaying -> 3 end requested -> 0
+// s_replay_counting  the decoder is on replayed samples: count, and keep
+//                    them out of MQTT, the SD log and the serial log
+#define ADSB_REPLAY_TASK_STACK (6 * 1024)
+#define ADSB_REPLAY_TASK_PRIO  3
+static volatile bool s_replay_feed = false;
+static volatile int  s_replay_phase = 0;
+static volatile bool s_replay_counting = false;
+static volatile bool s_replay_stop = false;
+static volatile bool s_live_gap_pending = false;   // tell the decoder live samples restart here
+static volatile uint32_t s_replay_msgs = 0;
+static uint64_t s_replay_busy_us = 0;              // decoder task only
+static adsb_replay_status_t s_replay;              // written by the replay task
 
 // ADS-B statistics — updated by on_msg, read by adsb_get_stats
 static volatile uint32_t s_total_messages = 0;
@@ -438,9 +553,10 @@ receiver_pos_t adsb_get_receiver_pos(void) {
 }
 
 void adsb_set_bias_tee(bool on) {
+    // A USB control transfer: handed to the reader task, which owns the
+    // device while samples are streaming.
     if (rtldev) {
-        rtlsdr_set_bias_tee(rtldev, on ? 1 : 0);
-        ESP_LOGI(TAG, "Bias-T: %s", on ? "ON" : "OFF");
+        s_bias_pending = on ? 1 : 0;
     }
 }
 
@@ -514,6 +630,34 @@ adsb_stats_t adsb_get_stats(void) {
     stats.pos_rate = s_gain_pos_rate_ema;
     stats.avg_signal = s_gain_avg_signal;
     stats.avg_delta = s_gain_avg_delta;
+    stats.df18_total = s_df18_total;
+    stats.df18_last_min = s_df18_last_min;
+    stats.df18_tisb = s_df18_tisb;
+    stats.df18_adsr = s_df18_adsr;
+    stats.df18_adsb_nt = s_df18_adsb_nt;
+    stats.df18_other = s_df18_other;
+    stats.decode_load = s_decode_load_permille / 1000.0f;
+    stats.sdlog_load  = s_sdlog_load_permille / 1000.0f;
+    stats.capture     = s_capture_permille / 1000.0f;
+    stats.usb_capture = s_usb_capture_permille / 1000.0f;
+    stats.min_capture = s_min_capture_permille / 1000.0f;
+    stats.peak_decode_load = s_peak_decode_permille / 1000.0f;
+    if (s_ring_mem) {
+        stats.ring_fill_pct = sample_ring_fill(&s_ring) * 100 / (ADSB_RING_SLOTS - 1);
+        stats.ring_max_pct  = s_ring.max_fill * 100 / (ADSB_RING_SLOTS - 1);
+        stats.ring_dropped  = s_ring.dropped;
+    }
+    stats.usb_xfers    = (uint32_t)s_usb_xfers;
+    stats.usb_starved  = s_usb_starved;
+    stats.stream_gaps  = s_decode_gaps;
+    stats.log_lines_s  = s_log_lines_s;
+    stats.log_bytes_s  = s_log_bytes_s;
+    stats.log_dropped  = s_log_dropped_total;
+    stats.log_dropped_win = s_log_dropped_win;
+    stats.mark_age_s        = (uint32_t)((esp_timer_get_time() - s_mark_us) / 1000000LL);
+    stats.ring_dropped_mark = (s_ring_mem ? s_ring.dropped : 0) - s_mark_ring_dropped;
+    stats.usb_starved_mark  = s_usb_starved - s_mark_usb_starved;
+    stats.log_dropped_mark  = s_log_dropped_total - s_mark_log_dropped;
     s_max_range_nm = stats.farthest_dist_nm;
 
     /* Build human-readable dongle model string for UI/MQTT */
@@ -542,9 +686,21 @@ static int gain_find_idx(uint16_t tenths) {
 }
 
 // Apply the current gain index to the hardware
-static void gain_apply(void) {
+static void gain_apply_now(void) {
     if (rtldev) {
         rtlsdr_set_tuner_gain(rtldev, R820T_GAINS[s_gain_idx]);
+    }
+}
+
+// Tuner writes are USB control transfers and belong to the reader task,
+// which owns the device while samples are streaming. Called from there it
+// writes at once; from anywhere else (the decoder's adaptive gain loop)
+// it leaves the request for the reader, which picks it up within 20 ms.
+static void gain_apply(void) {
+    if (s_adsb_reader_task_hdl != NULL && xTaskGetCurrentTaskHandle() == s_adsb_reader_task_hdl) {
+        gain_apply_now();
+    } else {
+        s_gain_pending = true;
     }
 }
 
@@ -1718,6 +1874,11 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     uint32_t icao = (uint32_t)(mm->aa1 << 16 | mm->aa2 << 8 | mm->aa3);
     if (icao == 0) return;
 
+    // A recording is being replayed: its messages are counted, tracked and
+    // shown, but go no further (no log line, SD log or MQTT).
+    const bool replayed = s_replay_counting;
+    if (replayed) s_replay_msgs++;
+
     if (!aircraft_mutex) return;
     xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
     aircraft_t *ac = aircraft_get(icao);
@@ -1731,7 +1892,7 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         aircraft_db_entry_t db;
         if (aircraft_db_lookup(icao, &db)) {
             char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
-            serial_console_print("%sICAO: %06lX|%s|%s|%s|%s|%s|%s|%c\n",
+            adsb_logq_printf("%sICAO: %06lX|%s|%s|%s|%s|%s|%s|%c\n",
                 _ts, (unsigned long)icao,
                 db.reg, db.typecode, db.mfr, db.model, db.owner, db.op_icao,
                 db.ac_class ? db.ac_class : '?');
@@ -1816,7 +1977,7 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
                     ac->suspect_agree = 0;
                     ac->suspect_lat = 0;
                     ac->suspect_lon = 0;
-                    serial_console_print("CPR: %06lX position suspect — local jumped, awaiting global recovery\n",
+                    adsb_logq_printf("CPR: %06lX position suspect — local jumped, awaiting global recovery\n",
                                          ac->icao);
                     // Fall through to global decode for immediate recovery attempt
                 }
@@ -1893,10 +2054,10 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
                         ac->good_pos_ts = now;
                         decoded = 1;
                         if (via_consensus)
-                            serial_console_print("CPR: %06lX recovered via consensus (%d agreeing globals)\n",
+                            adsb_logq_printf("CPR: %06lX recovered via consensus (%d agreeing globals)\n",
                                                  ac->icao, CPR_CONSENSUS_COUNT);
                         else
-                            serial_console_print("CPR: %06lX recovered via global decode\n", ac->icao);
+                            adsb_logq_printf("CPR: %06lX recovered via global decode\n", ac->icao);
                     } else {
                         ac->suspect_count++;
                         if (ac->suspect_count >= CPR_SUSPECT_GIVE_UP) {
@@ -1904,7 +2065,7 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
                             ac->position_suspect = 0;
                             ac->suspect_count = 0;
                             ac->suspect_agree = 0;
-                            serial_console_print("CPR: %06lX gave up recovery — resetting position\n",
+                            adsb_logq_printf("CPR: %06lX gave up recovery — resetting position\n",
                                                  ac->icao);
                         }
                     }
@@ -1925,7 +2086,7 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
                         ac->suspect_agree = 0;
                         ac->suspect_lat = 0;
                         ac->suspect_lon = 0;
-                        serial_console_print("CPR: %06lX position suspect — global re-seed jumped\n",
+                        adsb_logq_printf("CPR: %06lX position suspect — global re-seed jumped\n",
                                              ac->icao);
                     }
 
@@ -1952,7 +2113,7 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
                         ac->suspect_agree = 1;
                         ac->suspect_lat = gLat;
                         ac->suspect_lon = gLon;
-                        serial_console_print("CPR: %06lX position suspect — tight global disagrees with reference\n",
+                        adsb_logq_printf("CPR: %06lX position suspect — tight global disagrees with reference\n",
                                              ac->icao);
                     }
                     // Loose global (2–10s) with local already decoded: skip.
@@ -1989,8 +2150,8 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     }
 
     // --- Print one-line summary with full known state ---
-    // Routes through serial_console_print() so lines are buffered in PSRAM
-    // during CMD mode and replayed when returning to LOG mode.
+    // The log task writes it with serial_console_print(), so lines are
+    // buffered in PSRAM during CMD mode and replayed when returning to LOG mode.
     {
     char line[384];
     int pos = 0, avail = sizeof(line);
@@ -2053,10 +2214,16 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     }
     if (avail > 2) { line[pos++] = ']'; line[pos++] = '\n'; line[pos] = '\0'; }
 
-    serial_console_print("%s", line);
+    // Queued for the log task, never written here: the decoder must not
+    // wait for the console.
+    adsb_logq_push(line, pos);
     }
 
-    sd_log_aircraft(ac, mm);
+    if (!replayed) {
+        int64_t t_sd = esp_timer_get_time();
+        sd_log_aircraft(ac, mm);
+        s_sdlog_busy_us += (uint32_t)(esp_timer_get_time() - t_sd);
+    }
 
     // Queue aircraft update for MQTT feeder (returns immediately if not connected)
     {
@@ -2080,7 +2247,7 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
             mqac.dist_nm = (float)(dist_km * 0.539957);
             mqac.bearing_deg = (int16_t)brg;
         }
-        mqtt_feeder_update_aircraft(&mqac);
+        if (!replayed) mqtt_feeder_update_aircraft(&mqac);
     }
 
     // Update message statistics
@@ -2101,22 +2268,667 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 // demodulate — uses pre-allocated magnitude buffer
 // ============================================================
 
+// Mirror the decoder's DF18 counters for adsb_get_stats() and, once a
+// minute, log them if any DF18 arrived during that minute. The line starts
+// with "DF18:" directly after the timestamp, so the web app's aircraft-line
+// matcher (six hex digits there) cannot take it for an aircraft.
+static void df18_tick(void)
+{
+    uint32_t total = state.stat_df18;
+    s_df18_total   = total;
+    s_df18_tisb    = state.stat_df18_cf[2] + state.stat_df18_cf[3] + state.stat_df18_cf[5];
+    s_df18_adsr    = state.stat_df18_cf[6];
+    s_df18_adsb_nt = state.stat_df18_cf[0] + state.stat_df18_cf[1];
+    s_df18_other   = state.stat_df18_cf[4] + state.stat_df18_cf[7];
+
+    int64_t now = esp_timer_get_time();
+    if (s_df18_win_start == 0 || total < s_df18_win_base) {
+        // first call, or the decoder counters were reset (receiver restart)
+        s_df18_win_start = now;
+        s_df18_win_base = total;
+        return;
+    }
+    if (now - s_df18_win_start >= 60000000LL) {
+        s_df18_last_min = total - s_df18_win_base;
+        s_df18_win_base = total;
+        s_df18_win_start = now;
+        if (s_df18_last_min > 0) {
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            adsb_logq_printf("%sDF18: %lu in last 60 s, %lu total (TIS-B %lu, ADS-R %lu, ADS-B-NT %lu, other %lu)\n",
+                                 _ts, (unsigned long)s_df18_last_min, (unsigned long)total,
+                                 (unsigned long)s_df18_tisb, (unsigned long)s_df18_adsr,
+                                 (unsigned long)s_df18_adsb_nt, (unsigned long)s_df18_other);
+        }
+    }
+}
+
 void demodulate(uint8_t *source, int length)
 {
     if (!s_mag_buf) return;
-    mode_s_compute_magnitude_vector(source, s_mag_buf, length);
-    mode_s_detect(&state, s_mag_buf, length / 2, on_msg);
+    // Streaming detection: carries a short magnitude tail between chunks so
+    // frames straddling a chunk boundary are decoded (they used to be lost),
+    // and maintains an absolute sample counter per frame
+    // (mode_s_frame_sample_index()). Host-tested to be identical to
+    // processing the whole stream as one buffer (harness/check_stream.py).
+    // s_mag_buf holds DEFAULT_BUF_LENGTH/2 + MODE_S_STREAM_TAIL_MAX samples.
+    int64_t t0 = esp_timer_get_time();
+    if (ADSB_DEMOD_IS_2400)
+        mode_s_detect_stream_2400(&state, source, (uint32_t)length, s_mag_buf, on_msg);
+    else
+        mode_s_detect_stream(&state, source, (uint32_t)length, s_mag_buf, on_msg);
+    int64_t t1 = esp_timer_get_time();
+    df18_tick();
+    if (s_replay_counting) s_replay_busy_us += (uint64_t)(t1 - t0);
+    s_capture_bytes_win += (uint32_t)length;
+
+    // Decode load over ~5 s windows (see adsb_stats_t.decode_load)
+    s_decode_busy_us += (uint32_t)(t1 - t0);
+    if (s_window_restart) {
+        s_window_restart = false;
+        s_decode_win_start = 0;
+    }
+    if (s_decode_win_start == 0) {
+        s_decode_win_start = t1;
+        s_decode_busy_us = 0;
+        s_sdlog_busy_us = 0;
+        s_capture_bytes_win = 0;
+        s_win_log_lines0 = s_log_lines_total;
+        s_win_log_bytes0 = s_log_bytes_total;
+        s_win_log_dropped0 = s_log_dropped_total;
+    } else if (t1 - s_decode_win_start >= 5000000LL) {
+        const uint64_t win_us = (uint64_t)(t1 - s_decode_win_start);
+        const uint32_t dec_pm = (uint32_t)(((uint64_t)s_decode_busy_us * 1000ULL) / win_us);
+        const uint32_t sd_pm  = (uint32_t)(((uint64_t)s_sdlog_busy_us * 1000ULL) / win_us);
+        // Two bytes per sample. What the decoder was given against what the
+        // dongle produced: short of 100 % by whatever the USB side or a
+        // full ring lost. (It can read a little over 100 % in a window in
+        // which the decoder caught up on a backlog.)
+        const uint64_t produced = win_us * (uint64_t)ADSB_SAMPLE_RATE * 2ULL / 1000000ULL;
+        const uint32_t cap_pm = produced ? (uint32_t)(((uint64_t)s_capture_bytes_win * 1000ULL) / produced) : 0;
+        const uint32_t lines_total = s_log_lines_total, bytes_total = s_log_bytes_total, dropped_total = s_log_dropped_total;
+        const uint32_t lines_s = (uint32_t)(((uint64_t)(lines_total - s_win_log_lines0) * 1000000ULL) / win_us);
+        const uint32_t bytes_s = (uint32_t)(((uint64_t)(bytes_total - s_win_log_bytes0) * 1000000ULL) / win_us);
+        s_capture_permille     = cap_pm;
+        s_decode_load_permille = dec_pm;
+        s_sdlog_load_permille  = sd_pm;
+        s_log_lines_s = lines_s;
+        s_log_bytes_s = bytes_s;
+        s_log_dropped_win = dropped_total - s_win_log_dropped0;
+        if (cap_pm < s_min_capture_permille) s_min_capture_permille = cap_pm;
+        if (dec_pm > s_peak_decode_permille) s_peak_decode_permille = dec_pm;
+        // Once a minute, on the log itself, so a recorded log shows how
+        // the receiver was doing at any point in a session.
+        if (++s_load_line_windows >= 12) {
+            const uint32_t usb_pm = s_usb_capture_permille;
+            s_load_line_windows = 0;
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            adsb_logq_printf("%sLOAD: capture %lu.%lu%% (USB %lu.%lu%%), decode %lu.%lu%% of one core (SD log %lu.%lu%%), "
+                             "ring max %lu%% dropped %lu, USB starved %lu, "
+                             "log %lu lines/s %lu B/s dropped %lu, %.0f msg/s\n",
+                             _ts, (unsigned long)(cap_pm / 10), (unsigned long)(cap_pm % 10),
+                             (unsigned long)(usb_pm / 10), (unsigned long)(usb_pm % 10),
+                             (unsigned long)(dec_pm / 10), (unsigned long)(dec_pm % 10),
+                             (unsigned long)(sd_pm / 10), (unsigned long)(sd_pm % 10),
+                             (unsigned long)(s_ring.max_fill * 100 / (ADSB_RING_SLOTS - 1)),
+                             (unsigned long)s_ring.dropped, (unsigned long)s_usb_starved,
+                             (unsigned long)lines_s, (unsigned long)bytes_s, (unsigned long)dropped_total,
+                             (double)s_msg_rate);
+        }
+        s_decode_busy_us = 0;
+        s_sdlog_busy_us = 0;
+        s_capture_bytes_win = 0;
+        s_win_log_lines0 = lines_total;
+        s_win_log_bytes0 = bytes_total;
+        s_win_log_dropped0 = dropped_total;
+        s_decode_win_start = t1;
+    }
 }
 
 // ============================================================
-// ADSB reader task — runs the blocking RTL-SDR read loop
-// in its own FreeRTOS task instead of inside the USB callback.
+// Log line queue — see the declarations near the top of the file
+// ============================================================
+
+// Records are a 2-byte length followed by the text. Head and tail count
+// bytes without wrapping; the position in the buffer is the count masked.
+static void logq_write(uint32_t at, const char *src, uint32_t n)
+{
+    at &= (ADSB_LOGQ_BYTES - 1);
+    uint32_t first = ADSB_LOGQ_BYTES - at;
+    if (first > n) first = n;
+    memcpy(s_logq + at, src, first);
+    memcpy(s_logq, src + first, n - first);
+}
+
+static void logq_read(uint32_t at, char *dst, uint32_t n)
+{
+    at &= (ADSB_LOGQ_BYTES - 1);
+    uint32_t first = ADSB_LOGQ_BYTES - at;
+    if (first > n) first = n;
+    memcpy(dst, s_logq + at, first);
+    memcpy(dst + first, s_logq, n - first);
+}
+
+// Queue one line for the console. Never blocks. Called from the decoder
+// task only (one producer).
+static void adsb_logq_push(const char *line, int len)
+{
+    if (len <= 0) return;
+    if (s_replay_counting) return;   // a replay's messages stay off the log
+    if (len > ADSB_LOG_LINE_MAX - 1) len = ADSB_LOG_LINE_MAX - 1;
+    if (s_logq == NULL || s_log_task_hdl == NULL) {
+        // No queue (allocation failed at start-up): write directly, as
+        // every release before r9 did.
+        if (serial_console_print("%.*s", len, line)) {
+            s_log_lines_total++;
+            s_log_bytes_total += (uint32_t)len + 1;
+        }
+        return;
+    }
+    uint32_t head = atomic_load_explicit(&s_logq_head, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&s_logq_tail, memory_order_acquire);
+    if (ADSB_LOGQ_BYTES - (head - tail) < (uint32_t)len + 2) {
+        s_log_dropped_total++;   // the console is not keeping up
+        return;
+    }
+    char hdr[2] = { (char)(len & 0xff), (char)(len >> 8) };
+    logq_write(head, hdr, 2);
+    logq_write(head + 2, line, (uint32_t)len);
+    atomic_store_explicit(&s_logq_head, head + 2 + (uint32_t)len, memory_order_release);
+    xTaskNotifyGive(s_log_task_hdl);
+}
+
+static void adsb_logq_printf(const char *fmt, ...)
+{
+    char tmp[ADSB_LOG_LINE_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (n >= (int)sizeof(tmp)) n = (int)sizeof(tmp) - 1;
+    adsb_logq_push(tmp, n);
+}
+
+// Writes queued lines to the console. This is the task that waits for the
+// UART now; it runs below the decoder and the application tasks.
+// The console UART is polled (no driver): a write that does not fit its
+// transmit FIFO spins until it does. A task that spins at this priority
+// would take a whole core from the display whenever the log is busy, so
+// the writer keeps an estimate of when the FIFO will have room for the
+// next line and sleeps until then. It still fills the UART completely.
+#ifdef CONFIG_ESP_CONSOLE_UART_BAUDRATE
+#define ADSB_LOG_UART_BYTE_US (10000000 / CONFIG_ESP_CONSOLE_UART_BAUDRATE)
+#define ADSB_LOG_UART_FIFO    127
+#endif
+
+static void adsb_log_task(void *arg)
+{
+    static char line[ADSB_LOG_LINE_MAX];
+#ifdef ADSB_LOG_UART_BYTE_US
+    int64_t drain_at = 0;   // when the bytes written so far will have left the FIFO
+#endif
+    for (;;) {
+        uint32_t tail = atomic_load_explicit(&s_logq_tail, memory_order_relaxed);
+        uint32_t head = atomic_load_explicit(&s_logq_head, memory_order_acquire);
+        if (head == tail) {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+            continue;
+        }
+        unsigned char hdr[2];
+        logq_read(tail, (char *)hdr, 2);
+        uint32_t len = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8);
+        if (len >= ADSB_LOG_LINE_MAX) len = ADSB_LOG_LINE_MAX - 1;  // cannot happen; never overrun the buffer
+        logq_read(tail + 2, line, len);
+        line[len] = '\0';
+        atomic_store_explicit(&s_logq_tail, tail + 2 + len, memory_order_release);
+#ifdef ADSB_LOG_UART_BYTE_US
+        const uint32_t out = len + 1;   // + the CR the console adds
+        if (serial_console_log_enabled()) {
+            int64_t now = esp_timer_get_time();
+            if (drain_at < now) drain_at = now;
+            // Room for the whole line, or an empty FIFO for a longer one
+            const uint32_t need = out < ADSB_LOG_UART_FIFO ? out : ADSB_LOG_UART_FIFO;
+            int64_t room_at = drain_at - (int64_t)(ADSB_LOG_UART_FIFO - need) * ADSB_LOG_UART_BYTE_US;
+            if (room_at > now) vTaskDelay(pdMS_TO_TICKS((uint32_t)((room_at - now + 999) / 1000)));
+        }
+#endif
+        // In command mode this buffers the line for replay instead of
+        // printing it, as before.
+        if (serial_console_print("%s", line)) {
+            s_log_lines_total++;
+            s_log_bytes_total += len + 1;   // + the CR the console adds
+#ifdef ADSB_LOG_UART_BYTE_US
+            int64_t now = esp_timer_get_time();
+            if (drain_at < now) drain_at = now;
+            drain_at += (int64_t)out * ADSB_LOG_UART_BYTE_US;
+            // On return at most a FIFO's worth is still waiting
+            if (drain_at > now + (int64_t)ADSB_LOG_UART_FIFO * ADSB_LOG_UART_BYTE_US)
+                drain_at = now + (int64_t)ADSB_LOG_UART_FIFO * ADSB_LOG_UART_BYTE_US;
+#endif
+        }
+    }
+}
+
+// Create the queue and its task on first use. On failure lines are
+// written directly (adsb_logq_push).
+static void adsb_log_start(void)
+{
+    if (s_log_task_hdl != NULL) return;
+    if (s_logq == NULL) {
+        s_logq = heap_caps_malloc(ADSB_LOGQ_BYTES, MALLOC_CAP_SPIRAM);
+        atomic_init(&s_logq_head, 0);
+        atomic_init(&s_logq_tail, 0);
+    }
+    if (s_logq == NULL) {
+        ESP_LOGW(TAG, "log queue alloc failed — log lines are written from the decoder");
+        return;
+    }
+    TaskHandle_t h = NULL;
+    if (xTaskCreateWithCaps(adsb_log_task, "adsb_log", ADSB_LOG_TASK_STACK, NULL,
+                            ADSB_LOG_TASK_PRIO, &h, MALLOC_CAP_SPIRAM) != pdPASS) {
+        ESP_LOGW(TAG, "log task create failed — log lines are written from the decoder");
+        return;
+    }
+    s_log_task_hdl = h;
+}
+
+// ============================================================
+// Observation mark and replay
+// ============================================================
+
+void adsb_stats_mark(void)
+{
+    s_mark_ring_dropped = s_ring_mem ? s_ring.dropped : 0;
+    s_mark_usb_starved  = s_usb_starved;
+    s_mark_log_dropped  = s_log_dropped_total;
+    s_min_capture_permille = 1000;
+    s_peak_decode_permille = 0;
+    s_window_restart = true;   // the window in progress straddles the mark: discard it
+    s_mark_us = esp_timer_get_time();
+}
+
+// Forget every tracked aircraft. A replay starts and ends with this, so
+// live and recorded traffic never share the table.
+static void aircraft_table_clear(void)
+{
+    if (!aircraft_mutex) return;
+    xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
+    memset(aircraft_table, 0, sizeof(aircraft_table));
+    memset(cpr_cache, 0, sizeof(cpr_cache));
+    xSemaphoreGive(aircraft_mutex);
+}
+
+// Called by the decoder task whenever it finds the ring empty. Everything
+// a replay changes in the decoder's state is changed here, by the decoder
+// itself, at a moment when it has no samples in hand.
+static void replay_service_idle(void)
+{
+    if (s_replay_phase == 1) {
+        aircraft_table_clear();
+        mode_s_cache_clock(&state, ADSB_SAMPLE_RATE);  // the recording's clock, not the wall's
+        s_replay_msgs = 0;
+        s_replay_busy_us = 0;
+        s_replay_counting = true;
+        s_replay_phase = 2;
+    } else if (s_replay_phase == 3) {
+        s_replay_counting = false;
+        mode_s_cache_clock(&state, 0);
+        aircraft_table_clear();
+        s_replay_phase = 0;
+    }
+}
+
+static void replay_fail(const char *msg)
+{
+    snprintf(s_replay.error, sizeof(s_replay.error), "%s", msg);
+    s_replay.ok = false;
+}
+
+static void adsb_replay_task(void *arg)
+{
+    FILE *f = NULL;
+    uint8_t *buf = heap_caps_malloc(ADSB_USB_XFER_BYTES, MALLOC_CAP_SPIRAM);
+    const int64_t t_start = esp_timer_get_time();
+    const uint32_t dropped0 = s_ring.dropped;
+    bool taken_over = false;
+
+    s_replay.ok = true;
+    if (!buf) { replay_fail("out of memory"); goto out; }
+    f = fopen(s_replay.path, "rb");
+    if (!f) { replay_fail("cannot open the file"); goto out; }
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long sz = ftell(f);
+        if (sz > 0) s_replay.file_bytes = (uint64_t)sz;
+    }
+    rewind(f);
+
+    // Take the ring's input over from the live stream: the USB callback
+    // stops storing (it finishes within a millisecond), then the decoder
+    // empties the ring and switches itself over.
+    s_replay_feed = true;
+    taken_over = true;
+    vTaskDelay(pdMS_TO_TICKS(50));
+    s_replay_phase = 1;
+    for (int i = 0; s_replay_phase != 2; i++) {
+        if (s_decode_task_hdl == NULL || s_decode_stop || i > 500) {
+            replay_fail("the decoder did not take over (is the receiver running?)");
+            goto out;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    sample_ring_note_loss(&s_ring, 0);   // the recording does not follow the live samples
+
+    for (;;) {
+        if (s_replay_stop) { replay_fail("stopped"); break; }
+        if (s_decode_task_hdl == NULL || s_decode_stop) { replay_fail("the receiver stopped"); break; }
+        size_t n = fread(buf, 1, ADSB_USB_XFER_BYTES, f);
+        n &= ~(size_t)1;   // whole I/Q pairs
+        if (n == 0) break;
+        // Never overflow: wait for the decoder. This is what makes the
+        // result repeatable.
+        while (sample_ring_fill(&s_ring) >= ADSB_RING_SLOTS - 2 && !s_replay_stop &&
+               s_decode_task_hdl != NULL && !s_decode_stop)
+            vTaskDelay(1);
+        sample_ring_put(&s_ring, buf, (uint32_t)n, esp_timer_get_time());
+        s_replay.fed_bytes += n;
+        if (s_decode_task_hdl != NULL && sample_ring_fill(&s_ring) >= ADSB_DECODE_BATCH_SLOTS)
+            xTaskNotifyGive(s_decode_task_hdl);
+    }
+
+out:
+    if (taken_over) {
+        // Let the decoder finish what is in the ring and switch back.
+        if (s_replay_phase == 2) {
+            s_replay_phase = 3;
+            for (int i = 0; s_replay_phase != 0 && i < 3000; i++) {
+                if (s_decode_task_hdl == NULL || s_decode_stop) break;
+                xTaskNotifyGive(s_decode_task_hdl);
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+        }
+        if (s_replay_phase != 0) {
+            // The decoder task has gone (dongle removed): undo by hand.
+            s_replay_counting = false;
+            s_replay_phase = 0;
+        }
+        s_replay.messages       = s_replay_msgs;
+        s_replay.decode_busy_ms = (uint32_t)(s_replay_busy_us / 1000);
+        s_replay.ring_dropped   = s_ring.dropped - dropped0;
+        s_replay.signal_ms      = (uint32_t)(s_replay.fed_bytes / 2 * 1000ULL / ADSB_SAMPLE_RATE);
+        s_live_gap_pending = true;
+        s_replay_feed = false;
+        adsb_stats_mark();   // the extremes of the last minutes describe the replay, not the receiver
+    }
+    s_replay.wall_ms = (uint32_t)((esp_timer_get_time() - t_start) / 1000);
+    if (f) fclose(f);
+    heap_caps_free(buf);
+
+    {
+        char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+        if (s_replay.ok) {
+            uint32_t share_pm = s_replay.signal_ms ? (uint32_t)((uint64_t)s_replay.decode_busy_ms * 1000ULL / s_replay.signal_ms) : 0;
+            serial_console_print("%sREPLAY: %s: %llu bytes, %lu.%lu s of signal, %lu messages, "
+                                 "decoder busy %lu ms = %lu.%lu%% of one core at real time, "
+                                 "%lu transfers dropped, took %lu s\n",
+                                 _ts, s_replay.path, (unsigned long long)s_replay.fed_bytes,
+                                 (unsigned long)(s_replay.signal_ms / 1000), (unsigned long)(s_replay.signal_ms % 1000 / 100),
+                                 (unsigned long)s_replay.messages, (unsigned long)s_replay.decode_busy_ms,
+                                 (unsigned long)(share_pm / 10), (unsigned long)(share_pm % 10),
+                                 (unsigned long)s_replay.ring_dropped, (unsigned long)(s_replay.wall_ms / 1000));
+        } else {
+            serial_console_print("%sREPLAY: %s: failed: %s (%llu bytes fed, %lu messages)\n",
+                                 _ts, s_replay.path, s_replay.error,
+                                 (unsigned long long)s_replay.fed_bytes, (unsigned long)s_replay.messages);
+        }
+    }
+    s_replay.done = true;
+    s_replay.running = false;
+    vTaskDeleteWithCaps(NULL);   // a task with a PSRAM stack ends itself this way
+}
+
+bool adsb_replay_start(const char *path, char *err, size_t err_len)
+{
+    const char *why = NULL;
+    if (!path || !path[0])                        why = "no file given";
+    else if (s_replay.running)                    why = "a replay is already running";
+    else if (s_decode_task_hdl == NULL || !s_ring_mem || !s_rtlsdr_connected)
+                                                  why = "the receiver is not running (attach the dongle first)";
+    if (!why) {
+        memset(&s_replay, 0, sizeof(s_replay));
+        snprintf(s_replay.path, sizeof(s_replay.path), "%s", path);
+        s_replay.running = true;
+        s_replay_stop = false;
+        if (xTaskCreateWithCaps(adsb_replay_task, "adsb_replay", ADSB_REPLAY_TASK_STACK, NULL,
+                                ADSB_REPLAY_TASK_PRIO, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
+            s_replay.running = false;
+            why = "could not start the replay task";
+        }
+    }
+    if (why) {
+        if (err && err_len) snprintf(err, err_len, "%s", why);
+        return false;
+    }
+    return true;
+}
+
+void adsb_replay_stop(void)
+{
+    if (s_replay.running) s_replay_stop = true;
+}
+
+void adsb_replay_get(adsb_replay_status_t *out)
+{
+    if (!out) return;
+    *out = s_replay;
+    if (s_replay.running) {
+        // live figures while it runs
+        out->messages = s_replay_msgs;
+        out->wall_ms = 0;
+    }
+}
+
+// ============================================================
+// USB transfer -> sample ring (reader task context)
+// ============================================================
+
+// One finished USB transfer. Runs inside rtlsdr_stream_poll(), in the
+// reader task. Everything here must be quick: while it runs, the
+// transfer it was called for is not queued.
+static void usb_stream_data_cb(const uint8_t *data, int len, int64_t t_us, bool starved, void *ctx)
+{
+    if (s_replay_feed) {
+        // A recording is being replayed: the replay task is the ring's
+        // only writer. Keep reading the dongle, discard what it sends.
+        s_usb_prev_cb_us = t_us;
+        s_usb_bytes_total += (uint32_t)len;
+        return;
+    }
+    if (s_live_gap_pending) {
+        s_live_gap_pending = false;
+        sample_ring_note_loss(&s_ring, 0);   // live samples do not follow the recording
+    }
+    if (starved) {
+        // No other transfer was still queued: the dongle was not being
+        // read from the moment the last of them finished until now. The
+        // previous callback ran at s_usb_prev_cb_us with every transfer
+        // queued again, so they kept the endpoint busy for one transfer
+        // period each; the rest of the elapsed time is the loss. This is
+        // an estimate – it is off by however late that previous callback
+        // was – and the capture figure in adsb status is the measurement.
+        if (s_usb_prev_cb_us != 0) {
+            const int64_t period_us = (int64_t)(ADSB_USB_XFER_BYTES / 2) * 1000000LL / ADSB_SAMPLE_RATE;
+            int64_t idle_us = (t_us - s_usb_prev_cb_us) - (int64_t)s_usb_xfers * period_us;
+            uint32_t lost = idle_us > 0 ? (uint32_t)(idle_us * (int64_t)ADSB_SAMPLE_RATE / 1000000LL) : 0;
+            // With a single transfer (memory was short) every completion
+            // finds the endpoint dry; count only those that cost samples.
+            if (s_usb_xfers > 1 || lost > 0) {
+                sample_ring_note_loss(&s_ring, lost);
+                s_usb_starved++;
+            }
+        }
+    }
+    s_usb_prev_cb_us = t_us;
+    s_usb_bytes_total += (uint32_t)len;
+    sample_ring_put(&s_ring, data, (uint32_t)len, t_us);   // a full ring drops it and counts
+    if (s_decode_task_hdl != NULL && sample_ring_fill(&s_ring) >= ADSB_DECODE_BATCH_SLOTS)
+        xTaskNotifyGive(s_decode_task_hdl);
+}
+
+// ============================================================
+// Decoder task — takes samples from the ring and decodes them
+// ============================================================
+
+static void adsb_decode_task(void *arg)
+{
+    bool waited = false;
+    int64_t last_rest_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "ADSB decoder task started");
+    while (!s_decode_stop) {
+        // Let a few transfers collect, so the decoder works in long runs:
+        // one bounded wait, then take whatever is there.
+        if (!waited && sample_ring_fill(&s_ring) < ADSB_DECODE_BATCH_SLOTS) {
+            waited = true;
+            int64_t t_wait = esp_timer_get_time();
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+            int64_t t_woke = esp_timer_get_time();
+            if (t_woke - t_wait >= 1000) last_rest_us = t_woke;   // it really slept
+            continue;
+        }
+        waited = false;
+
+        // A decoder that cannot keep up never waits above, and would then
+        // hold a core for good: the tasks below it on that core, and the
+        // idle task the watchdog watches, would not run. One tick of rest
+        // every 200 ms costs half a percent and prevents that.
+        if (esp_timer_get_time() - last_rest_us > 200000) {
+            vTaskDelay(1);
+            last_rest_us = esp_timer_get_time();
+        }
+
+        const uint8_t *data;
+        uint32_t bytes, lost;
+        bool gap;
+        int64_t t_us;
+        uint32_t n = sample_ring_peek(&s_ring, DEFAULT_BUF_LENGTH, &data, &bytes, &gap, &lost, &t_us);
+        if (n == 0) {
+            replay_service_idle();   // the ring is empty: a replay may start or end here
+            continue;
+        }
+        (void)t_us;   // the time stamp is for the timebase work (ROADMAP-AVIATION.md 4.1)
+
+        if (gap) {
+            // Samples were lost before this run: do not join it to the
+            // previous one, and keep the sample count honest.
+            mode_s_stream_gap(&state, lost);
+            s_decode_gaps++;
+        }
+        // Decoded in place; the slots are given back afterwards.
+        demodulate((uint8_t *)data, (int)bytes);
+        sample_ring_release(&s_ring, n);
+
+        // One-shot health check after first successful read
+        {
+            static bool first_read_logged = false;
+            if (!first_read_logged) {
+                first_read_logged = true;
+                ESP_LOGI(TAG, "First read OK, stack HWM: %u free, heap: %s",
+                         (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)),
+                         heap_caps_check_integrity_all(true) ? "OK" : "CORRUPT");
+            }
+        }
+
+        // Adaptive gain evaluation — phase-dependent timing. Paused while a
+        // recording is replayed: its statistics say nothing about the dongle.
+        if (s_replay_feed) {
+            s_gain_last_eval = esp_timer_get_time();
+        } else if (s_gain_auto) {
+            int64_t now_gain = esp_timer_get_time();
+            int64_t elapsed = now_gain - s_gain_last_eval;
+            uint32_t msgs = state.stat_crc_ok + state.stat_crc_fail;
+            bool should_eval = false;
+
+            // Warmup: let decoder stabilize before first evaluation
+            if (s_gain_warmup && elapsed < GAIN_WARMUP_US) {
+                // Still warming up — skip
+            } else {
+                if (s_gain_warmup) {
+                    // Warmup just ended — flush accumulated counters so first real window starts clean
+                    s_gain_warmup = false;
+                    state.stat_crc_ok = 0;
+                    state.stat_crc_fail = 0;
+                    state.stat_preambles = 0;
+                    state.stat_signal_sum = 0;
+                    state.stat_delta_sum = 0;
+                    s_gain_win_pos = 0;
+                    s_gain_last_eval = now_gain;
+                    ESP_LOGI("GAIN", "Warmup complete — starting adaptive gain");
+                } else if (s_gain_phase == 1) {
+                    // Phase 1: fast — every 10s or 200 messages
+                    if (elapsed >= GAIN_P1_PERIOD_US || msgs >= GAIN_P1_MSG_COUNT)
+                        should_eval = true;
+                } else {
+                    // Phase 2: steady — every 60s
+                    if (elapsed >= GAIN_P2_PERIOD_US)
+                        should_eval = true;
+                }
+
+                if (should_eval) {
+                    gain_evaluate(&state);
+                    s_gain_last_eval = now_gain;
+                }
+            }
+        }
+
+        // Manual-mode heartbeat: log stats every 60s for webapp visibility
+        if (!s_gain_auto) {
+            static int64_t s_manual_hb_last = 0;
+            static uint32_t s_manual_hb_ok = 0;
+            static uint32_t s_manual_hb_fail = 0;
+            static uint32_t s_manual_hb_pos = 0;
+            static uint64_t s_manual_hb_signal = 0;
+            static uint64_t s_manual_hb_delta = 0;
+            int64_t now_hb = esp_timer_get_time();
+            if (s_manual_hb_last == 0) s_manual_hb_last = now_hb;  // first call
+            if (now_hb - s_manual_hb_last >= GAIN_P2_PERIOD_US) {
+                float elapsed_s = (now_hb - s_manual_hb_last) / 1e6f;
+                uint32_t d_ok = state.stat_crc_ok - s_manual_hb_ok;
+                uint32_t d_fail = state.stat_crc_fail - s_manual_hb_fail;
+                uint32_t d_pos = s_gain_win_pos - s_manual_hb_pos;
+                uint64_t d_signal = state.stat_signal_sum - s_manual_hb_signal;
+                uint64_t d_delta_sum = state.stat_delta_sum - s_manual_hb_delta;
+                float err = (d_ok + d_fail > 0) ? (float)d_fail / (d_ok + d_fail) : 0;
+                float pos_rate = (elapsed_s > 0) ? d_pos / elapsed_s : 0;
+                uint32_t hb_avg_sig = d_ok > 0 ? (uint32_t)(d_signal / d_ok) : 0;
+                uint32_t hb_avg_del = d_ok > 0 ? (uint32_t)(d_delta_sum / d_ok) : 0;
+                s_manual_hb_last = now_hb;
+                s_manual_hb_ok = state.stat_crc_ok;
+                s_manual_hb_fail = state.stat_crc_fail;
+                s_manual_hb_pos = s_gain_win_pos;
+                s_manual_hb_signal = state.stat_signal_sum;
+                s_manual_hb_delta = state.stat_delta_sum;
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: [Manual] %.1f dB, err=%.0f%%, pos=%.1f/s, range=%.0fnm, sig=%lu delta=%lu\n",
+                                     _ts, R820T_GAINS[s_gain_idx] / 10.0,
+                                     err * 100, pos_rate, s_max_range_nm,
+                                     (unsigned long)hb_avg_sig, (unsigned long)hb_avg_del);
+            }
+        }
+    }
+
+    // Tell the reader task we are out of the decoder and hold nothing,
+    // then wait to be deleted.
+    xSemaphoreGive(s_decode_done);
+    vTaskSuspend(NULL);
+}
+
+// ============================================================
+// ADSB reader task — opens the RTL-SDR, then keeps its sample stream
+// moving into the ring until the device goes away.
 // ============================================================
 
 static void adsb_reader_task(void *arg)
 {
     class_driver_t *driver_obj = (class_driver_t *)arg;
-    int r, n_read = 0;
+    int r;
 
     uint8_t dev_addr = s_new_dev_addr;
     ESP_LOGI(TAG, "ADSB reader task started for device %d", dev_addr);
@@ -2140,9 +2952,9 @@ static void adsb_reader_task(void *arg)
     if (r < 0) fprintf(stderr, "WARNING: Failed to set center freq.\n");
     else       fprintf(stderr, "Tuned to %u Hz.\n", 1090000000);
 
-    r = rtlsdr_set_sample_rate(rtldev, 2000000);
+    r = rtlsdr_set_sample_rate(rtldev, ADSB_SAMPLE_RATE);
     if (r < 0) fprintf(stderr, "WARNING: Failed to set sample rate.\n");
-    else       fprintf(stderr, "Sampling at %u S/s.\n", 2000000);
+    else       fprintf(stderr, "Sampling at %u S/s.\n", (unsigned)ADSB_SAMPLE_RATE);
 
     r = rtlsdr_set_tuner_gain_mode(rtldev, 1);  // 1 = manual gain
     if (r != 0) fprintf(stderr, "WARNING: Failed to set tuner gain mode.\n");
@@ -2186,6 +2998,14 @@ static void adsb_reader_task(void *arg)
     ESP_LOGI(TAG, "[APP] Free memory: %ld bytes", esp_get_free_heap_size());
 
     mode_s_init(&state);
+#ifdef CONFIG_ADSB_DECODE_FIX2
+    // Exact 2-bit correction with false-decode discipline; see the help
+    // text of ADSB_DECODE_FIX2 in main/Kconfig.projbuild and docs/DECODER.md.
+    state.fix2 = 1;
+    state.strict_es = 1;
+    state.fix2_known_icao = 1;
+    state.soft_fix = 8; // soft rescue; used by the 2.4 Msps demodulator only
+#endif
     ESP_LOGI(TAG, "mode_s_init done, stack HWM: %u free, heap: %s",
              (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)),
              heap_caps_check_integrity_all(true) ? "OK" : "CORRUPT");
@@ -2205,156 +3025,128 @@ static void adsb_reader_task(void *arg)
 
     s_msg_window_start = esp_timer_get_time();
 
-    // Allocate read buffers and magnitude buffer once — in PSRAM to
-    // preserve internal RAM for SDMMC DMA, LVGL, and wallpaper decoding.
-    uint8_t *buffer = heap_caps_malloc(DEFAULT_BUF_LENGTH * sizeof(uint8_t), MALLOC_CAP_SPIRAM);
-    if (buffer == NULL) { ESP_LOGE(TAG, "buffer malloc failed"); goto done; }
-
-    uint8_t *tbuffer = heap_caps_malloc(MAX_PACKET_SIZE * sizeof(uint8_t), MALLOC_CAP_SPIRAM);
-    if (tbuffer == NULL) {
-        ESP_LOGE(TAG, "tbuffer malloc failed");
-        free(buffer);
-        goto done;
+    // ---- Sample path ----
+    // This task reads the dongle and does nothing else; the decoder runs
+    // in its own task and takes the samples from a ring between the two
+    // (usb_stream.h, sample_ring.h). Up to r8 this task read a buffer and
+    // then decoded it, and nothing was received while it decoded.
+    if (s_ring_mem == NULL) {
+        s_ring_mem = heap_caps_aligned_alloc(8, sample_ring_mem_size(ADSB_RING_SLOTS, ADSB_USB_XFER_BYTES), MALLOC_CAP_SPIRAM);
+        if (s_ring_mem == NULL) { ESP_LOGE(TAG, "sample ring malloc failed"); goto done; }
+        sample_ring_init(&s_ring, s_ring_mem, ADSB_RING_SLOTS, ADSB_USB_XFER_BYTES);
+    } else {
+        sample_ring_reset(&s_ring);  // no decoder task is running at this point
     }
 
-    s_mag_buf = heap_caps_malloc((DEFAULT_BUF_LENGTH / 2) * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    // Magnitude buffer for one decoder run, in PSRAM to preserve internal
+    // RAM for SDMMC DMA, LVGL, and wallpaper decoding.
+    s_mag_buf = heap_caps_malloc(((DEFAULT_BUF_LENGTH / 2) + MODE_S_STREAM_TAIL_MAX) * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    mode_s_stream_reset(&state); // new sample stream: drop any tail carried from a previous run
     if (s_mag_buf == NULL) {
         ESP_LOGE(TAG, "mag buffer malloc failed");
-        free(tbuffer);
-        free(buffer);
         goto done;
     }
-    // Main read loop — runs until stop flag is set (e.g. device removed)
-    int consecutive_errors = 0;
+
+    adsb_log_start();   // log writer task; created once, kept
+
+    if (s_decode_done == NULL) s_decode_done = xSemaphoreCreateBinary();
+    if (s_decode_done == NULL) {
+        ESP_LOGE(TAG, "decoder semaphore alloc failed");
+        free(s_mag_buf);
+        s_mag_buf = NULL;
+        goto done;
+    }
+    xSemaphoreTake(s_decode_done, 0);   // clear a stale completion signal
+    s_decode_stop = false;
     s_gain_last_eval = esp_timer_get_time();
-
-    while (!s_adsb_reader_stop) {
-        // Apply deferred gain changes from external callers (serial console)
-        // This ensures rtlsdr_set_tuner_gain() is only called from the USB task.
-        if (s_gain_pending) {
-            gain_apply();
-            s_gain_pending = false;
-        }
-
-        int read_ok = 1;
-        for (int i = 0; i < DEFAULT_BUF_LENGTH; i += MAX_PACKET_SIZE) {
-            r = rtlsdr_read_sync(rtldev, tbuffer, MAX_PACKET_SIZE, &n_read);
-            if (r < 0) {
-                fprintf(stderr, "WARNING: sync read failed. %d\n", r);
-                read_ok = 0;
-                break;
-            }
-            if ((uint32_t)n_read < MAX_PACKET_SIZE) {
-                fprintf(stderr, "Short read\n");
-                read_ok = 0;
-                break;
-            }
-            memcpy(&buffer[i], tbuffer, MAX_PACKET_SIZE);
-        }
-        if (read_ok && n_read > 0) {
-            demodulate(buffer, DEFAULT_BUF_LENGTH);
-            consecutive_errors = 0;  // reset on successful read
-
-            // One-shot health check after first successful read
-            {
-                static bool first_read_logged = false;
-                if (!first_read_logged) {
-                    first_read_logged = true;
-                    ESP_LOGI(TAG, "First read OK, stack HWM: %u free, heap: %s",
-                             (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)),
-                             heap_caps_check_integrity_all(true) ? "OK" : "CORRUPT");
-                }
-            }
-
-            // Adaptive gain evaluation — phase-dependent timing
-            if (s_gain_auto) {
-                int64_t now_gain = esp_timer_get_time();
-                int64_t elapsed = now_gain - s_gain_last_eval;
-                uint32_t msgs = state.stat_crc_ok + state.stat_crc_fail;
-                bool should_eval = false;
-
-                // Warmup: let decoder stabilize before first evaluation
-                if (s_gain_warmup && elapsed < GAIN_WARMUP_US) {
-                    // Still warming up — skip
-                } else {
-                    if (s_gain_warmup) {
-                        // Warmup just ended — flush accumulated counters so first real window starts clean
-                        s_gain_warmup = false;
-                        state.stat_crc_ok = 0;
-                        state.stat_crc_fail = 0;
-                        state.stat_preambles = 0;
-                        state.stat_signal_sum = 0;
-                        state.stat_delta_sum = 0;
-                        s_gain_win_pos = 0;
-                        s_gain_last_eval = now_gain;
-                        ESP_LOGI("GAIN", "Warmup complete — starting adaptive gain");
-                    } else if (s_gain_phase == 1) {
-                        // Phase 1: fast — every 10s or 200 messages
-                        if (elapsed >= GAIN_P1_PERIOD_US || msgs >= GAIN_P1_MSG_COUNT)
-                            should_eval = true;
-                    } else {
-                        // Phase 2: steady — every 60s
-                        if (elapsed >= GAIN_P2_PERIOD_US)
-                            should_eval = true;
-                    }
-
-                    if (should_eval) {
-                        gain_evaluate(&state);
-                        s_gain_last_eval = now_gain;
-                    }
-                }
-            }
-
-            // Manual-mode heartbeat: log stats every 60s for webapp visibility
-            if (!s_gain_auto) {
-                static int64_t s_manual_hb_last = 0;
-                static uint32_t s_manual_hb_ok = 0;
-                static uint32_t s_manual_hb_fail = 0;
-                static uint32_t s_manual_hb_pos = 0;
-                static uint64_t s_manual_hb_signal = 0;
-                static uint64_t s_manual_hb_delta = 0;
-                int64_t now_hb = esp_timer_get_time();
-                if (s_manual_hb_last == 0) s_manual_hb_last = now_hb;  // first call
-                if (now_hb - s_manual_hb_last >= GAIN_P2_PERIOD_US) {
-                    float elapsed_s = (now_hb - s_manual_hb_last) / 1e6f;
-                    uint32_t d_ok = state.stat_crc_ok - s_manual_hb_ok;
-                    uint32_t d_fail = state.stat_crc_fail - s_manual_hb_fail;
-                    uint32_t d_pos = s_gain_win_pos - s_manual_hb_pos;
-                    uint64_t d_signal = state.stat_signal_sum - s_manual_hb_signal;
-                    uint64_t d_delta_sum = state.stat_delta_sum - s_manual_hb_delta;
-                    float err = (d_ok + d_fail > 0) ? (float)d_fail / (d_ok + d_fail) : 0;
-                    float pos_rate = (elapsed_s > 0) ? d_pos / elapsed_s : 0;
-                    uint32_t hb_avg_sig = d_ok > 0 ? (uint32_t)(d_signal / d_ok) : 0;
-                    uint32_t hb_avg_del = d_ok > 0 ? (uint32_t)(d_delta_sum / d_ok) : 0;
-                    s_manual_hb_last = now_hb;
-                    s_manual_hb_ok = state.stat_crc_ok;
-                    s_manual_hb_fail = state.stat_crc_fail;
-                    s_manual_hb_pos = s_gain_win_pos;
-                    s_manual_hb_signal = state.stat_signal_sum;
-                    s_manual_hb_delta = state.stat_delta_sum;
-                    char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
-                    serial_console_print("%sGAIN: [Manual] %.1f dB, err=%.0f%%, pos=%.1f/s, range=%.0fnm, sig=%lu delta=%lu\n",
-                                         _ts, R820T_GAINS[s_gain_idx] / 10.0,
-                                         err * 100, pos_rate, s_max_range_nm,
-                                         (unsigned long)hb_avg_sig, (unsigned long)hb_avg_del);
-                }
-            }
-        }
-        if (!read_ok) {
-            consecutive_errors++;
-            if (consecutive_errors >= 10) {
-                ESP_LOGE(TAG, "Too many consecutive read errors (%d) — assuming device disconnected", consecutive_errors);
-                break;
-            }
-            // Back off briefly on read errors before retrying
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
+    if (xTaskCreateWithCaps(adsb_decode_task, "adsb_decode", ADSB_DECODE_TASK_STACK, NULL,
+                            ADSB_DECODE_TASK_PRIO, &s_decode_task_hdl, MALLOC_CAP_SPIRAM) != pdPASS) {
+        ESP_LOGE(TAG, "decoder task create failed");
+        s_decode_task_hdl = NULL;
+        free(s_mag_buf);
+        s_mag_buf = NULL;
+        goto done;
     }
 
-    free(s_mag_buf);
+    s_usb_prev_cb_us = 0;
+    s_usb_xfers = rtlsdr_stream_start(rtldev, usb_stream_data_cb, NULL);
+    if (s_usb_xfers <= 0) {
+        ESP_LOGE(TAG, "could not start the USB sample stream");
+        s_usb_xfers = 0;
+        s_rtlsdr_connected = false;
+        s_rtlsdr_error = true;
+    } else {
+        ESP_LOGI(TAG, "Sample stream: %d USB transfers of %d bytes, ring of %d (%u ms)",
+                 s_usb_xfers, ADSB_USB_XFER_BYTES, ADSB_RING_SLOTS,
+                 (unsigned)((uint64_t)ADSB_RING_SLOTS * (ADSB_USB_XFER_BYTES / 2) * 1000ULL / ADSB_SAMPLE_RATE));
+
+        // Main loop — runs until stop flag is set (e.g. device removed).
+        // Completed transfers are delivered to usb_stream_data_cb() from
+        // inside rtlsdr_stream_poll(), and from inside the control
+        // transfers of a gain change, which pump the same event queue.
+        int64_t  usb_win_start = esp_timer_get_time();
+        uint64_t usb_win_bytes0 = s_usb_bytes_total;
+        int      silent_windows = 0;
+        while (!s_adsb_reader_stop) {
+            // Tuner and bias-T writes requested by other tasks: only this
+            // task may talk to the device.
+            if (s_gain_pending) {
+                s_gain_pending = false;
+                gain_apply_now();
+            }
+            if (s_bias_pending >= 0) {
+                int on = s_bias_pending;
+                s_bias_pending = -1;
+                rtlsdr_set_bias_tee(rtldev, on);
+                ESP_LOGI(TAG, "Bias-T: %s", on ? "ON" : "OFF");
+            }
+
+            rtlsdr_stream_poll(rtldev, pdMS_TO_TICKS(20));
+
+            if (!rtlsdr_stream_alive()) {
+                adsb_stream_stats_t us;
+                rtlsdr_stream_get_stats(&us);
+                ESP_LOGE(TAG, "USB sample stream ended (%lu errors, last status %d) — assuming device disconnected",
+                         (unsigned long)us.errors, us.last_error);
+                break;
+            }
+
+            // What arrived over USB against what the dongle produced, in
+            // 5 s windows (adsb_stats_t.usb_capture).
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - usb_win_start >= 5000000LL) {
+                uint64_t got = s_usb_bytes_total - usb_win_bytes0;
+                uint64_t produced = (uint64_t)(now_us - usb_win_start) * (uint64_t)ADSB_SAMPLE_RATE * 2ULL / 1000000ULL;
+                s_usb_capture_permille = produced ? (uint32_t)(got * 1000ULL / produced) : 0;
+                if (got == 0) {
+                    if ((silent_windows++ % 12) == 0)
+                        ESP_LOGW(TAG, "No samples from the dongle for 5 s");
+                } else {
+                    silent_windows = 0;
+                }
+                usb_win_start = now_us;
+                usb_win_bytes0 = s_usb_bytes_total;
+            }
+        }
+        rtlsdr_stream_stop(rtldev);
+    }
+
+    // Stop the decoder: it finishes the run it is in, then parks.
+    s_decode_stop = true;
+    xTaskNotifyGive(s_decode_task_hdl);
+    if (xSemaphoreTake(s_decode_done, pdMS_TO_TICKS(15000)) == pdTRUE) {
+        vTaskDeleteWithCaps(s_decode_task_hdl);   // frees its PSRAM stack
+        free(s_mag_buf);
+    } else {
+        // It may be inside a slow SD write holding the aircraft lock.
+        // Deleting it there would leave the lock taken for good, so it is
+        // left to park by itself; its buffer stays allocated because it
+        // may still be using it.
+        ESP_LOGE(TAG, "decoder task did not stop in 15 s — left to finish on its own");
+    }
+    s_decode_task_hdl = NULL;
     s_mag_buf = NULL;
-    free(tbuffer);
-    free(buffer);
+    s_usb_xfers = 0;
 
 done:
     s_rtlsdr_connected = false;

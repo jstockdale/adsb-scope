@@ -75,7 +75,7 @@ typedef struct {
 
     // ── Scope Display ──
     uint8_t  scope_fps_cap;       // 0=auto, 5/10/15/30, default 0 (auto)
-    uint8_t  scope_max_aircraft;  // 0=unlimited (up to 128), default 0
+    uint8_t  scope_max_aircraft;  // 0=unlimited (up to ADSB_MAX_AIRCRAFT, 256), default 0
 
     // ── Console ──
     bool     heartbeat_enabled;    // serial console heartbeat, default true
@@ -198,7 +198,7 @@ static inline void settings_validate(device_settings_t *s) {
     if (s->meshy_hop_limit < 1 || s->meshy_hop_limit > 7) s->meshy_hop_limit = 5;
     if (s->volume > 100) s->volume = 50;
     if (s->scope_fps_cap > 30) s->scope_fps_cap = 0;
-    if (s->scope_max_aircraft > 128) s->scope_max_aircraft = 0; // MAX_SCOPE_AIRCRAFT
+    if (s->scope_max_aircraft > 192) s->scope_max_aircraft = 0; // largest selectable limit; 0 = all (256)
     if (s->heartbeat_period_s < 5) s->heartbeat_period_s = 30;
     // WiFi: ensure null-termination and valid poll interval
     s->wifi_ssid[32] = '\0';

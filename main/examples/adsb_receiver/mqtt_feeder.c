@@ -3,6 +3,7 @@
 // See mqtt_feeder.h for API documentation.
 
 #include "mqtt_feeder.h"
+#include "mqtt_batch.h"
 #include "device_settings.h"
 
 #include <string.h>
@@ -62,9 +63,25 @@ const char ISRG_ROOT_X1_PEM[] =
 
 #define BATCH_INTERVAL_MS   2000    // flush aircraft batch every 2s
 #define STATUS_INTERVAL_MS  30000   // status heartbeat every 30s
-#define MAX_AIRCRAFT        64      // max aircraft per batch
+#define TASK_POLL_MS        250     // feeder task wake-up period
 #define TASK_STACK_SIZE     8192
 #define TASK_PRIORITY       3
+#define SLOW_PUBLISH_MS     1000    // a publish blocking this long is counted and logged
+
+// MQTT client buffers, and the size of one aircraft message. A batch is
+// split into as many messages as it needs (mqtt_batch.h), each of which
+// fits the client's output buffer whole – header and topic included – and
+// therefore one TLS record (CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN, 4096) and
+// the TCP send buffer (CONFIG_LWIP_TCP_SND_BUF_DEFAULT, 4096). Nothing is
+// fragmented by the client, and a publish does not have to wait for the far
+// end to acknowledge half a message before it can send the rest.
+#define MQTT_BUF_SIZE       4096
+#define MSG_BUF_SIZE        3800    // JSON text of one message, NUL included
+// fixed header (<= 4) + topic length (2) + topic ("adsb/" + id of up to 32
+// characters + "/aircraft" = 46) + payload must fit; 85 more bytes cover
+// the largest TLS 1.2 record overhead.
+_Static_assert(MSG_BUF_SIZE + 4 + 2 + 46 + 85 <= MQTT_BUF_SIZE, "aircraft message must fit one buffer");
+_Static_assert(MSG_BUF_SIZE >= MQTT_BATCH_MSG_MIN, "aircraft message buffer too small");
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -72,10 +89,31 @@ static esp_mqtt_client_handle_t s_client   = NULL;
 static volatile bool            s_connected = false;
 static TaskHandle_t             s_task      = NULL;
 
-// Aircraft batch buffer — PSRAM-allocated at init
-static mqtt_aircraft_t *s_ac_buf    = NULL;
-static volatile int     s_ac_count  = 0;
+// Aircraft batch – PSRAM-allocated at init.
+//   s_batch    latest state of each aircraft heard since the last flush;
+//              written by the decoder, emptied by the feeder task, both
+//              under s_ac_mutex
+//   s_snap     the feeder task's private copy of it while it publishes
+//   s_msg_buf  one JSON message
+static mqtt_batch_t     *s_batch    = NULL;
+static mqtt_aircraft_t  *s_snap     = NULL;
+static char             *s_msg_buf  = NULL;
 static SemaphoreHandle_t s_ac_mutex = NULL;
+
+// Task shutdown handshake (mqtt_feeder_stop)
+static volatile bool     s_task_stop = false;
+static SemaphoreHandle_t s_task_done = NULL;
+
+// Counters. s_stats is written under s_stats_lock (a spinlock: the
+// sections are a few instructions long); the batch counters live in
+// s_batch and are added to the s_base_* totals when it is freed.
+static portMUX_TYPE        s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+static mqtt_feeder_stats_t s_stats      = {0};
+static volatile uint32_t   s_dropped_busy = 0;
+static uint32_t s_base_updates = 0, s_base_coalesced = 0, s_base_dropped_full = 0;
+static int64_t  s_connected_since_us = 0;   // 0 = not connected
+static int64_t  s_last_drop_us       = 0;   // 0 = never
+static int64_t  s_last_error_us      = 0;   // 0 = never
 
 // Receiver status — updated externally, read by feeder task
 static mqtt_status_t     s_status       = {0};
@@ -157,8 +195,10 @@ static void install_cjson_hooks(void) {
 static void feeder_task(void *arg);
 static void event_handler(void *arg, esp_event_base_t base, int32_t event_id, void *event_data);
 static void handle_admin_cmd(const char *cmd);
-static void pub_batch(void);
+static bool pub_batch(void);
 static void pub_status(void);
+static void free_batch_buffers(void);
+static void note_connection_lost(bool wifi);
 static void pub_meta(void);
 
 // ─── Device ID ───────────────────────────────────────────────────────────────
@@ -205,25 +245,39 @@ void mqtt_feeder_init(void) {
 
     ensure_device_id();  // already called by mqtt_feeder_device_id(), but idempotent
 
-    // Allocate aircraft batch buffer in PSRAM
-    s_ac_buf = (mqtt_aircraft_t *)heap_caps_malloc(
-        sizeof(mqtt_aircraft_t) * MAX_AIRCRAFT, MALLOC_CAP_SPIRAM);
-    if (!s_ac_buf) {
-        ESP_LOGE(TAG, "Failed to allocate aircraft buffer in PSRAM — MQTT disabled");
+    if (s_client) {
+        ESP_LOGW(TAG, "Feeder already running – init ignored");
         return;
     }
-    memset(s_ac_buf, 0, sizeof(mqtt_aircraft_t) * MAX_AIRCRAFT);
-    s_ac_count = 0;
 
     // Create mutexes if not already created (survive stop/reinit cycles)
     if (!s_ac_mutex) s_ac_mutex = xSemaphoreCreateMutex();
     if (!s_status_mutex) s_status_mutex = xSemaphoreCreateMutex();
-    if (!s_ac_mutex || !s_status_mutex) {
+    if (!s_task_done) s_task_done = xSemaphoreCreateBinary();
+    if (!s_ac_mutex || !s_status_mutex || !s_task_done) {
         ESP_LOGE(TAG, "Failed to create mutexes — MQTT disabled");
-        heap_caps_free(s_ac_buf);
-        s_ac_buf = NULL;
         return;
     }
+
+    // Allocate the batch, its snapshot copy and the message buffer in PSRAM,
+    // once: nothing is allocated per batch.
+    mqtt_batch_t    *batch = (mqtt_batch_t *)heap_caps_malloc(sizeof(mqtt_batch_t), MALLOC_CAP_SPIRAM);
+    mqtt_aircraft_t *snap  = (mqtt_aircraft_t *)heap_caps_malloc(
+        sizeof(mqtt_aircraft_t) * MQTT_BATCH_SLOTS, MALLOC_CAP_SPIRAM);
+    char            *msg   = (char *)heap_caps_malloc(MSG_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    if (!batch || !snap || !msg) {
+        ESP_LOGE(TAG, "Failed to allocate aircraft buffer in PSRAM — MQTT disabled");
+        heap_caps_free(batch);
+        heap_caps_free(snap);
+        heap_caps_free(msg);
+        return;
+    }
+    mqtt_batch_init(batch);
+    xSemaphoreTake(s_ac_mutex, portMAX_DELAY);
+    s_batch   = batch;
+    s_snap    = snap;
+    s_msg_buf = msg;
+    xSemaphoreGive(s_ac_mutex);
 
     // Build broker URI
     char uri[192];
@@ -238,14 +292,13 @@ void mqtt_feeder_init(void) {
     cfg.credentials.authentication.password = g_settings.mqtt_pass[0] ? g_settings.mqtt_pass : NULL;
     cfg.session.keepalive = 60;
     cfg.network.disable_auto_reconnect = true;  // we handle reconnect manually
-    cfg.buffer.size = 4096;      // PSRAM via malloc (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0)
-    cfg.buffer.out_size = 4096;
+    cfg.buffer.size = MQTT_BUF_SIZE;      // PSRAM via malloc (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0)
+    cfg.buffer.out_size = MQTT_BUF_SIZE;
 
     s_client = esp_mqtt_client_init(&cfg);
     if (!s_client) {
         ESP_LOGE(TAG, "Failed to init MQTT client — MQTT disabled");
-        heap_caps_free(s_ac_buf);
-        s_ac_buf = NULL;
+        free_batch_buffers();
         return;
     }
 
@@ -264,12 +317,13 @@ void mqtt_feeder_init(void) {
         ESP_LOGE(TAG, "Failed to start MQTT client (0x%x) — MQTT disabled", err);
         esp_mqtt_client_destroy(s_client);
         s_client = NULL;
-        heap_caps_free(s_ac_buf);
-        s_ac_buf = NULL;
+        free_batch_buffers();
         return;
     }
 
     // Create feeder task with PSRAM stack
+    s_task_stop = false;
+    xSemaphoreTake(s_task_done, 0);  // clear a stale completion signal
     BaseType_t ret = xTaskCreateWithCaps(
         feeder_task, "mqtt_feeder",
         TASK_STACK_SIZE, NULL,
@@ -280,8 +334,8 @@ void mqtt_feeder_init(void) {
         esp_mqtt_client_stop(s_client);
         esp_mqtt_client_destroy(s_client);
         s_client = NULL;
-        heap_caps_free(s_ac_buf);
-        s_ac_buf = NULL;
+        s_task = NULL;
+        free_batch_buffers();
         return;
     }
 
@@ -290,16 +344,20 @@ void mqtt_feeder_init(void) {
 
 void mqtt_feeder_update_aircraft(const mqtt_aircraft_t *ac) {
     // Fast path: bail immediately if not connected or not initialized
-    if (!s_connected || !s_ac_buf || !s_ac_mutex) return;
+    if (!s_connected || !s_batch || !s_ac_mutex) return;
 
     if (xSemaphoreTake(s_ac_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        if (s_ac_count < MAX_AIRCRAFT) {
-            s_ac_buf[s_ac_count++] = *ac;
-        }
-        // else: buffer full — drop this update (will be in next batch)
+        // Latest state per aircraft: a later message from the same aircraft
+        // replaces this one, so the batch size follows the number of
+        // aircraft, not the message rate. (s_batch re-checked under the
+        // lock: mqtt_feeder_stop() frees it under the same lock.)
+        if (s_batch) mqtt_batch_put(s_batch, ac);
         xSemaphoreGive(s_ac_mutex);
+    } else {
+        // Mutex contention – never block the decode loop. The feeder holds
+        // the lock only to copy the batch, so this should stay at zero.
+        s_dropped_busy++;
     }
-    // else: mutex contention — drop silently, never block the decode loop
 }
 
 void mqtt_feeder_update_status(const mqtt_status_t *st) {
@@ -311,23 +369,90 @@ void mqtt_feeder_update_status(const mqtt_status_t *st) {
     }
 }
 
+// Free the batch buffers. The decoder may be inside
+// mqtt_feeder_update_aircraft(), so the pointers are cleared under its lock.
+static void free_batch_buffers(void) {
+    mqtt_batch_t *batch = NULL;
+    mqtt_aircraft_t *snap = NULL;
+    char *msg = NULL;
+    if (s_ac_mutex) xSemaphoreTake(s_ac_mutex, portMAX_DELAY);
+    batch = s_batch;   s_batch = NULL;
+    snap  = s_snap;    s_snap = NULL;
+    msg   = s_msg_buf; s_msg_buf = NULL;
+    if (batch) {  // keep its counters: they run from boot
+        s_base_updates      += batch->updates;
+        s_base_coalesced    += batch->coalesced;
+        s_base_dropped_full += batch->dropped_full;
+    }
+    if (s_ac_mutex) xSemaphoreGive(s_ac_mutex);
+    heap_caps_free(batch);
+    heap_caps_free(snap);
+    heap_caps_free(msg);
+}
+
 void mqtt_feeder_stop(void) {
     if (s_task) {
-        vTaskDelete(s_task);
+        // Ask the task to finish and wait for it, instead of deleting it
+        // wherever it happens to be: deleted in the middle of a publish it
+        // would take the MQTT client's lock with it, and the client could
+        // then never be stopped. A publish can block for the client's 10 s
+        // network timeout, hence the long wait.
+        s_task_stop = true;
+        xTaskNotifyGive(s_task);
+        if (xSemaphoreTake(s_task_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
+            ESP_LOGW(TAG, "Feeder task did not finish in 15 s – deleting it");
+        }
+        // The task was created with a PSRAM stack: this call frees the
+        // stack and task block, which plain vTaskDelete() would leak.
+        vTaskDeleteWithCaps(s_task);
         s_task = NULL;
     }
     if (s_client) {
+        cancel_retry();
         esp_mqtt_client_stop(s_client);
         esp_mqtt_client_destroy(s_client);
         s_client = NULL;
     }
-    if (s_ac_buf) {
-        heap_caps_free(s_ac_buf);
-        s_ac_buf = NULL;
-    }
+    if (s_connected) note_connection_lost(false);
     s_connected = false;
-    s_ac_count = 0;
+    free_batch_buffers();
     ESP_LOGI(TAG, "Feeder stopped");
+}
+
+// Bookkeeping when an established connection ends.
+static void note_connection_lost(bool wifi) {
+    int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_stats_lock);
+    if (wifi) s_stats.wifi_pauses++; else s_stats.disconnects++;
+    s_stats.last_drop_up_s = s_connected_since_us ? (uint32_t)((now - s_connected_since_us) / 1000000LL) : 0;
+    s_last_drop_us = now;
+    s_connected_since_us = 0;
+    portEXIT_CRITICAL(&s_stats_lock);
+}
+
+void mqtt_feeder_get_stats(mqtt_feeder_stats_t *out) {
+    if (!out) return;
+    int64_t now = esp_timer_get_time();
+    uint32_t updates = 0, coalesced = 0, dropped_full = 0;
+    if (s_ac_mutex && xSemaphoreTake(s_ac_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        updates = s_base_updates; coalesced = s_base_coalesced; dropped_full = s_base_dropped_full;
+        if (s_batch) {
+            updates += s_batch->updates;
+            coalesced += s_batch->coalesced;
+            dropped_full += s_batch->dropped_full;
+        }
+        xSemaphoreGive(s_ac_mutex);
+    }
+    portENTER_CRITICAL(&s_stats_lock);
+    *out = s_stats;
+    out->connected_s      = s_connected_since_us ? (uint32_t)((now - s_connected_since_us) / 1000000LL) : 0;
+    out->last_drop_ago_s  = s_last_drop_us  ? (uint32_t)((now - s_last_drop_us) / 1000000LL) : 0;
+    out->last_error_ago_s = s_last_error_us ? (uint32_t)((now - s_last_error_us) / 1000000LL) : 0;
+    portEXIT_CRITICAL(&s_stats_lock);
+    out->updates = updates;
+    out->coalesced = coalesced;
+    out->dropped_full = dropped_full;
+    out->dropped_busy = s_dropped_busy;
 }
 
 bool mqtt_feeder_is_connected(void) {
@@ -338,8 +463,10 @@ void mqtt_feeder_pause(void) {
     if (!s_client) return;
     s_paused = true;
     cancel_retry();
+    bool was_connected = s_connected;
+    s_connected = false;  // stop offering work to a client that is going away
     esp_mqtt_client_stop(s_client);
-    s_connected = false;
+    if (was_connected) note_connection_lost(true);
     ESP_LOGI(TAG, "Paused (WiFi down)");
 }
 
@@ -358,6 +485,10 @@ static void event_handler(void *arg, esp_event_base_t base,
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
     switch (event_id) {
         case MQTT_EVENT_CONNECTED:
+            portENTER_CRITICAL(&s_stats_lock);
+            s_stats.connects++;
+            s_connected_since_us = esp_timer_get_time();
+            portEXIT_CRITICAL(&s_stats_lock);
             s_connected = true;
             s_retry_count = 0;
             cancel_retry();
@@ -383,15 +514,38 @@ static void event_handler(void *arg, esp_event_base_t base,
                 }
             }
             break;
-        case MQTT_EVENT_DISCONNECTED:
+        case MQTT_EVENT_DISCONNECTED: {
+            // The client reports this both when an established connection
+            // ends and when a connection attempt fails.
+            bool was_connected = s_connected;
             s_connected = false;
+            if (was_connected) {
+                note_connection_lost(false);
+            } else {
+                portENTER_CRITICAL(&s_stats_lock);
+                s_stats.connect_failures++;
+                portEXIT_CRITICAL(&s_stats_lock);
+            }
             if (s_paused) {
                 ESP_LOGI(TAG, "Disconnected (WiFi down — waiting for reconnect)");
             } else {
                 ESP_LOGW(TAG, "Disconnected from broker");
+                if (was_connected) {
+                    // What the link was doing when it went: enough to tell a
+                    // stalled network from a broker that hung up.
+                    mqtt_feeder_stats_t st;
+                    mqtt_feeder_get_stats(&st);
+                    ESP_LOGW(TAG, "Link was up %lu s. Totals: %lu disconnects, %lu publish failures, "
+                                  "longest publish %lu ms, last batch %lu aircraft in %lu msgs (%lu B)",
+                             (unsigned long)st.last_drop_up_s, (unsigned long)st.disconnects,
+                             (unsigned long)st.publish_failures, (unsigned long)st.publish_max_ms,
+                             (unsigned long)st.last_aircraft, (unsigned long)st.last_messages,
+                             (unsigned long)st.last_bytes);
+                }
                 schedule_retry();
             }
             break;
+        }
         case MQTT_EVENT_DATA:
             // Incoming message — route admin commands
             if (event->topic && event->topic_len > 0 && event->data && event->data_len > 0) {
@@ -425,10 +579,26 @@ static void event_handler(void *arg, esp_event_base_t base,
             }
             break;
         case MQTT_EVENT_ERROR:
-            if (event->error_handle &&
-                event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-                ESP_LOGE(TAG, "Transport error: %s",
-                         strerror(event->error_handle->esp_transport_sock_errno));
+            if (event->error_handle) {
+                const esp_mqtt_error_codes_t *e = event->error_handle;
+                portENTER_CRITICAL(&s_stats_lock);
+                s_stats.last_error_type    = (int)e->error_type;
+                s_stats.last_sock_errno    = e->esp_transport_sock_errno;
+                s_stats.last_tls_err       = (int)e->esp_tls_last_esp_err;
+                s_stats.last_tls_stack_err = e->esp_tls_stack_err;
+                s_stats.last_connect_rc    = (int)e->connect_return_code;
+                s_last_error_us            = esp_timer_get_time();
+                portEXIT_CRITICAL(&s_stats_lock);
+                if (e->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+                    ESP_LOGE(TAG, "Transport error: %s",
+                             strerror(e->esp_transport_sock_errno));
+                    ESP_LOGE(TAG, "Transport detail: errno %d, esp-tls 0x%x, TLS stack -0x%04x",
+                             e->esp_transport_sock_errno, (unsigned)e->esp_tls_last_esp_err,
+                             (unsigned)(e->esp_tls_stack_err < 0 ? -e->esp_tls_stack_err : e->esp_tls_stack_err));
+                } else if (e->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
+                    ESP_LOGE(TAG, "Connection refused by broker: CONNACK code %d",
+                             (int)e->connect_return_code);
+                }
             }
             break;
         default:
@@ -441,18 +611,41 @@ static void event_handler(void *arg, esp_event_base_t base,
 static void feeder_task(void *arg) {
     int64_t last_batch  = esp_timer_get_time();
     int64_t last_status = esp_timer_get_time();
+    bool    was_connected = false;
 
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(500));  // wake every 500ms
-
-        if (!s_connected) continue;
+    while (!s_task_stop) {
+        // Periodic wake-up; mqtt_feeder_stop() cuts the wait short.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(TASK_POLL_MS));
+        if (s_task_stop) break;
 
         int64_t now = esp_timer_get_time();
 
+        if (!s_connected) {
+            was_connected = false;
+            continue;
+        }
+        if (!was_connected) {
+            // New connection. Whatever was collected before the link went
+            // down is stale: discard it and start a fresh interval.
+            was_connected = true;
+            if (xSemaphoreTake(s_ac_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                if (s_batch) mqtt_batch_reset(s_batch);
+                xSemaphoreGive(s_ac_mutex);
+            }
+            last_batch = now;
+            continue;
+        }
+
         // Aircraft batch
         if ((now - last_batch) >= (BATCH_INTERVAL_MS * 1000LL)) {
-            pub_batch();
-            last_batch = now;
+            uint32_t gap_ms = (uint32_t)((now - last_batch) / 1000);
+            if (pub_batch()) {
+                portENTER_CRITICAL(&s_stats_lock);
+                if (gap_ms > s_stats.flush_gap_max_ms) s_stats.flush_gap_max_ms = gap_ms;
+                portEXIT_CRITICAL(&s_stats_lock);
+                last_batch = now;
+            }
+            // else: the batch lock was busy; try again at the next wake-up
         }
 
         // Status heartbeat
@@ -461,75 +654,86 @@ static void feeder_task(void *arg) {
             last_status = now;
         }
     }
+
+    // Tell mqtt_feeder_stop() the task is out of the client and holds
+    // nothing, then wait to be deleted.
+    xSemaphoreGive(s_task_done);
+    vTaskSuspend(NULL);
 }
 
 // ─── Publishers ──────────────────────────────────────────────────────────────
 
-static void pub_batch(void) {
-    if (!s_ac_buf) return;
+// Publish everything collected since the last batch. Returns false only if
+// the batch could not be taken (lock busy), in which case nothing changed.
+static bool pub_batch(void) {
+    if (!s_batch || !s_snap || !s_msg_buf) return true;
 
-    // Snapshot and clear the buffer under lock
-    // Use a PSRAM-allocated copy to avoid holding the mutex during JSON serialization
-    mqtt_aircraft_t *batch = (mqtt_aircraft_t *)heap_caps_malloc(
-        sizeof(mqtt_aircraft_t) * MAX_AIRCRAFT, MALLOC_CAP_SPIRAM);
-    if (!batch) return;  // PSRAM exhausted — skip this batch
+    // Take the collected aircraft and clear the slots under the lock; the
+    // JSON work and the network writes below happen without it, so the
+    // decode loop is never held up by the network.
+    if (xSemaphoreTake(s_ac_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
+    int count = mqtt_batch_take(s_batch, s_snap, MQTT_BATCH_SLOTS);
+    xSemaphoreGive(s_ac_mutex);
+    if (count == 0) return true;
 
-    int count = 0;
-    if (xSemaphoreTake(s_ac_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        count = s_ac_count;
-        if (count > 0) {
-            memcpy(batch, s_ac_buf, count * sizeof(mqtt_aircraft_t));
-            s_ac_count = 0;
+    // Receiver position, if known
+    bool have_rx = false;
+    double rx_lat = 0.0, rx_lon = 0.0;
+    if (xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        rx_lat = s_status.lat;
+        rx_lon = s_status.lon;
+        have_rx = (rx_lat != 0.0 || rx_lon != 0.0);
+        xSemaphoreGive(s_status_mutex);
+    }
+
+    char topic[64];
+    snprintf(topic, sizeof(topic), "adsb/%s/aircraft", s_device_id);
+
+    int next = 0, sent = 0, messages = 0, failures = 0, slow = 0;
+    uint32_t bytes = 0, max_ms = 0;
+    while (next < count) {
+        int first = next;
+        size_t len = mqtt_batch_serialise(s_snap, count, &next, have_rx, rx_lat, rx_lon,
+                                          s_msg_buf, MSG_BUF_SIZE);
+        if (len == 0) break;
+        if (!s_connected || s_task_stop) { next = first; break; }
+
+        int64_t t0 = esp_timer_get_time();
+        int ret = esp_mqtt_client_publish(s_client, topic, s_msg_buf, (int)len, 0, 0);  // QoS 0
+        uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+        if (ms > max_ms) max_ms = ms;
+        if (ms >= SLOW_PUBLISH_MS) {
+            slow++;
+            ESP_LOGW(TAG, "Slow publish: %lu ms for %u bytes", (unsigned long)ms, (unsigned)len);
         }
-        xSemaphoreGive(s_ac_mutex);
-    }
-
-    if (count == 0) {
-        heap_caps_free(batch);
-        return;
-    }
-
-    // Build JSON (cJSON allocations go to PSRAM via hooks)
-    cJSON *root = cJSON_CreateObject();
-    if (!root) { heap_caps_free(batch); return; }
-
-    cJSON *arr = cJSON_AddArrayToObject(root, "aircraft");
-
-    // Add receiver position if available
-    if (s_status.lat != 0.0 || s_status.lon != 0.0) {
-        cJSON_AddNumberToObject(root, "rx_lat", s_status.lat);
-        cJSON_AddNumberToObject(root, "rx_lon", s_status.lon);
-    }
-
-    for (int i = 0; i < count; i++) {
-        const mqtt_aircraft_t *ac = &batch[i];
-        cJSON *obj = cJSON_CreateObject();
-        if (!obj) continue;
-        cJSON_AddStringToObject(obj, "icao", ac->icao);
-        if (ac->callsign[0])        cJSON_AddStringToObject(obj, "callsign", ac->callsign);
-        if (ac->has_pos) {
-            cJSON_AddNumberToObject(obj, "lat", ac->lat);
-            cJSON_AddNumberToObject(obj, "lon", ac->lon);
+        if (ret < 0) {
+            // Not connected any more, or the write failed and the client
+            // has dropped the connection. The rest would fail the same way.
+            failures++;
+            next = first;
+            ESP_LOGW(TAG, "Publish failed after %lu ms – %d of %d aircraft not sent",
+                     (unsigned long)ms, count - first, count);
+            break;
         }
-        if (ac->alt_ft != 0)        cJSON_AddNumberToObject(obj, "alt", ac->alt_ft);
-        if (ac->speed_kt != 0)      cJSON_AddNumberToObject(obj, "speed", ac->speed_kt);
-        if (ac->heading_deg >= 0)    cJSON_AddNumberToObject(obj, "hdg", ac->heading_deg);
-        if (ac->vert_rate_fpm != 0)  cJSON_AddNumberToObject(obj, "vr", ac->vert_rate_fpm);
-        if (ac->dist_nm > 0)        cJSON_AddNumberToObject(obj, "dist", ac->dist_nm);
-        if (ac->bearing_deg >= 0)    cJSON_AddNumberToObject(obj, "brg", ac->bearing_deg);
-        cJSON_AddItemToArray(arr, obj);
+        sent += next - first;
+        messages++;
+        bytes += (uint32_t)len;
     }
 
-    char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    heap_caps_free(batch);
-
-    if (json) {
-        char topic[64];
-        snprintf(topic, sizeof(topic), "adsb/%s/aircraft", s_device_id);
-        esp_mqtt_client_publish(s_client, topic, json, 0, 0, 0);  // QoS 0
-        free(json);  // allocated by cJSON via PSRAM hooks
-    }
+    portENTER_CRITICAL(&s_stats_lock);
+    s_stats.flushes++;
+    s_stats.messages         += (uint32_t)messages;
+    s_stats.bytes            += bytes;
+    s_stats.aircraft_sent    += (uint32_t)sent;
+    s_stats.aircraft_unsent  += (uint32_t)(count - sent);
+    s_stats.publish_failures += (uint32_t)failures;
+    s_stats.publish_slow     += (uint32_t)slow;
+    if (max_ms > s_stats.publish_max_ms) s_stats.publish_max_ms = max_ms;
+    s_stats.last_aircraft = (uint32_t)count;
+    s_stats.last_messages = (uint32_t)messages;
+    s_stats.last_bytes    = bytes;
+    portEXIT_CRITICAL(&s_stats_lock);
+    return true;
 }
 
 static void pub_status(void) {

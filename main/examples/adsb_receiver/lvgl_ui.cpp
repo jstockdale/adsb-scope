@@ -82,6 +82,17 @@ struct ScopeTrailAC {
 static ScopeTrailAC *g_trails = nullptr;
 static int g_trail_count = 0;
 
+// Per-trail bookkeeping kept apart from the 14 kB trail records, so the
+// once-a-second lookup below walks 2 kB instead of touching every record:
+// the trail's ICAO address (a copy of g_trails[t].icao) and the uptime, in
+// seconds, of its newest point.
+static EXT_RAM_BSS_ATTR uint32_t g_trail_icao[SCOPE_TRAIL_MAX];
+static EXT_RAM_BSS_ATTR uint32_t g_trail_last_s[SCOPE_TRAIL_MAX];
+// A trail that has had no new point for this long belongs to an aircraft
+// the scope stopped drawing (it hides them 180 s after the last message),
+// so its slot can go to a new aircraft.
+#define SCOPE_TRAIL_REUSE_S 180
+
 // PSRAM-allocated aircraft buffers (replace three static 64-slot .bss arrays)
 // g_trail_ac: used by esp_timer trail callback (separate task from LVGL)
 // g_scope_ac: shared by LVGL task callsites (aircraft list update + scope radar draw)
@@ -93,6 +104,7 @@ static void scope_trail_timer_cb(void *arg) {
     if (!g_trails || !g_trail_ac) return;
 
     int ac_count = adsb_get_aircraft_for_scope(g_trail_ac, MAX_SCOPE_AIRCRAFT);
+    const uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
     for (int i = 0; i < ac_count; i++) {
         if (!g_trail_ac[i].has_position) continue;
@@ -100,15 +112,31 @@ static void scope_trail_timer_cb(void *arg) {
 
         int slot = -1;
         for (int t = 0; t < g_trail_count; t++) {
-            if (g_trails[t].icao == g_trail_ac[i].icao) { slot = t; break; }
+            if (g_trail_icao[t] == g_trail_ac[i].icao) { slot = t; break; }
         }
-        if (slot < 0 && g_trail_count < SCOPE_TRAIL_MAX) {
-            slot = g_trail_count++;
-            g_trails[slot].icao = g_trail_ac[i].icao;
-            g_trails[slot].head = 0;
-            g_trails[slot].count = 0;
+        if (slot < 0) {
+            if (g_trail_count < SCOPE_TRAIL_MAX) {
+                slot = g_trail_count++;
+            } else {
+                // Every slot has been used. Slots were never given back, so
+                // after SCOPE_TRAIL_MAX different aircraft since boot no new
+                // aircraft got a trail. Take over the trail that has gone
+                // longest without a point, if it is old enough to be off
+                // the screen.
+                int oldest = 0;
+                for (int t = 1; t < SCOPE_TRAIL_MAX; t++)
+                    if (g_trail_last_s[t] < g_trail_last_s[oldest]) oldest = t;
+                if (now_s - g_trail_last_s[oldest] > SCOPE_TRAIL_REUSE_S) slot = oldest;
+            }
+            if (slot >= 0) {
+                g_trails[slot].count = 0;   // first: the scope skips a trail with fewer than 2 points
+                g_trails[slot].head = 0;
+                g_trails[slot].icao = g_trail_ac[i].icao;
+                g_trail_icao[slot] = g_trail_ac[i].icao;
+            }
         }
         if (slot >= 0) {
+            g_trail_last_s[slot] = now_s;
             g_trails[slot].pts[g_trails[slot].head] = {
                 g_trail_ac[i].lat, g_trail_ac[i].lon,
                 (int16_t)(g_trail_ac[i].altitude > 32767 ? 32767 : g_trail_ac[i].altitude),
@@ -4276,7 +4304,7 @@ namespace Lvgl_Ui
         // Static text buffers — LVGL 9 canvas draw is deferred; dsc.text must
         // persist until lv_canvas_finish_layer() renders everything.
         static char ring_labels[8][16];
-        static char ac_labels[MAX_SCOPE_AIRCRAFT][28];
+        static EXT_RAM_BSS_ATTR char ac_labels[MAX_SCOPE_AIRCRAFT][28];   // PSRAM
 
         // Colors
         lv_color_t col_bg    = lv_color_hex(0x0a0e14);
@@ -4326,7 +4354,9 @@ namespace Lvgl_Ui
         double nm_per_deg_lon = 60.0 * cos_lat;
 
         // Calculate distance from center for all positioned aircraft
-        static double ac_dx[MAX_SCOPE_AIRCRAFT], ac_dy[MAX_SCOPE_AIRCRAFT], ac_dist[MAX_SCOPE_AIRCRAFT];
+        static EXT_RAM_BSS_ATTR double ac_dx[MAX_SCOPE_AIRCRAFT];     // PSRAM, as are the next two
+        static EXT_RAM_BSS_ATTR double ac_dy[MAX_SCOPE_AIRCRAFT];
+        static EXT_RAM_BSS_ATTR double ac_dist[MAX_SCOPE_AIRCRAFT];
         memset(ac_dx, 0, sizeof(ac_dx));
         memset(ac_dy, 0, sizeof(ac_dy));
         memset(ac_dist, 0, sizeof(ac_dist));
@@ -6254,18 +6284,18 @@ namespace Lvgl_Ui
         {
             lv_obj_t *row = add_row();
             add_row_label(row, "Max Aircraft");
-            static const uint8_t ac_vals[] = {0, 16, 32, 48, 64, 96, 128};
-            static const char *ac_labels[] = {"All", "16", "32", "48", "64", "96", "128"};
+            static const uint8_t ac_vals[] = {0, 16, 32, 48, 64, 96, 128, 192};
+            static const char *ac_labels[] = {"All", "16", "32", "48", "64", "96", "128", "192"};
             int cur = 0;
-            for (int i = 0; i < 7; i++) if (g_settings.scope_max_aircraft == ac_vals[i]) { cur = i; break; }
+            for (int i = 0; i < 8; i++) if (g_settings.scope_max_aircraft == ac_vals[i]) { cur = i; break; }
             lv_obj_t *btn = add_value_btn(row, ac_labels[cur]);
             lv_obj_add_event_cb(btn, [](lv_event_t *e) {
                 if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-                static const uint8_t vals[] = {0, 16, 32, 48, 64, 96, 128};
-                static const char *labels[] = {"All", "16", "32", "48", "64", "96", "128"};
+                static const uint8_t vals[] = {0, 16, 32, 48, 64, 96, 128, 192};
+                static const char *labels[] = {"All", "16", "32", "48", "64", "96", "128", "192"};
                 int cur = 0;
-                for (int i = 0; i < 7; i++) if (g_settings.scope_max_aircraft == vals[i]) { cur = i; break; }
-                cur = (cur + 1) % 7;
+                for (int i = 0; i < 8; i++) if (g_settings.scope_max_aircraft == vals[i]) { cur = i; break; }
+                cur = (cur + 1) % 8;
                 g_settings.scope_max_aircraft = vals[cur];
                 lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
                 if (lbl) lv_label_set_text(lbl, labels[cur]);

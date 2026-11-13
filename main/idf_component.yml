@@ -2,24 +2,30 @@ dependencies:
   lvgl/lvgl:
     version: 9.3.0
 
+  # Unconditional: the app includes tinyusb.h (USB mass-storage mode)
+  # regardless of configuration. The original manifest gated this on
+  # $CONFIG{ENABLE_USB_DISPLAY}; the component manager does not support
+  # Kconfig conditions on ESP-IDF 5.4.1, ignores the clause, and then
+  # skips the dependency entirely.
   espressif/esp_tinyusb:
     version: ^1
-    matches:
-    - if: $CONFIG{ENABLE_USB_DISPLAY} == False
 
-  # esp_video:
-  #   version: "0.9.*"
+  # esp_video: in-tree vendored copy at components/esp_video (see VENDOR.md)
 
   espressif/esp-sr:
     version: ^2.1.3
 
-#  espressif/esp_hosted:
-#    version: 2.0.17
+  # ESP-Hosted host pinned to match the C6 slave firmware exactly
+  # (firmware/c6/*network_adapter_v2.12.3*.bin).  See VENDOR.md for the
+  # version-selection rationale and the first-build handshake check.
+  espressif/esp_hosted:
+    version: "2.12.3"
 
-#  espressif/esp_wifi_remote:
-#    version: ^1.1
+  espressif/esp_wifi_remote:
+    version: "~1.1.6"
 
-  espressif/esp_lcd_usb_display:
-    version: ^1.0.0
-    matches:
-    - if: $CONFIG{ENABLE_USB_DISPLAY} == True
+  # Only needed with CONFIG_ENABLE_USB_DISPLAY=y (off by default). Was
+  # gated on $CONFIG{ENABLE_USB_DISPLAY}, which ESP-IDF 5.4.1 cannot
+  # evaluate; uncomment when building the USB-display variant.
+  # espressif/esp_lcd_usb_display:
+  #   version: ^1.0.0
