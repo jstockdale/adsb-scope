@@ -66,6 +66,7 @@ static void usage(const char *a0)
             "       [--fix2-delta N] [--df18 0|1]\n"
             "       [--rate 2.0|2.4]   2.4 selects the 2.4 Msps demodulator, with\n"
             "       [--gate N] [--gate2 N] [--pre N] [--tries N] [--soft N]  (its tuning; see mode-s.h)\n"
+            "       [--coh 0|1] [--coh-ts N] [--coh-gate N] [--coh-df 0|1|2]  coherent second look (mode_s_coh.c)\n"
 #endif
             "defaults: chunk=262144 (the firmware's DEFAULT_BUF_LENGTH), stream=0,\n"
             "          fix=1, everything else 0 except --df18 1 (deliver DF18 so it\n"
@@ -81,6 +82,7 @@ int main(int argc, char **argv)
     int fix2 = 0, strict = 0, known = 0, df18 = 1;
     uint32_t fix2_delta = 0;
     int gate = -1, gate2 = -1, pre = -1, tries = -1, soft = -1;
+    int coh = 0, coh_ts = -1, coh_gate = -1, coh_df = -1;
     // One loss of samples in the stream (stream mode only): at byte offset
     // gap_at of the input, gap_skip bytes are thrown away and the decoder
     // is told gap_lost samples went missing.
@@ -143,6 +145,14 @@ int main(int argc, char **argv)
             tries = atoi(v);
         else if (!strcmp(a, "--soft"))
             soft = atoi(v);
+        else if (!strcmp(a, "--coh"))
+            coh = atoi(v);
+        else if (!strcmp(a, "--coh-ts"))
+            coh_ts = atoi(v);
+        else if (!strcmp(a, "--coh-gate"))
+            coh_gate = atoi(v);
+        else if (!strcmp(a, "--coh-df"))
+            coh_df = atoi(v);
         else
         {
             usage(argv[0]);
@@ -183,6 +193,7 @@ int main(int argc, char **argv)
         return 2;
     }
     (void)df18; (void)gate; (void)gate2; (void)pre; (void)tries; (void)soft;
+    (void)coh; (void)coh_ts; (void)coh_gate; (void)coh_df;
 #else
     st.fix2 = fix2;
     st.strict_es = strict;
@@ -194,6 +205,14 @@ int main(int argc, char **argv)
     if (pre >= 0) st.d24_pre_x100 = (uint16_t)pre;
     if (tries >= 0) st.d24_tries = (uint8_t)tries;
     if (soft >= 0) st.soft_fix = (uint8_t)soft;
+    if (coh)
+    {
+        st.coh_work = malloc(mode_s_coh_work_size());
+        st.coh_fix = (st.coh_work != NULL);
+    }
+    if (coh_ts >= 0) st.coh_tsearch = (uint8_t)coh_ts;
+    if (coh_gate >= 0) st.coh_gate_x100 = (uint16_t)coh_gate;
+    if (coh_df >= 0) st.coh_df_gate = (uint8_t)coh_df;
 #endif
 
     unsigned char *buf = malloc(chunk);
@@ -271,6 +290,8 @@ int main(int argc, char **argv)
             st.stat_fix1, st.stat_fix2, st.stat_soft_fix, st.stat_fix2_icao_rej, st.stat_strict_rej,
             st.stat_df18,
             st.stat_crc_fail ? (double)st.stat_fail_delta_sum / st.stat_crc_fail : 0.0);
+    fprintf(stderr, " coh_gated=%u coh_try=%u coh_abort=%u coh_ok=%u coh_soft=%u",
+            st.stat_coh_gated, st.stat_coh_try, st.stat_coh_abort, st.stat_coh_ok, st.stat_coh_soft);
 #endif
     fprintf(stderr, " samples=%llu\n", (unsigned long long)consumed);
     free(buf);

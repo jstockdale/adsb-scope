@@ -56,6 +56,21 @@ void mode_s_init(mode_s_t *self)
     self->soft_fix = 0;
     self->last_frame_phase = 0;
     self->stat_soft_fix = 0;
+    self->coh_fix = 0;
+    self->coh_tsearch = 1;
+    self->coh_df_gate = 2;
+    self->coh_gate_x100 = 200;
+    self->coh_work = NULL;
+    self->coh_ref = 0;
+    self->iq_cur = NULL;
+    self->iq_cur_n = 0;
+    self->iq_tail_n = 0;
+    self->last_freq_hz = 0;
+    self->stat_coh_gated = 0;
+    self->stat_coh_try = 0;
+    self->stat_coh_abort = 0;
+    self->stat_coh_ok = 0;
+    self->stat_coh_soft = 0;
     mode_s_stream_reset(self);
 
     // Allocate the ICAO address cache. We use two uint32_t for every entry
@@ -1034,6 +1049,8 @@ void mode_s_stream_reset(mode_s_t *self)
     self->stream_tail = 0;
     self->stream_samples = 0;
     self->stream_base = 0;
+    self->iq_tail_valid = 0;
+    self->coh_last_tick = 0;
 }
 
 void mode_s_stream_gap(mode_s_t *self, uint64_t lost_samples)
@@ -1042,6 +1059,7 @@ void mode_s_stream_gap(mode_s_t *self, uint64_t lost_samples)
     self->detect_resume = 0;
     self->stream_tail = 0;
     self->stream_samples += lost_samples;
+    self->iq_tail_valid = 0;
 }
 
 // See mode-s.h. Layout of 'mag' during a call:
@@ -1073,6 +1091,8 @@ static void stream_run(mode_s_t *self, unsigned char *iq, uint32_t iq_bytes,
 
     if (total > span)
     {
+        if (self->coh_fix && self->coh_work)
+            mode_s_coh_stream_begin(self, iq, n, tail);
         detect(self, mag, total, cb); // consumes detect_start, sets detect_resume
         first_unexamined = (total - span) + self->detect_resume;
     }
@@ -1082,6 +1102,8 @@ static void stream_run(mode_s_t *self, unsigned char *iq, uint32_t iq_bytes,
     }
 
     keep_from = (total > tail_len) ? (total - tail_len) : 0;
+    if (self->coh_fix && self->coh_work)
+        mode_s_coh_stream_end(self, iq, n, tail, keep_from, total); // keep the IQ of the carried tail
     if (keep_from)
         memmove(mag, mag + keep_from, (total - keep_from) * sizeof(uint16_t));
     self->stream_tail = total - keep_from;

@@ -8,6 +8,8 @@
    options off must be identical to the pristine historical decoder.
 3. Reports what the historical per-chunk path loses at the firmware's
    chunk size.
+4. The coherent second look (2.4 Msps, streaming only) must give the same
+   output at every chunk size, add frames, and add none that was not sent.
 Uses synth.py, so it needs no external tools. Exits non-zero on failure.
 """
 import os, subprocess, sys, tempfile
@@ -67,6 +69,28 @@ def main():
             same = got == ref24
             ok &= same
             print(f"  stream chunk={chunk:>7s}: {len(got):6d} frames  {'IDENTICAL' if same else 'MISMATCH'}")
+        # ---- the coherent second look (mode_s_coh.c). It needs the IQ behind
+        # the magnitudes, so it only runs on the streaming path, where the IQ
+        # of the carried tail is kept between calls: its output must not
+        # depend on the chunk size, and no frame it adds may be one that was
+        # never sent.
+        soft = ["--rate", "2.4", "--soft", "8"]
+        base = {l.rsplit("hex=", 1)[1] for l in run("host_mode_s", p24, *soft, "--chunk", big, "--stream", "1")}
+        refc = run("host_mode_s", p24, *soft, "--coh", "1", "--chunk", big, "--stream", "1")
+        hexc = {l.rsplit("hex=", 1)[1] for l in refc}
+        stray = (hexc - base) - truth24
+        ok &= not stray and len(hexc) > len(base)
+        print(f"2.4 Msps with the coherent second look: {len(refc)} frames, {len(hexc - base)} more than without, "
+              f"{len(stray)} of those never sent  {'OK' if not stray and len(hexc) > len(base) else 'MISMATCH'}")
+        for chunk in ("262144", "65536", "4096", "1000", "596", "100", "2"):
+            got = run("host_mode_s", p24, *soft, "--coh", "1", "--chunk", chunk, "--stream", "1")
+            same = got == refc
+            ok &= same
+            print(f"  stream chunk={chunk:>7s}: {len(got):6d} frames  {'IDENTICAL' if same else 'MISMATCH'}")
+        off = run("host_mode_s", p24, "--rate", "2.4", "--coh", "1", "--chunk", big, "--stream", "0")
+        same = off == ref24
+        ok &= same
+        print(f"  single buffer (no IQ kept), option on: {'IDENTICAL to option off' if same else 'MISMATCH'}")
     # ---- a loss of samples in the stream (mode_s_stream_gap): the frames
     # decoded must be exactly those of the two sides decoded as separate
     # streams, with the second side's sample times moved on by the first

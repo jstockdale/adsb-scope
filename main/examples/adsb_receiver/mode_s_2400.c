@@ -31,6 +31,9 @@
 //   4. Optional soft rescue: a DF17/18 frame that still fails its CRC is
 //      repaired if flipping some of its least confident bits (and only
 //      those) produces exactly the observed CRC syndrome.
+//   5. Optional coherent second look (mode_s_coh.c): a frame that still
+//      fails is re-sliced from IQ on its own carrier, which survives an
+//      overlapping transmission far better than magnitudes do.
 //
 // Written for this project; it shares no code with other decoders.
 
@@ -44,6 +47,9 @@
 #define SHORT_BITS 56
 #define SOFT_MAX_BITS 8             // most low-confidence bits considered by the soft rescue
 #define SOFT_MAX_FLIPS 4            // most bits the soft rescue will flip
+#ifndef COH_DEDUP
+#define COH_DEDUP 4u                // a second look within this many ticks of the last one is the same frame
+#endif
 
 // Pulse chip start offsets within the preamble, in U: 0, 1.0, 3.5, 4.5 us.
 static const uint8_t PULSE_U[4] = {0, 12, 42, 54};
@@ -202,6 +208,89 @@ static int soft_rescue(unsigned char *msg, const uint32_t *conf, int width)
         if (best_mask & (1 << j))
             msg[idx[j] >> 3] ^= (unsigned char)(0x80 >> (idx[j] & 7));
     return best_flips;
+}
+
+// Coherent second look at the candidate at mag[n] + f/5 that failed its CRC.
+// Gates first (they decide the cost), then the re-slice, then the same
+// checks every repaired frame gets. Returns 1 with *mm decoded.
+// Kept out of line: it runs for a small share of candidates, and inlined it
+// costs the detection loop registers on every sample.
+static __attribute__((noinline)) int coh_second_look(mode_s_t *self, uint32_t n, int f, const unsigned char *first_msg,
+                           uint32_t first_delta, struct mode_s_msg *mm)
+{
+    unsigned char cm[MODE_S_LONG_MSG_BYTES];
+    uint32_t cconf[LONG_BITS];
+    uint64_t tick = (self->stream_base + n) * 5u + (uint32_t)f + 1u;
+    int dt = 0, flips = 0, df, r;
+    uint32_t t;
+    float fhz = 0;
+
+    if (self->coh_df_gate)
+    {
+        // The first slice's format field: 17 or 18 exactly (gate 1), or within
+        // one bit of either (gate 2). Other Mode S replies and most noise
+        // fail this; an extended squitter with a damaged first byte may too.
+        unsigned a = (unsigned)(first_msg[0] >> 3) ^ 17u, b = (unsigned)(first_msg[0] >> 3) ^ 18u;
+        if (self->coh_df_gate == 1 ? (a && b) : ((a & (a - 1u)) && (b & (b - 1u))))
+            return 0;
+    }
+    // The bit delta of a pure-noise candidate sits close to the running
+    // level of all failed candidates; a frame worth a second look stands
+    // well above it.
+    if (self->coh_gate_x100 &&
+        (uint64_t)first_delta * 1600u < (uint64_t)self->coh_gate_x100 * self->coh_ref)
+        return 0;
+    // One attempt per frame: the candidates one sample either side of it
+    // are the same frame, and the timing search has already covered them.
+    if (self->coh_last_tick && tick + COH_DEDUP >= self->coh_last_tick && tick <= self->coh_last_tick + COH_DEDUP)
+        return 0;
+    self->stat_coh_gated++;
+    r = mode_s_coh_reslice(self, n, f, cm, cconf, &dt, &fhz);
+    if (r == 0)
+        return 0;
+    self->coh_last_tick = tick;
+    self->stat_coh_try++;
+    if (r < 0)
+    {
+        self->stat_coh_abort++;
+        return 0;
+    }
+
+    df = cm[0] >> 3;
+    if (df != 17 && df != 18)
+        return 0;
+    if (mode_s_crc_syndrome(cm, LONG_BITS) != 0)
+    {
+        uint32_t addr;
+        if (!self->soft_fix)
+            return 0;
+        flips = soft_rescue(cm, cconf, self->soft_fix);
+        if (!flips)
+            return 0;
+        df = cm[0] >> 3;
+        addr = ((uint32_t)cm[1] << 16) | ((uint32_t)cm[2] << 8) | cm[3];
+        if ((df != 17 && df != 18) ||
+            (self->fix2_known_icao && !icao_addr_was_recently_seen(self, addr)))
+            return 0;
+    }
+    // The frame's time as re-sliced: the reported timing plus the correction.
+    t = 5u * n + (uint32_t)f + (uint32_t)dt; // dt >= -2 and 5n + f >= 2 here in practice
+    if (dt < 0 && 5u * n + (uint32_t)f < (uint32_t)(-dt))
+        t = 0;
+    self->last_frame_offset = t / 5u;
+    self->last_frame_phase = (uint8_t)(t % 5u);
+    self->last_delta = first_delta;
+    mode_s_decode(self, mm, cm); // the frame is CRC-clean here, so this only reads its fields
+    if (!mm->crcok)
+        return 0;
+    self->last_freq_hz = fhz;
+    self->stat_coh_ok++;
+    if (flips)
+    {
+        mm->errorbit = flips << 16;
+        self->stat_coh_soft++;
+    }
+    return 1;
 }
 
 // Sum of the nine samples after position m that are quiet for every
@@ -371,6 +460,32 @@ void mode_s_detect_2400(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_c
                         self->stat_soft_fix++;
                     }
                 }
+            }
+        }
+
+        // ---- 5. coherent second look -----------------------------------------
+        if (!mm.crcok && self->coh_fix && self->iq_cur)
+        {
+            if (coh_second_look(self, n, first_f, first_msg, first_delta, &mm))
+                delta = first_delta;
+        }
+        if (!mm.crcok && self->coh_fix)
+        {
+            // Noise reference: the lower quartile of the bit delta of failed
+            // candidates (x16), tracked by stepping up a little when a
+            // candidate is above it and three times as far down when below.
+            // Most failed candidates are noise, and those that are real
+            // signals sit above the quartile, so traffic does not drag it up.
+            uint32_t d16 = first_delta << 4;
+            if (!self->coh_ref)
+                self->coh_ref = d16;
+            else
+            {
+                uint32_t step = (self->coh_ref >> 8) + 1u;
+                if (d16 > self->coh_ref)
+                    self->coh_ref += step;
+                else if (self->coh_ref > 3u * step)
+                    self->coh_ref -= 3u * step;
             }
         }
 

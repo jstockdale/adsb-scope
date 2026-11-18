@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <unistd.h>
 #include <math.h>
 #include <sys/time.h>
@@ -91,6 +92,29 @@ typedef struct
     volatile uint32_t stat_soft_fix; // frames repaired by the soft rescue
     uint8_t last_frame_phase; // set by the 2.4 Msps demodulator with last_frame_offset: the frame's
                               // sub-sample timing in fifths of a sample (0-4). 0 at 2.0 Msps.
+
+    // Coherent second look at CRC-failed frames (mode_s_coh.c). Inert unless
+    // coh_fix is set AND coh_work points at mode_s_coh_work_size() bytes,
+    // and only through mode_s_detect_stream_2400() (it needs the IQ).
+    uint8_t coh_fix;         // 1: re-slice CRC-failed frames from IQ
+    uint8_t coh_tsearch;     // also try timings this many fifths of a sample either side (0-2; default 1)
+    uint8_t coh_df_gate;     // only frames whose first slice read DF17/18: 1 = exactly, 2 = within one
+                             // bit; 0 = any. Fewer attempts, fewer frames recovered
+    uint16_t coh_gate_x100;  // only frames whose bit delta is at least this multiple (x100) of the
+                             // running bit delta of failed candidates; 0 = ungated (default 200)
+    void *coh_work;          // working memory, supplied by the application
+    uint32_t coh_ref;        // running bit delta of CRC-failed candidates, x16 (the noise reference)
+    uint64_t coh_last_tick;  // absolute tick of the last attempt, plus 1 (0 = none)
+    const unsigned char *iq_cur; // IQ behind mag[] during a streaming detect call, else NULL
+    uint32_t iq_cur_n;       // ... IQ samples in it
+    uint32_t iq_tail_n;      // ... magnitude samples in front of it carried from the previous call
+    uint32_t iq_tail_valid;  // samples of carried IQ held in coh_work
+    float last_freq_hz;      // carrier offset of the last frame the re-slice recovered
+    volatile uint32_t stat_coh_gated; // failed candidates that passed the gates
+    volatile uint32_t stat_coh_try;   // re-slices run
+    volatile uint32_t stat_coh_abort; // ... of which stopped early: no single carrier in the frame
+    volatile uint32_t stat_coh_ok;    // frames recovered by the re-slice ...
+    volatile uint32_t stat_coh_soft;  // ... of which needed the soft rescue as well
 } mode_s_t;
 
 // The struct we use to store information about a decoded message
@@ -184,6 +208,21 @@ void mode_s_stream_gap(mode_s_t *self, uint64_t lost_samples);
 void mode_s_detect_2400(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_callback_t cb);
 void mode_s_detect_stream_2400(mode_s_t *self, unsigned char *iq, uint32_t iq_bytes,
                                uint16_t *mag, mode_s_callback_t cb);
+
+// Coherent second look (mode_s_coh.c). The application allocates
+// mode_s_coh_work_size() bytes (any memory; PSRAM on the device), points
+// coh_work at them and sets coh_fix. mode_s_coh_reslice() re-slices the
+// 112-bit frame whose preamble starts at mag[n] + f/5 of the current
+// streaming call: msg/conf receive bits and per-bit confidence, *dt_out the
+// timing correction it chose (fifths of a sample), *freq_hz the carrier
+// offset. Returns 1 if it sliced the frame, 0 if the IQ is not available,
+// -1 if the frame shows no single carrier (not worth slicing).
+size_t mode_s_coh_work_size(void);
+int mode_s_coh_reslice(mode_s_t *self, uint32_t n, int f, unsigned char *msg, uint32_t *conf,
+                       int *dt_out, float *freq_hz);
+void mode_s_coh_stream_begin(mode_s_t *self, const unsigned char *iq, uint32_t n, uint32_t tail);
+void mode_s_coh_stream_end(mode_s_t *self, const unsigned char *iq, uint32_t n, uint32_t tail,
+                           uint32_t keep_from, uint32_t total);
 
 // Shared with mode_s_2400.c
 int mode_s_msg_len_by_type(int type);

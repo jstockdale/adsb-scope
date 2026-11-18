@@ -21,17 +21,17 @@ all: $(BINS)
 $(APP)/mode_s_syndromes.h: gen_syndrome_tables.py
 	$(PYTHON) gen_syndrome_tables.py
 
-host_mode_s: host_mode_s.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(APP)/mode-s.h $(APP)/mode_s_syndromes.h
-	$(CC) $(CFLAGS) -I$(APP) -o $@ host_mode_s.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(LDLIBS)
+host_mode_s: host_mode_s.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(APP)/mode_s_coh.c $(APP)/mode-s.h $(APP)/mode_s_syndromes.h
+	$(CC) $(CFLAGS) -I$(APP) -o $@ host_mode_s.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(APP)/mode_s_coh.c $(LDLIBS)
 
 host_mode_s_df18off: host_mode_s.c $(APP)/mode-s.c $(APP)/mode-s.h $(APP)/mode_s_syndromes.h
-	$(CC) $(CFLAGS) -I$(APP) -DMODE_S_DF18_FIX=0 -o $@ host_mode_s.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(LDLIBS)
+	$(CC) $(CFLAGS) -I$(APP) -DMODE_S_DF18_FIX=0 -o $@ host_mode_s.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(APP)/mode_s_coh.c $(LDLIBS)
 
 host_mode_s_baseline: host_mode_s.c baseline/mode-s.c baseline/mode-s.h
 	$(CC) $(CFLAGS) -include time.h -Ibaseline -DBASELINE -o $@ host_mode_s.c baseline/mode-s.c $(LDLIBS)
 
 test_fix_c: test_fix_c.c $(APP)/mode-s.c $(APP)/mode-s.h $(APP)/mode_s_syndromes.h
-	$(CC) $(CFLAGS) -I$(APP) -o $@ test_fix_c.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(LDLIBS)
+	$(CC) $(CFLAGS) -I$(APP) -o $@ test_fix_c.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(APP)/mode_s_coh.c $(LDLIBS)
 
 test_batch: feeder/test_batch.c $(APP)/mqtt_batch.c $(APP)/mqtt_batch.h $(APP)/mqtt_feeder.h
 	$(CC) $(CFLAGS) -Wextra -I$(APP) -o $@ feeder/test_batch.c $(APP)/mqtt_batch.c $(LDLIBS)
