@@ -154,7 +154,8 @@ static int soft_rescue(unsigned char *msg, const uint32_t *conf, int width)
     int idx[SOFT_MAX_BITS];
     uint32_t val[SOFT_MAX_BITS];
     uint32_t syn = mode_s_crc_syndrome(msg, LONG_BITS);
-    int n = 0, k, j, best_mask = 0, best_flips = SOFT_MAX_FLIPS + 1, mask;
+    uint32_t acc = 0;
+    int n = 0, k, j, g, best_mask = 0, best_flips = SOFT_MAX_FLIPS + 1, mask = 0, flips = 0;
 
     if (syn == 0)
         return 0;
@@ -178,19 +179,18 @@ static int soft_rescue(unsigned char *msg, const uint32_t *conf, int width)
         }
     }
 
-    for (mask = 1; mask < (1 << n); mask++)
+    // Every non-empty subset of those bits, in Gray-code order: each step
+    // changes one bit, so the subset's syndrome is one XOR from the last.
+    // Chosen as before: the fewest flips, and among equals the smallest mask.
+    for (g = 1; g < (1 << n); g++)
     {
-        uint32_t s = 0;
-        int flips = 0;
-        for (j = 0; j < n; j++)
-        {
-            if (mask & (1 << j))
-            {
-                s ^= mode_s_syn_bit_112[idx[j]];
-                flips++;
-            }
-        }
-        if (s == syn && flips < best_flips)
+        int bit = 0;
+        while (!((g >> bit) & 1))
+            bit++;
+        mask ^= 1 << bit;
+        acc ^= mode_s_syn_bit_112[idx[bit]];
+        flips += ((mask >> bit) & 1) ? 1 : -1;
+        if (acc == syn && (flips < best_flips || (flips == best_flips && mask < best_mask)))
         {
             best_flips = flips;
             best_mask = mask;
