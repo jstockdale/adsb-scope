@@ -22,9 +22,11 @@ simulator are not.
 | **Timing phase (new finding)** | the 2 Msps decoder is blind to ~35 % of arrival phases **at any signal strength**; a second pass on a half-sample-shifted grid recovers them: **+37 % to +43 % frames on a real capture** (experiment, not yet in firmware) |
 
 | **2.4 Msps demodulator (new, now the default)** | built to fix the timing loss: 96 % of strong frames decode (was 68 %), **1018 → 1646 frames on a real capture**, at or above dump1090-fa on every test, about 1.8× the decode CPU |
+| Coherent second look (2026-11-18; host-tested, in no firmware image) | frames that fail their CRC are sliced again from IQ on their own carrier: **1646 → 1918 frames on the real capture** (fix2 image: 1755 → 2077), weak-signal decode 37 % → 45 %, for 5–6 % more decoder instructions. Its stress test also found the 2-bit fix putting wrong messages on real tracks – section 5.7 |
 
-The last two rows are the important ones. Sections 2–4 cover the earlier
-changes; section 5 covers the finding and the demodulator built to fix it.
+The timing-phase and 2.4 Msps rows are the important ones. Sections 2–4
+cover the earlier changes; section 5 covers the finding, the demodulator
+built to fix it and, in 5.7, the coherent second look.
 
 ## 2. What changed in the firmware sources
 
@@ -196,6 +198,13 @@ gate it adds nothing measurable, and its right value depends on gain.
 What the known-address gate means in practice: a 2-bit repair is accepted
 only for an aircraft heard error-free within the last 60 s. Repairs
 therefore extend tracks; they never create one.
+
+*Measured 2026-11-18 (section 5.7): a 2-bit repair can still put a wrong
+message on an existing track. In 400,000 simulated collisions the fix2
+configuration delivered 124 frames that were never sent, 117 of them
+under a real aircraft's address, against 12 for the same configuration
+without the 2-bit fix. How often that happens on the air is not known.
+Read 5.7 before enabling `CONFIG_ADSB_DECODE_FIX2`.*
 
 The soak should watch `state.stat_fix1`, `stat_fix2`,
 `stat_fix2_icao_rej` and `stat_strict_rej`. **Those four are not printed
@@ -429,6 +438,206 @@ ns) – `experiments/toa_error.py`, `results/toa_error.txt`. Nothing in
 the firmware uses it yet; `docs/ROADMAP-AVIATION.md` section 4.1 says
 what it is for.
 
+### 5.7 Coherent second look (`mode_s_coh.c`) – host-tested, in no firmware image
+
+*Added 2026-11-18. Off by default, and nothing in the firmware turns it
+on. It changes decoder sources, so under roadmap rule 1 it stays on its
+own branch until the r10 images have reported from a device.*
+
+**The gap.** `mode_s_2400.c` decides a bit by comparing the magnitudes of
+its two halves. Two things defeat that. When another transmission overlaps
+the frame, its pulses land in the halves that should be empty. And for a
+weak frame, the noise of both rails goes into every magnitude. How bad the
+first is, measured with pairs of overlapping DF17 frames
+(`experiments/collide.py`: 2,000 pairs per cell, the second frame starting
+0–100 µs after the first, idealised pulses) – share of pairs in which the
+stronger frame was decoded:
+
+| the stronger frame is | equal | 3 dB up | 6 dB up | 10 dB up |
+| --- | --- | --- | --- | --- |
+| default image | 0.7 % | 10.3 % | 65.8 % | 100 % |
+| default image + coherent look | 4.8 % | 28.9 % | 81.9 % | 100 % |
+| soft rescue + 2-bit fix | 1.9 % | 20.4 % | 84.9 % | 100 % |
+| soft rescue + 2-bit fix + coherent look | 19.4 % | 54.5 % | 91.0 % | 100 % |
+
+**How it works.** For a frame the detector found and could not decode:
+
+1. *Chips from IQ.* The 224 half-bit chips are matched-filtered from the
+   IQ samples with the two-sample weights the magnitude slicer uses –
+   integer arithmetic.
+2. *Carrier.* The stronger chip of each bit is taken as its pulse.
+   Products of neighbouring pulses 0.5 and 1.0 µs apart give the carrier
+   offset coarsely; with that removed the pulses are summed in 4 µs
+   blocks and a 64-point FFT refines it to a few hundred Hz.
+3. *Is there one carrier?* For a clean frame the FFT peak holds nearly
+   all the pulse energy. Under 30 %, the attempt stops: that is what a
+   Mode A/C burst or a hopeless collision looks like, and stopping here
+   is what keeps real traffic cheap.
+4. *Slice in phase.* The chips are rotated to baseband, the phase is
+   taken from the pulses, and each bit is decided on the in-phase
+   difference of its two chips. What is not in phase with the frame's own
+   carrier – half the noise, most of a signal on another carrier – drops
+   out. Repeated one fifth of a sample either side; the widest eye wins.
+5. *Checks.* CRC. If it fails and the soft rescue is on, the soft rescue
+   with the new confidences, under the safeguards it already has (still
+   DF17/18; a known address when asked). No 1-bit or 2-bit table fix.
+
+**Gates.** Most failed candidates are noise, and a re-slice costs as much
+as decoding 400–500 samples, so three tests decide who gets one. The first
+slice must read DF17 or DF18 to within one bit. Its bit delta must be at
+least twice the running lower quartile of the bit delta of failed
+candidates – the noise reference; a quartile, so that traffic does not
+pull it up. And a frame gets one attempt, not one per neighbouring
+candidate. In 20 s of noise that leaves no attempts at all.
+
+**Results** (`experiments/eval_coh.py`, `results/coh_eval.txt`): the test
+set of section 5.6 plus two heavy-traffic scenarios, *busy* at 1,000 and
+*dense* at 2,000 messages/s (`experiments/prep_dense.py`).
+
+| | strong | medium | weak | busy | dense | Madrid, low gain | Madrid, high gain |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| default image | 96.0 % | 96.1 % | 36.8 % | 41.5 % | 35.7 % | 1646 | 1571 |
+| **+ coherent look** | 96.4 % | 96.6 % | 45.4 % | 48.8 % | 42.3 % | **1918** | **1872** |
+| soft rescue | 96.2 % | 96.4 % | 43.4 % | 46.2 % | 40.1 % | 1715 | 1685 |
+| **+ coherent look** | 97.1 % | 97.8 % | 62.5 % | 62.0 % | 54.3 % | **2086** | **2063** |
+| fix2 image (soft, 2-bit, known address) | * | * | * | * | * | 1755 | 1718 |
+| **+ coherent look** | * | * | * | * | * | **2077** | **2056** |
+| fix2 image without its 2-bit fix | * | * | * | * | * | 1708 | 1676 |
+| **+ coherent look** | * | * | * | * | * | **2062** | **2043** |
+
+\* As in 5.6: the known-address gate refuses every repair in simulation.
+No row produced a false frame in any simulated set or in the noise.
+
+- **+16 % to +22 % frames on the real capture**, depending on the
+  configuration.
+  The best row is 79 % of what more1090 decodes from the original
+  8 Msps samples (2,633), through a 2.4 Msps 8-bit front end.
+- **It is a weak-signal gain as much as a collision gain.** The weak set
+  has 300 messages/s and little overlap; it goes from 36.8 % to 45.4 %,
+  and with the soft rescue from 43.4 % to 62.5 %.
+- **The soft rescue and the coherent look multiply.** The coherent slice
+  gives better per-bit confidences, so the rescue finds its bits more
+  often.
+- About half the frames it recovers on Madrid would have been decoded
+  from the next candidate position anyway; the table shows the net.
+
+**Are the added frames real?** Madrid has no ground truth, so its frames
+were compared with more1090's decodes of the 8 Msps original
+(`experiments/xcheck_madrid.py`, `results/coh_madrid_xcheck.txt`). Of the
+272 frames the look adds to the default image at low gain, 266 are frames
+the reference decoded too – the same 112 bits – and the other 6 come from
+aircraft it heard error-free. At high gain: 301 added, 295 and 6. For the
+fix2 image: 322 added, 310 and 12; 338 added, 324 and 14. None of the
+1,233 comes from an address the reference did not know, and the look
+loses no frame the decoder had without it.
+
+**False frames – and what the test found about the 2-bit fix.** Sets
+without a single false frame say little, so `collide.py --stress` ran
+400,000 collisions (stronger frame 0–10 dB up, 40 aircraft addresses per
+2,000 pairs, each heard cleanly once first) and counted decoded frames
+that were never sent (`results/coh_collide.txt`):
+
+| | frames decoded | false | of those, under a real address |
+| --- | --- | --- | --- |
+| default image | 170,678 | 12 | 3 |
+| + coherent look | 220,877 | 12 | 3 |
+| soft rescue, no address gate | 198,886 | 17 | 5 |
+| + coherent look | 291,396 | 18 | 5 |
+| fix2 image | 206,940 | **124** | **117** |
+| + coherent look | 290,621 | 110 | 103 |
+| fix2 image without its 2-bit fix | 198,306 | 12 | 5 |
+| + coherent look | 289,940 | 12 | 5 |
+
+The coherent look adds 50,000–92,000 frames and no false ones. The fix2
+image is the outlier: 113 of its 124 false frames are exact 2-bit
+repairs, every one under a real aircraft's address. The frame's address
+came through the collision, other bits did not, and one of the 6,216
+two-bit patterns happened to match the CRC error – about 1 in 2,700
+frames damaged beyond two bits. The known-address gate checks the
+address, which is correct, so it passes them. Section 4 says repairs
+"extend tracks; they never create one"; that holds, but a repair can put
+a wrong message on an existing track. The soft rescue tries at most 162
+patterns, all among the least confident bits; it accounts for 1 or 2 of
+the false frames in the gated rows and 7 in the ungated one. The rest
+are 1-bit repairs (7–9 per row) and 3 DF16 frames accepted through the
+address/parity check, with or without the look.
+
+With the coherent look in place the 2-bit fix has little left to add:
+without it the fix2 image decodes 0.2 % fewer frames in this test and
+0.7 % fewer on Madrid, with a ninth of the false frames. Without the
+coherent look, dropping it costs 4 % and 2.7 %. These rates are per frame
+decoded in a test where every frame is hit; on the air most are not, and
+how often this happens there has not been measured.
+
+One loose end, in r10 as well: a frame repaired by the soft rescue is
+decoded as if it had arrived clean, so it renews its address's 60 s
+"heard error-free" lifetime. With the known-address gate that cannot
+admit a new aircraft, but an aircraft can stay known on repaired frames
+alone.
+
+**What it does not fix.**
+
+- *Both frames of a collision.* Never, in any configuration. The look
+  decides which of the two survives; a second frame would need the first
+  subtracted, or two carriers estimated jointly. Not attempted in C.
+- *Frames whose tail is overlapped* (the second starts 100–120 µs into
+  the first). The decoder jumps a full frame length past every decoded
+  frame, so decoding the first hides the second's preamble: with the
+  default image both come out in 1.4–2.4 % of pairs, 2.1–2.9 % with the
+  look. The jump is the limit there, not the slicer.
+- *Frames the detector never found.* The preamble test assumes quiet
+  samples around the pulses; under interference it does not fire, and
+  there is nothing to take a second look at.
+
+**Cost** (`experiments/cost_coh.py`, `results/coh_cost.txt`), x86-64
+instructions per input sample:
+
+| | Madrid | dense | noise |
+| --- | --- | --- | --- |
+| r10, default image | 95.39 | 80.76 | 70.48 |
+| this tree, option off | 95.39 | 80.76 | 70.48 |
+| default image + coherent look | 100.70 (+5.6 %) | 90.92 (+12.6 %) | 70.55 (+0.1 %) |
+| r10, fix2 image | 99.10 | 84.95 | 71.54 |
+| fix2 image, this tree | 97.15 | 82.78 | 70.99 |
+| fix2 image + coherent look | 102.40 (+5.4 %) | 93.59 (+13.1 %) | 71.06 (+0.1 %) |
+
+The fix2 image is cheaper than r10's because the soft rescue now walks
+its bit subsets in Gray-code order – identical result, one XOR per subset
+instead of eight. A re-slice that stops at step 3 costs about 29,000
+instructions and a full one about 49,000; on Madrid 54 % stop early.
+These are instruction counts on a PC. The decoder's share of a P4 core is
+still unmeasured (`Decode` in `adsb status`), so the absolute cost on the
+device is unknown.
+
+**On the device** – compiled for `rv32imafc`/`ilp32f` with a generic
+RISC-V gcc, not with ESP-IDF, and never run: about 4.7 kB of flash; no
+static RAM; 9,604 bytes of working memory that the application allocates
+and that is touched only during a re-slice, so PSRAM will do; 64 bytes
+more in `mode_s_t`; 704 bytes of stack below `mode_s_detect_2400()` on
+the deepest path. Single-precision float throughout; per re-slice two
+`atan2f`, three `cosf`, three `sinf` and one `roundf` from the C library.
+
+**Checked.** With the option off, output is byte-identical to r10 on the
+eight test sets in four configurations (and at 2.0 Msps), and the
+instruction count is the same. With it on, output does not depend on the
+chunk size – down to 2-byte chunks on the synthetic stream (`make check`)
+and at five sizes on the dense, weak and Madrid sets. The Gray-code
+rescue returns the same repair as the old loop on 20 million random
+damaged frames.
+
+**Turning it on.** On a PC: `host_mode_s --rate 2.4 --stream 1 --coh 1`
+(`--coh-gate`, `--coh-df`, `--coh-ts` for the gates and the timing
+search; five `coh_` counters on the `STATS` line). In the firmware,
+after `mode_s_init()` – not written, because it changes the sample path:
+
+```c
+state.coh_work = heap_caps_malloc(mode_s_coh_work_size(), MALLOC_CAP_SPIRAM);
+state.coh_fix = (state.coh_work != NULL);
+```
+
+It only acts through `mode_s_detect_stream_2400()`, which keeps the IQ of
+the carried samples for it.
+
 ## 6. Not verified – read before relying on any of this
 
 - **Compiled, not run.** The full firmware builds with ESP-IDF v5.4.1
@@ -465,7 +674,30 @@ what it is for.
   correct decode from a false one. The simulated runs say false decodes
   are at or near zero; cross-checking the Madrid output against
   more1090's own decodes of the same recording would settle it and has
-  not been done.
+  not been done. **Done 2026-11-18** (section 5.7,
+  `harness/results/coh_madrid_xcheck.txt`): of the default image's 1646
+  frames at low gain the reference decoded 1633 bit for bit; of the other 13, 6 come
+  from addresses it never heard error-free. That bounds false frames; it
+  does not prove the 13 wrong.
+- **The coherent second look (section 5.7) exists on a PC only.** It has
+  not been built with ESP-IDF v5.4.1 – it was compiled for the P4's
+  instruction set with a different RISC-V gcc and C library – and has
+  never run on a device. Its cost there is unknown: the figures are x86
+  instruction counts, and the P4's `atan2f`/`sinf`/`cosf` and its FPU
+  timing are not in them. Whether the decode task's stack has 704 bytes
+  to spare has not been checked. No firmware code enables it.
+- **Its gates were tuned on this test set** – one real recording and six
+  simulated ones. The noise reference adapts; the two fixed numbers (bit
+  delta at twice the reference, carrier peak at 30 % of pulse energy)
+  may want other values behind a real RTL-SDR.
+- **The collision tests are idealised**: rectangular pulses, two frames,
+  no multipath, carrier offsets as a normal distribution of 100 kHz
+  sigma. Real transponders drift in frequency during a frame and an
+  RTL-SDR adds a DC offset and IQ imbalance; none of that is modelled.
+  The Madrid capture has real transponders but not an RTL-SDR front end.
+- **How often the 2-bit fix puts a wrong message on a real track on the
+  air is not measured** – only that it does so in the collision stress
+  test, where the soft rescue and the coherent look do not.
 - **One real recording, one location, 20 seconds.**
 - **The DF18 counter's on-screen lines have not been seen on a display.**
   They compile; whether the extra line fits the stats panel at its
