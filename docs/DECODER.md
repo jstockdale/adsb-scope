@@ -24,9 +24,13 @@ simulator are not.
 | **2.4 Msps demodulator (new, now the default)** | built to fix the timing loss: 96 % of strong frames decode (was 68 %), **1018 → 1646 frames on a real capture**, at or above dump1090-fa on every test, about 1.8× the decode CPU |
 | Coherent second look (2026-11-18; host-tested; on by default from the coh2 images, never run on a device) | frames that fail their CRC are sliced again from IQ on their own carrier: **1646 → 1918 frames on the real capture**, and 2062 with the soft rescue that is now on with it; weak-signal decode 37 % → 45 %, for 5–6 % more decoder instructions. Its stress test also found the 2-bit fix putting wrong messages on real tracks – section 5.7 |
 
+| Gain loop (2026-11-18, coh3; simulated, never run on a device) | the first device run showed the error-rate loop taking 27 dB of gain away in half a second: at 2.4 Msps its error rate is 99 % at every gain. Replaced by a loop on headroom, the share of frames at full scale, and yield – section 5.8 |
+| Decoder cost (coh3) | the same run showed the decoder filling a core. Measured in RISC-V instructions and cut from 288 M to 149 M per second of signal with identical output; 66 kB of internal RAM freed – section 5.9 |
+
 The timing-phase and 2.4 Msps rows are the important ones. Sections 2–4
 cover the earlier changes; section 5 covers the finding, the demodulator
-built to fix it and, in 5.7, the coherent second look.
+built to fix it, in 5.7 the coherent second look, and in 5.8 and 5.9 what
+the first run on a device found.
 
 ## 2. What changed in the firmware sources
 
@@ -44,6 +48,8 @@ All in `main/examples/adsb_receiver/`.
 | Coherent second look (`coh_fix`), 2.4 Msps only – `CONFIG_ADSB_DECODE_COH` | `mode_s_coh.c`, `mode_s_2400.c`, `mode-s.c` | **on** since coh2 | frames that fail their CRC are sliced again from IQ; section 5.7 |
 | 2-bit correction (`fix2`), SNR gate (`fix2_min_delta`) – `CONFIG_ADSB_DECODE_FIX2` | `mode-s.c` | **off**, and since coh2 not recommended (section 5.7) | none |
 | Decoder stages switchable while running: `adsb dec default\|soft\|fix2`, `adsb coh on\|off`; repair counters in `adsb status` and `diag`, a `DECODER:` log line once a minute, a second `REPLAY:` line | `class_driver.c`, `serial_console.c` | – | `UPLINK.md` section 9.4 |
+| Gain loop on levels and yield, level statistics, squitter error rate, `gain sweep` (coh3) | `gain_ctl.c`, `mode-s.c`, `mode_s_2400.c`, `class_driver.c`, `serial_console.c` | on with the 2.4 Msps demodulator | section 5.8 |
+| Faster exact forms of the magnitude table, checksum and chip sums; decoder files at `-O2`; decoder task on core 1 (coh3) | `mode-s.c`, `mode_s_2400.c`, `main/CMakeLists.txt`, `class_driver.c` | on | same output, half the instructions; section 5.9 |
 | Scan-limit underflow guard, `<time.h>`, `#pragma once`, DF re-read after a correction | `mode-s.c`, `mode-s.h` | on | none in practice |
 
 `+32,776` bytes of const flash (tables). No new RAM apart from 484 bytes
@@ -672,6 +678,219 @@ file (`results/coh_replay_expect.txt` for the two files of the test
 set); the replay's `decoder busy` figure is the first measurement of
 what any of this costs on a P4.
 
+### 5.8 Gain at 2.4 Msps: the error rate, and what replaced it (coh3)
+
+**What the first device run showed (2026-11-18, coh2, a busy band).** Ten
+seconds after the decoder started the adaptive gain loop wrote this, 40 ms
+apart:
+
+```
+GAIN: [P1] Down: 49.6 → 43.4 dB (−6.2 dB, err=99%, pos=0.0/s, ok=3, sig=5168 delta=3577)
+GAIN: [P1] Down: 43.4 → 37.2 dB (−6.2 dB, err=99%, pos=1.0/s, ok=3, sig=6120 delta=3314)
+GAIN: [P1] Down: 37.2 → 29.7 dB (−7.5 dB, err=99%, pos=2.0/s, ok=3, sig=6721 delta=4843)
+GAIN: [P1] Down: 29.7 → 22.9 dB (−6.8 dB, err=99%, pos=1.0/s, ok=3, sig=5087 delta=2864)
+GAIN: Converged at 22.9 dB (err=99%, ...) → steady-state
+```
+
+27 dB of gain gone in half a second, and the message rate with it: about
+thirty a second before, about three after.
+
+**Two things were wired to the wrong counter.** The loop's error rate is
+`stat_crc_fail / (stat_crc_ok + stat_crc_fail)`, and its phase 1 window
+ends after 200 "messages", counted as `stat_crc_ok + stat_crc_fail`. With
+the 2.0 Msps demodulator both are close to what the names say: its
+preamble test lets few candidates through, so a failed candidate is nearly
+always a damaged frame. The 2.4 Msps demodulator gates on ratios and passes
+about 5,000 candidates a second on a busy band – Mode A/C replies, pulse
+noise, the bodies of frames already failed – whatever the gain is. So:
+
+- the "error rate" sat at 99 % and stays there at every gain, and
+- the 200-"message" window was over in 40 ms, with between none and three
+  decoded frames in it.
+
+Phase 1 reads more than 90 % as "near-total garbage" and drops 6 dB a
+window. The one thing that should have stopped it, the signal gate (three
+decoded frames with a mean level over 5,000), passed whenever three frames
+of a nearby aircraft fell into the same 40 ms.
+
+**No error rate can do this job at 2.4 Msps.** Counting properly does not
+rescue the idea. `harness/experiments/gain_sweep.py` puts the Madrid
+capture (16-bit samples, 41 dB between its noise and its full scale)
+through an 8-bit ADC at a series of gains; `results/gain_sweep.txt`,
+abridged:
+
+| ADC gain | noise, counts | headroom | msg/s | pos/s | loud | err (squitters lost) | old err |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| −12 dB | 0.60 | 46.6 dB | 320 | 33.6 | 0 % | 69.5 % | 99.4 % |
+| −6 dB | 0.89 | 43.1 dB | 350 | 36.1 | 0 % | 64.2 % | 99.1 % |
+| 0 dB | 1.46 | 38.8 dB | 357 | 37.4 | 7 % | 39.7 % | 94.3 % |
+| +3 dB | 2.02 | 36.0 dB | 360 | 37.5 | 11 % | 35.8 % | 92.7 % |
+| +6 dB | 2.76 | 33.3 dB | 356 | 37.0 | 20 % | 35.3 % | 92.1 % |
+| +9 dB | 3.87 | 30.4 dB | 348 | 37.0 | 30 % | 33.9 % | 92.0 % |
+| +12 dB | 5.43 | 27.4 dB | 335 | 36.2 | 39 % | 33.1 % | 92.2 % |
+| +15 dB | 7.67 | 24.4 dB | 315 | 35.0 | 48 % | 31.9 % | 92.5 % |
+| +18 dB | 10.8 | 21.4 dB | 275 | 33.5 | 57 % | 32.0 % | 93.3 % |
+| +24 dB | 21.5 | 15.5 dB | 166 | 24.3 | 90 % | 32.2 % | 95.3 % |
+| +30 dB | 42.8 | 9.5 dB | 28 | 6.8 | 100 % | 36.3 % | 98.7 % |
+
+"Old err" is what the loop steered on: 92–99 % across 42 dB of gain. "Err"
+is a properly counted one (below). From +6 to +24 dB the yield falls by
+more than half and it does not move: it sits between 32 and 35 %. On this
+band a third of the squitters that can be seen are lost to other
+transmissions on top of them, which no gain setting changes; the frames
+too much gain destroys leave the count on both sides. (It does rise at the
+cold end, where the ADC's steps break up the level it is referred to.)
+
+**The error rate that is shown now.** `stat_es_ok` counts extended
+squitters decoded; `stat_es_lost` counts candidates whose slice reads DF17
+or DF18 and whose bits stand at least twice as far apart as those of the
+run of failed candidates, once per 120 µs, less any that decoded on the
+neighbouring alignment. The rate is lost / (decoded + lost). Against the
+simulator's truth (`experiments/es_lost_truth.py`,
+`results/gain_es_lost_truth.txt`):
+
+| set | squitters sent | really lost | shown |
+| --- | --- | --- | --- |
+| strong | 1378 | 3.6 % | 6.5 % |
+| mid | 1428 | 3.4 % | 4.6 % |
+| weak | 1380 | 54.6 % | 34.5 % |
+| busy (1,000 messages/s) | 2234 | 51.2 % | 30.1 % |
+| dense (2,000 messages/s) | 4468 | 57.7 % | 33.8 % |
+
+It follows the truth in order and reads low when losses are heavy: a frame
+too weak or too buried to show a DF17 header is not counted as lost,
+because nothing says it was there. Read it as "at least this share". It
+is shown in `adsb status`, `gain`, the `GAIN:` lines (`err=`) and the MQTT
+status; the loop does not steer on it.
+
+**What does move with gain** is in the same table:
+
+- *headroom* – ADC full scale over the noise, from a histogram of one
+  sample pair in 67 (`mode_s_level_count`; noise from the level half of
+  the samples lie under, so traffic moves it little). Under about one
+  count of noise the ADC's own steps start to cost weak frames: 3 % of
+  the messages at 43 dB, 11 % at 47 dB.
+- *loud* – the share of decoded frames whose pulses are within 3 dB of
+  full scale. The frames that clip are the ones too much gain costs: at
+  2.4 Msps a chip is 1.2 samples, each bit is decided from samples that
+  carry both of its chips, and a clipped pulse loses the contrast between
+  them. Messages decoded are within 3.5 % of the best from 3 % to 30 %
+  loud, 7 % down at 39 %, a quarter down at 57 %.
+
+**The loop (`gain_ctl.c`, used with the 2.4 Msps demodulator).**
+
+- *Phase 1*, 10 s windows (or two seconds once 200 frames are **decoded**):
+  down 3 dB at 35 % loud, 6 dB at 50 %; down to 26 dB of headroom if the
+  noise alone leaves less than 20; up, 3 dB at a time (6 while the noise is
+  under 0.8 count), while nothing is loud and more than 33 dB of headroom
+  would remain. Three windows without a change end it.
+- *Phase 2*, 60 s windows: one step down while more than 20 % is loud, one
+  step up while under 5 % is loud and more than 31 dB of headroom remains.
+  Every step is judged by the positions decoded per second two windows
+  later and taken back if it cost more than 15 % – unless the signal level
+  moved by 40 %, which means the traffic changed. Two failed steps fence
+  that direction off for twenty windows. The per-gain history ("profile")
+  can propose a neighbour. All of that is the older loop's phase 2,
+  carried over; what changed is what proposes a step.
+- A gain change is followed by half a second in which nothing is counted.
+- Started from the top step it stays there unless something is loud:
+  the loop does not give up gain to gain headroom nobody is using.
+
+The 2.0 Msps build keeps the older loop unchanged; `gain band` belongs to
+it and is not used by this one.
+
+**Simulated** (`harness/gain/sim_gain.c`, in `make check`): the loop,
+compiled from the firmware's file, against a model made of the decoder's
+own counts on the capture above at every dB of gain, with traffic that
+varies over the day, hours with none, a start from the lowest step, and
+one aircraft in fifty or two hundred. Thirty runs of twelve hours
+(`results/gain_sim.txt`): it ends at or next to the gain that would have
+been the best fixed one and decodes 99–100 % of that gain's positions,
+with 0–12 changes in twelve hours; where the top step is the best one it
+never moves.
+
+**What the model is not.** It is an ADC in front of a recording: its noise
+follows the gain dB for dB. A tuner's noise figure also changes with the
+gain setting, and its steps are not exactly what the table says. The
+thresholds above come from one recording with many strong aircraft. So
+the device measures itself: `gain sweep [seconds]` holds each step from
+49.6 down to 19.7 dB for ten seconds (or as asked) and logs
+
+```
+GAIN: [Sweep] 49.6 dB: 28.4 msg/s, ES 9.8/s, pos=9.1/s, err=31%, sig=6120 delta=3314, loud=4% noise=3.2 headroom=32dB clip=0.02%
+```
+
+(example values), then returns to the gain it started from. Traffic
+changes during the three minutes it takes, so run it twice. Those lines
+are the evidence the thresholds should be tuned on.
+
+**Checked.** `make check` (the loop on the model, thirty runs with
+expectations); the firmware builds. **Not checked:** the loop on a device;
+the sweep and the `[Manual]` line on a device; what a real R820T's noise
+does across its steps.
+
+### 5.9 What the decoder costs on the P4's processor (coh3)
+
+**The same device run** printed the task watchdog every five seconds from
+the moment the receiver was busy: the idle task of core 0 never ran, the
+decoder task was on that core at four of five reports, core 1 was idle at
+all five. The program counters, resolved against the flashed image, were
+in the slicer, the checksum and the soft rescue – candidate work.
+
+**Measured in the device's instructions.** `experiments/cost_rv32.py`
+builds the decoder with the firmware's compiler and flags, runs it under
+qemu-riscv32 on the start of the Madrid capture and counts instructions
+(`results/cost_rv32.txt`). Per second of signal, the default decoder:
+
+| | instructions / s | |
+| --- | --- | --- |
+| coh2 as flashed (`-Og`) | 288 M | 100 % |
+| coh2 at `-O2` | 221 M | 77 % |
+| coh3 at `-Og` | 190 M | 66 % |
+| **coh3 as built (`-O2`)** | **149 M** | **52 %** |
+
+The cores run at 360 MHz. How many instructions they finish per cycle on
+this code is not known here; at 0.8 the flashed decoder needs a whole core
+for a band like this one, which is what the device showed.
+
+**What changed – all of it exact**, i.e. the same frames, bit deltas and
+times out:
+
+- *Magnitude table* indexed by the sample pair as it lies in the buffer
+  (I + 256·Q): one load where there were two subtractions, two absolute
+  values and a multiplication. 128 kB in PSRAM; the older table took
+  66 kB of **internal** RAM (it was declared twice the size it used),
+  which is free again.
+- *Checksum* by the byte-wise CRC table over the data bytes instead of one
+  step per bit.
+- *Chip sums written out*: the preamble's pulse and quiet chips with
+  positions the compiler folds, and each bit as a three- or four-tap
+  filter with constant weights, instead of loops over position tables.
+  `-DMODE_S_2400_PLAIN` builds the plain form.
+- The three decoder files are compiled at `-O2` (`main/CMakeLists.txt`).
+
+Evidence: against the coh2 decoder, identical output in fifty comparisons
+(eight test sets, five configurations at 2.4 Msps, two at 2.0 Msps);
+`make check` holds the written-out form to the plain one, the checksum to
+the bit-by-bit one on two million frames, and the table to the square
+root for all 65,536 sample pairs.
+
+What is left, by share on RISC-V: the per-sample gate (about 19
+instructions a sample, 30 %), the magnitude conversion (18 %), the later
+gate stages and timing search (20 %), slicing (16 %), repairs and the
+coherent look (the rest).
+
+**A core of its own.** The decoder task is pinned to core 1. Core 0
+carries the USB host, the timers, the network tasks and the interrupt
+handlers registered at start-up; unpinned, the decoder settled there.
+
+**Not known.** The decoder task rests for one tick every 200 ms when it
+never has to wait, so that the idle task behind it runs; on the device that
+did not happen for at least 25 s and reading the code has not shown why. If
+the watchdog message returns, it will now name core 1, and `top` taken at
+that moment is the evidence needed. And the real figure: `adsb status`
+prints the decoder's share of a core and the share of air time decoded.
+
 ## 6. Not verified – read before relying on any of this
 
 - **Compiled, not run.** The full firmware builds with ESP-IDF v5.4.1
@@ -698,7 +917,10 @@ what any of this costs on a P4.
   detector lets through. The new detector's thresholds are ratios to the
   noise level, so that number no longer moves with gain the way it did.
   How the loop behaves with it is unknown; compare with a manual gain
-  setting on first boot.
+  setting on first boot. **Found out on 2026-11-18** (the first device
+  run): it took the gain from 49.6 to 22.9 dB in half a second. Section
+  5.8; from coh3 the 2.4 Msps demodulator has a different loop, simulated
+  and not yet run on a device.
 - **The front end is modelled, not an RTL-SDR.** Recordings are resampled
   8 → 2.0 Msps with a generic anti-alias filter and quantised to 8 bits.
   The RTL2832U's own decimation filter and the tuner's IF response differ.

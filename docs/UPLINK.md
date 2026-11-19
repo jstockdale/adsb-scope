@@ -534,3 +534,87 @@ showing:
 
 Not verified: any of this on a device. The switches and counters compile
 and are exercised on a PC only through the decoder functions they call.
+
+### 9.5 Gain on the console (coh3): `gain`, `gain sweep`
+
+With the 2.4 Msps demodulator the adaptive gain steers on signal levels
+and yield, not on the error rate (`docs/DECODER.md` section 5.8 has the
+reasons and the rules).
+
+| command | effect |
+| --- | --- |
+| `gain` | the gain, the phase, and what the loop sees: noise in ADC counts and the headroom above it, the share of decoded frames at full scale ("loud"), the share of clipped samples, squitters lost |
+| `gain auto` | adaptive, from the top step |
+| `gain restart` | adaptive, phase 1 again from the gain in use |
+| `gain <dB>` | fixed |
+| `gain sweep [seconds]` | hold each step from 49.6 down to 19.7 dB for that long (default 10 s, 3–600) and log what it yields; then back to the gain in use before. About three minutes at the default |
+| `gain sweep stop` | end a sweep early |
+| `gain band ...` | the 2.0 Msps loop's error-rate band; stored, not used by this loop |
+
+In the log:
+
+```
+GAIN: [P1] Holding 49.6 dB (err=31%, pos=9.4/s, ok=283, sig=6120 delta=3314, loud=4% noise=3.2 headroom=32dB clip=0.02%)
+GAIN: Converged at 49.6 dB (err=31%, pos=9.2/s, range=85nm, sig=6093 delta=3301, loud=4% noise=3.2 headroom=32dB clip=0.02%) → steady-state
+GAIN: [P2] Steady: 49.6 dB, EMA err=32%, pos=9.3/s, range=85nm, sig=6101 delta=3290, loud=4% noise=3.2 headroom=32dB clip=0.02%
+GAIN: [Manual] 44.5 dB, err=30%, pos=8.8/s, range=85nm, sig=3400 delta=2100, loud=1% noise=1.8 headroom=37dB clip=0.00%
+GAIN: [Sweep] 49.6 dB: 28.4 msg/s, ES 9.8/s, pos=9.1/s, err=31%, sig=6120 delta=3314, loud=4% noise=3.2 headroom=32dB clip=0.02%
+```
+
+(example values). The lines keep the older ones' beginnings and the
+`err=`, `pos=`, `range=`, `sig=` and `delta=` fields in their old order;
+the level fields are added at the end. Two differences a parser may meet:
+`band=` is gone from the `[P2] Steady` line, and `err=` now means
+squitters lost over squitters seen, a figure around 30 % on a busy band
+at any gain, where it used to read 99 %. The lines go through the log
+queue like the aircraft lines; the decoder no longer waits for the console
+to print them.
+
+`adsb status` (and `diag`) carry a `Levels:` line and `Squitters:` in
+place of `CRC error:`.
+
+### 9.6 The first run on a device (2026-11-18, coh2): what it found
+
+The log of that run (a busy band, a T-Display-P4 that had been running a
+build of 2026-04-18) is the first evidence from hardware for anything
+since r7. In order of weight:
+
+1. **More traffic** than the build it replaced – about ten aircraft and
+   thirty messages a second in the first ten seconds, at 49.6 dB.
+2. **The gain loop then removed 27 dB of gain in half a second** and the
+   rate fell to about three a second. `docs/DECODER.md` section 5.8.
+3. **The decoder filled core 0**: task watchdog reports every five
+   seconds, I2C transfers timing out. Section 5.9.
+4. **The device had been running `5b1dbb7-dirty`**, built nine days after
+   the tip of the fork this repository was cut from (`6fd3692`,
+   2026-04-09), from a commit that is not on GitHub. Three differences
+   show in the two boot logs, and there may be more:
+   - it seeded the clock from the RTC as UTC; this tree reads the RTC as
+     local time and landed eight hours out (`RTC seed: … 13:13:05 UTC`
+     for an RTC at 05:13:05). The seed only serves TLS before GPS or NTP
+     arrive, and this tree writes local time back to the RTC once they
+     do, so the two builds disagree about what the RTC holds;
+   - it printed `[SD] LDO VO4 set to 3300mV (VDDPST_5 for GPIO39-48)`;
+     this tree asks ESP-IDF's SD power control for the same LDO and gets
+     `ldo: The voltage value 0 is out of the recommended range`. The card
+     mounted and logged in both. Not touched in coh3;
+   - it did not print the bus driver's info lines. Off in coh3
+     (`PATCHES.md` section 2).
+5. **Flashing the merged image replaced the partition table** (two OTA
+   slots → one factory app) **and with it the NVS**: settings back to
+   defaults, a new Meshtastic node identity and key pair. `README-FLASH.md`
+   in the firmware kit now says so, and how to keep the NVS.
+6. The I/O expander did not answer the first probe after the reset that
+   followed flashing (it had been mid-transfer); the start-up now waits
+   for it.
+
+**Wanted from the next run** (coh3), about ten minutes of work:
+
+1. The boot log up to and including the first `GAIN: Converged` line, and
+   the first `LOAD:` line a minute later.
+2. `diag` once it has run for a few minutes – `Decode:` (share of a core)
+   and `Capture:` (share of air time decoded) are the two numbers section
+   5.9 could not measure.
+3. `gain sweep`, twice, and the `GAIN: [Sweep]` lines.
+4. If `task_wdt` appears again: `top`, right then.
+5. A replay, as in section 9.4 step 3, if a recording is on the card.
