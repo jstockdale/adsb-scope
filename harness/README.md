@@ -44,6 +44,7 @@ feeder tests, `../docs/UPLINK.md`.
 | `experiments/collide.py` | pairs of overlapping frames at a chosen strength gap – which of the two comes out; `--stress N` counts false frames over N collisions → `results/coh_collide.txt` |
 | `experiments/xcheck_madrid.py` | the Madrid capture has no ground truth: compares our frames with more1090's decodes of the 8 Msps original (set `MORE1090`) → `results/coh_madrid_xcheck.txt` |
 | `experiments/cost_coh.py` | instruction counts with and without the coherent second look (needs valgrind) → `results/coh_cost.txt` |
+| `experiments/replay_expect.py` | what `adsb replay <file>` should report on the device in each console setting (`adsb dec`, `adsb coh`): runs the host decoder on the same file the way the device replays it → `results/coh_replay_expect.txt` |
 | `results/` | CSVs and plot from the runs reported in `docs/DECODER.md` |
 
 ## Checks that need nothing but gcc and Python
@@ -175,6 +176,7 @@ python3 experiments/collide.py                   --out "$R/coh_collide_full.txt"
 python3 experiments/collide.py --tau-us 100,120  --out "$R/coh_collide_tail.txt"
 python3 experiments/collide.py --stress 400000   --out "$R/coh_collide_stress.txt"
 python3 experiments/cost_coh.py "$WORK/set"                                > "$R/coh_cost.txt";          cat "$R/coh_cost.txt"
+python3 experiments/replay_expect.py "$WORK/set/dense.cu8" "$WORK/set/madrid_lo.cu8" > "$R/coh_replay_expect.txt"; cat "$R/coh_replay_expect.txt"
 echo "done - results in $R"
 )
 ```

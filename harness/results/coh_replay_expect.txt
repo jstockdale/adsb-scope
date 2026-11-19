@@ -1,0 +1,39 @@
+What `adsb replay` should report on the device, per console setting (2026-11-18)
+
+Method: experiments/replay_expect.py - the host build of the firmware decoder run the way the
+device replays a file (2.4 Msps, streaming, DF18 not delivered, known-address cache aged by the
+recording's clock). "messages" is what the first REPLAY: line reports; the other columns are on
+the second REPLAY: line. Two files:
+
+  dense.cu8      prep_dense.py: simulated, 2,000 messages/s, 5 s - the heaviest decode load.
+                 Every simulated frame has a new random address, so the known-address gate
+                 refuses every soft or 2-bit repair: the three `adsb dec` settings give the same.
+  madrid_lo.cu8  the Madrid capture at the test set's low gain, 20 s - real traffic. Made by
+                 `python3 decimate.py madrid.sigmf-meta madrid_lo.cu8 --rate 2.4 --scale 145.9`
+                 (md5 d0e04586752c613e1ea7f48b826ecced).
+
+dense.cu8: 24000000 bytes, 5.0 s of signal
+  console setting                                    messages  1-bit  soft  2-bit  re-slices  stopped early  recovered
+  adsb dec default ; adsb coh off                        1655    720     0      0          0              0          0
+  adsb dec default ; adsb coh on                         1794    655     0      0       2473            126        545
+  adsb dec soft    ; adsb coh off                        1655    720     0      0          0              0          0
+  adsb dec soft    ; adsb coh on   (boot default)        1794    655     0      0       2473            126        545
+  adsb dec fix2    ; adsb coh off                        1655    720     0      0          0              0          0
+  adsb dec fix2    ; adsb coh on                         1794    655     0      0       2473            126        545
+
+madrid_lo.cu8: 96000000 bytes, 20.0 s of signal
+  console setting                                    messages  1-bit  soft  2-bit  re-slices  stopped early  recovered
+  adsb dec default ; adsb coh off                        6693    427     0      0          0              0          0
+  adsb dec default ; adsb coh on                         7000    394     0      0       6770           3760        537
+  adsb dec soft    ; adsb coh off                        6755    417   109      0          0              0          0
+  adsb dec soft    ; adsb coh on   (boot default)        7144    389    97      0       6671           3757        611
+  adsb dec fix2    ; adsb coh off                        6801    400    42    144          0              0          0
+  adsb dec fix2    ; adsb coh on                         7158    380    38    130       6624           3759        572
+
+Does float rounding move these counts? The coherent look is the only float code in the decoder.
+Rebuilt twice with different rounding - once with fused multiply-add (-march=haswell
+-ffp-contract=fast: 27 fused instructions) and once at -Og with contraction off - the host
+decoder gives the same set of messages as the normal build on dense.cu8, madrid_lo.cu8 and
+weak.cu8, with the look on, with and without the soft rescue. The P4's own atan2f/sinf/cosf
+are not covered by that. So: the same counts are expected on the device; a frame or two of
+difference with the look on would not be alarming; more would be a finding.

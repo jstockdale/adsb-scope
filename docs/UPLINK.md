@@ -472,3 +472,65 @@ recording takes several minutes to replay.
 
 Not verified: any of it on a device, as before. In particular how fast
 the card reads, and that live reception resumes cleanly afterwards.
+
+### 9.4 Decoder stages on the console (coh2): `adsb dec`, `adsb coh`
+
+The decoder's repair stages can be switched while the receiver runs, so
+one flash can compare them on the same antenna or the same recording.
+`docs/DECODER.md` sections 4 and 5.7 say what each stage is and why the
+default is what it is.
+
+| command | effect |
+| --- | --- |
+| `adsb dec` | show the setting, the repair counters and the decoder task's unused stack |
+| `adsb dec default` | 1-bit correction only – with `adsb coh off`, exactly r10's default image |
+| `adsb dec soft` | + soft rescue, known-address gate, strict validation (**boot default**) |
+| `adsb dec fix2` | + exact 2-bit correction (r10's `fix2` image; not recommended) |
+| `adsb coh on` / `adsb coh off` | the coherent second look (**on at boot**) |
+
+Nothing is stored: a restart returns to the build's settings
+(`CONFIG_ADSB_DECODE_SOFT`, `_COH`, `_FIX2`). A change is taken over by
+the decoder task between two of its runs.
+
+Where the stages report:
+
+- `adsb status`, and so `diag`: a `Decoder:` line with the setting, a
+  `Repairs:` line (frames repaired by each kind since the receiver
+  started, and repairs refused by the two gates) and a `Coherent:` line
+  (re-slices, how many stopped early, frames recovered).
+- the log, once a minute after the `LOAD:` line:
+  `DECODER: 1-bit fix, soft rescue (known address, strict), coherent look; in the last 60 s: repaired 1-bit 412, soft 96, 2-bit 0; coherent look 20100 re-slices, 11300 stopped early, 1830 frames recovered`
+  (example values).
+- a replay: a second line,
+  `REPLAY: decoder: <setting>; repaired 1-bit N, soft N, 2-bit N; coherent look N re-slices, N stopped early, N frames recovered`.
+  At the start and end of a replay the coherent look's noise reference is
+  reset, so a replay does not depend on what was on the air before it.
+
+**Reading the live counters.** "Frames recovered" overstates the gain:
+on the recorded capture about half of them would have been decoded from
+the next candidate position a sample later. The honest comparison is a
+replay of one file in two settings.
+
+**A first session with coh2**, with the dongle attached and aircraft
+showing:
+
+1. *Baseline, as r10:* `adsb dec default`, `adsb coh off`, `diag mark`,
+   a few minutes of traffic, `diag`. This is the measurement roadmap
+   rule 1 was waiting for.
+2. *The default:* `adsb dec soft`, `adsb coh on`, `diag mark`, the same
+   few minutes, `diag`. Compare `Decode` and `Capture` with step 1; the
+   message rates cannot be compared, the traffic has changed.
+3. *The same samples in both settings:* with a recording on the card,
+   `adsb dec default`, `adsb coh off`, `adsb replay <file>`; then
+   `adsb dec soft`, `adsb coh on`, `adsb replay <file>`. Keep the four
+   `REPLAY:` lines. The message counts give the gain; the two `decoder
+   busy` figures give what it costs on a P4, which nothing so far has
+   measured.
+4. *Against the PC:* `python3 harness/experiments/replay_expect.py
+   <the same file>` prints the counts the host build gets in each
+   setting. They should match the device's; with the coherent look on a
+   frame or two of difference would not be alarming (it works in
+   single-precision float), more would be a finding.
+
+Not verified: any of this on a device. The switches and counters compile
+and are exercised on a PC only through the decoder functions they call.

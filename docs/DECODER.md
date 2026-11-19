@@ -22,7 +22,7 @@ simulator are not.
 | **Timing phase (new finding)** | the 2 Msps decoder is blind to ~35 % of arrival phases **at any signal strength**; a second pass on a half-sample-shifted grid recovers them: **+37 % to +43 % frames on a real capture** (experiment, not yet in firmware) |
 
 | **2.4 Msps demodulator (new, now the default)** | built to fix the timing loss: 96 % of strong frames decode (was 68 %), **1018 → 1646 frames on a real capture**, at or above dump1090-fa on every test, about 1.8× the decode CPU |
-| Coherent second look (2026-11-18; host-tested, in no firmware image) | frames that fail their CRC are sliced again from IQ on their own carrier: **1646 → 1918 frames on the real capture** (fix2 image: 1755 → 2077), weak-signal decode 37 % → 45 %, for 5–6 % more decoder instructions. Its stress test also found the 2-bit fix putting wrong messages on real tracks – section 5.7 |
+| Coherent second look (2026-11-18; host-tested; on by default from the coh2 images, never run on a device) | frames that fail their CRC are sliced again from IQ on their own carrier: **1646 → 1918 frames on the real capture**, and 2062 with the soft rescue that is now on with it; weak-signal decode 37 % → 45 %, for 5–6 % more decoder instructions. Its stress test also found the 2-bit fix putting wrong messages on real tracks – section 5.7 |
 
 The timing-phase and 2.4 Msps rows are the important ones. Sections 2–4
 cover the earlier changes; section 5 covers the finding, the demodulator
@@ -40,9 +40,10 @@ All in `main/examples/adsb_receiver/`.
 | DF18 counter, total and by source (TIS-B / ADS-R / non-transponder ADS-B) | `mode-s.c`, `class_driver.c`, `serial_console.c`, `main.cpp` | on | visible in four places, see below |
 | Streaming detection (`mode_s_detect_stream`) | `mode-s.c`, `class_driver.c` | on | boundary frames decoded; per-frame absolute sample index available |
 | 2.4 Msps demodulator, `CONFIG_ADSB_DEMOD_2400` (menuconfig → Example Configuration → ADS-B demodulator) | `mode_s_2400.c`, `class_driver.c`, `Kconfig.projbuild` | **on** | the RTL-SDR runs at 2.4 Msps; frames decode whatever their timing |
-| Soft rescue (`soft_fix`), 2.4 Msps only | `mode_s_2400.c` | **off** (enabled by `CONFIG_ADSB_DECODE_FIX2`) | none |
-| 2-bit correction (`fix2`), strict CA/CF validation (`strict_es`), known-address gate (`fix2_known_icao`), SNR gate (`fix2_min_delta`) | `mode-s.c` | **off** | none |
-| `CONFIG_ADSB_DECODE_FIX2` (menuconfig → Example Configuration; enables fix2 + strict + known-address) | `Kconfig.projbuild`, `class_driver.c` | **off** | none |
+| Soft rescue (`soft_fix`) with strict CA/CF validation (`strict_es`) and the known-address gate (`fix2_known_icao`), 2.4 Msps only – `CONFIG_ADSB_DECODE_SOFT` | `mode_s_2400.c`, `mode-s.c` | **on** since coh2 (was off) | frames of aircraft already heard cleanly are repaired from their least confident bits |
+| Coherent second look (`coh_fix`), 2.4 Msps only – `CONFIG_ADSB_DECODE_COH` | `mode_s_coh.c`, `mode_s_2400.c`, `mode-s.c` | **on** since coh2 | frames that fail their CRC are sliced again from IQ; section 5.7 |
+| 2-bit correction (`fix2`), SNR gate (`fix2_min_delta`) – `CONFIG_ADSB_DECODE_FIX2` | `mode-s.c` | **off**, and since coh2 not recommended (section 5.7) | none |
+| Decoder stages switchable while running: `adsb dec default\|soft\|fix2`, `adsb coh on\|off`; repair counters in `adsb status` and `diag`, a `DECODER:` log line once a minute, a second `REPLAY:` line | `class_driver.c`, `serial_console.c` | – | `UPLINK.md` section 9.4 |
 | Scan-limit underflow guard, `<time.h>`, `#pragma once`, DF re-read after a correction | `mode-s.c`, `mode-s.h` | on | none in practice |
 
 `+32,776` bytes of const flash (tables). No new RAM apart from 484 bytes
@@ -188,7 +189,23 @@ front end as ours, so treat the comparison as rough).
 
 ## 4. Recommended configuration
 
-Ship as built: syndrome correction, DF18 length fix (held from the app),
+**Since coh2 (2026-11-18)** the build default is the configuration
+section 5.7 arrives at, decided by the project owner the same day:
+
+1. the 2.4 Msps demodulator, 1-bit syndrome correction;
+2. the soft rescue, with strict CA/CF validation and the known-address
+   gate (`CONFIG_ADSB_DECODE_SOFT`);
+3. the coherent second look, whose confidences give the soft rescue a
+   second try (`CONFIG_ADSB_DECODE_COH`);
+4. no 2-bit correction (`CONFIG_ADSB_DECODE_FIX2` stays off).
+
+All of it is host-tested only. On a device each stage can be switched
+from the console – `adsb dec default` and `adsb coh off` give exactly
+what r10's default image did – and `UPLINK.md` section 9.4 has the test
+procedure. The rest of this section is the earlier recommendation, kept
+for the record.
+
+*Until coh2:* ship as built: syndrome correction, DF18 length fix (held from the app),
 streaming detection. After a soak on hardware, enable
 `CONFIG_ADSB_DECODE_FIX2` (menuconfig → Example Configuration) – that
 sets `fix2`, `strict_es` and `fix2_known_icao`, and with the 2.4 Msps
@@ -207,8 +224,9 @@ without the 2-bit fix. How often that happens on the air is not known.
 Read 5.7 before enabling `CONFIG_ADSB_DECODE_FIX2`.*
 
 The soak should watch `state.stat_fix1`, `stat_fix2`,
-`stat_fix2_icao_rej` and `stat_strict_rej`. **Those four are not printed
-anywhere yet.** (The DF18 counters are – see section 2.)
+`stat_fix2_icao_rej` and `stat_strict_rej`. Since coh2 they are printed,
+with the soft-rescue and coherent-look counters: the `Repairs:` and
+`Coherent:` lines of `adsb status`.
 
 ## 5. The finding: timing-phase blindness
 
@@ -438,11 +456,14 @@ ns) – `experiments/toa_error.py`, `results/toa_error.txt`. Nothing in
 the firmware uses it yet; `docs/ROADMAP-AVIATION.md` section 4.1 says
 what it is for.
 
-### 5.7 Coherent second look (`mode_s_coh.c`) – host-tested, in no firmware image
+### 5.7 Coherent second look (`mode_s_coh.c`) – host-tested, never run on a device
 
-*Added 2026-11-18. Off by default, and nothing in the firmware turns it
-on. It changes decoder sources, so under roadmap rule 1 it stays on its
-own branch until the r10 images have reported from a device.*
+*Added 2026-11-18. First delivered off and unwired (coh1); the same day
+the project owner chose to make it, with the soft rescue, the build
+default (coh2, section 4) – ahead of roadmap rule 1, which would have
+held decoder changes until the r10 images had reported from a device.
+The r10 behaviour is one console command away (`adsb dec default`,
+`adsb coh off`), and that is the baseline to take first.*
 
 **The gap.** `mode_s_2400.c` decides a bit by comparing the magnitudes of
 its two halves. Two things defeat that. When another transmission overlaps
@@ -609,13 +630,17 @@ These are instruction counts on a PC. The decoder's share of a P4 core is
 still unmeasured (`Decode` in `adsb status`), so the absolute cost on the
 device is unknown.
 
-**On the device** – compiled for `rv32imafc`/`ilp32f` with a generic
-RISC-V gcc, not with ESP-IDF, and never run: about 4.7 kB of flash; no
-static RAM; 9,604 bytes of working memory that the application allocates
-and that is touched only during a re-slice, so PSRAM will do; 64 bytes
-more in `mode_s_t`; 704 bytes of stack below `mode_s_detect_2400()` on
-the deepest path. Single-precision float throughout; per re-slice two
-`atan2f`, three `cosf`, three `sinf` and one `roundf` from the C library.
+**On the device** – built with ESP-IDF v5.4.1 since coh2 (no new
+warnings), never run. Measured on the object files of a generic RISC-V
+gcc for `rv32imafc`/`ilp32f`: about 4.7 kB of flash for the look itself
+(the coh2 application image is about 12 kB larger than r10's, console
+commands and counters included); no static RAM; 9,604 bytes of working
+memory, allocated from PSRAM when the look is first switched on and
+touched only during a re-slice; 64 bytes more in `mode_s_t`; 704 bytes of
+stack below `mode_s_detect_2400()` on the deepest path – the decoder task
+has 12 kB, and `adsb dec` prints how much of it has never been used.
+Single-precision float throughout; per re-slice two `atan2f`, three
+`cosf`, three `sinf` and one `roundf` from the C library.
 
 **Checked.** With the option off, output is byte-identical to r10 on the
 eight test sets in four configurations (and at 2.0 Msps), and the
@@ -625,18 +650,27 @@ and at five sizes on the dense, weak and Madrid sets. The Gray-code
 rescue returns the same repair as the old loop on 20 million random
 damaged frames.
 
-**Turning it on.** On a PC: `host_mode_s --rate 2.4 --stream 1 --coh 1`
-(`--coh-gate`, `--coh-df`, `--coh-ts` for the gates and the timing
-search; five `coh_` counters on the `STATS` line). In the firmware,
-after `mode_s_init()` – not written, because it changes the sample path:
-
-```c
-state.coh_work = heap_caps_malloc(mode_s_coh_work_size(), MALLOC_CAP_SPIRAM);
-state.coh_fix = (state.coh_work != NULL);
-```
+**Turning it on and off.** On a PC: `host_mode_s --rate 2.4 --stream 1
+--coh 1` (`--coh-gate`, `--coh-df`, `--coh-ts` for the gates and the
+timing search; `--coh-on-at` / `--coh-off-at` to switch it in mid-stream;
+five `coh_` counters on the `STATS` line). In the firmware since coh2:
+on at boot (`CONFIG_ADSB_DECODE_COH`), and `adsb coh on|off` on the
+console while the receiver runs. The application calls
+`mode_s_coh_enable()`, which also discards what the look had kept from
+before the switch; the firmware does that from the decoder task, between
+two of its runs. `make check` switches the look on and off in mid-stream
+and requires the output outside that interval to be exactly what it is
+with the look off.
 
 It only acts through `mode_s_detect_stream_2400()`, which keeps the IQ of
 the carried samples for it.
+
+**The first test on a device** is `UPLINK.md` section 9.4: a baseline
+with the look off, then a replay of the same recording in each setting.
+`experiments/replay_expect.py` gives the counts a PC gets for the same
+file (`results/coh_replay_expect.txt` for the two files of the test
+set); the replay's `decoder busy` figure is the first measurement of
+what any of this costs on a P4.
 
 ## 6. Not verified – read before relying on any of this
 
@@ -679,13 +713,17 @@ the carried samples for it.
   frames at low gain the reference decoded 1633 bit for bit; of the other 13, 6 come
   from addresses it never heard error-free. That bounds false frames; it
   does not prove the 13 wrong.
-- **The coherent second look (section 5.7) exists on a PC only.** It has
-  not been built with ESP-IDF v5.4.1 – it was compiled for the P4's
-  instruction set with a different RISC-V gcc and C library – and has
-  never run on a device. Its cost there is unknown: the figures are x86
-  instruction counts, and the P4's `atan2f`/`sinf`/`cosf` and its FPU
-  timing are not in them. Whether the decode task's stack has 704 bytes
-  to spare has not been checked. No firmware code enables it.
+- **The coherent second look (section 5.7) has never run on a device.**
+  Since coh2 it is built with ESP-IDF v5.4.1 and on by default. Its cost
+  there is unknown: the figures are x86 instruction counts, and the P4's
+  `atan2f`/`sinf`/`cosf` and its FPU timing are not in them. Whether the
+  decode task's stack has 704 bytes to spare has not been checked
+  (`adsb dec` reports it). The console switches, the counters, the
+  `DECODER:` log line and the second `REPLAY:` line compile and have
+  never been seen working.
+- **The soft rescue is on by default since coh2 without the hardware
+  soak section 4 once asked for.** The grounds are the stress test of
+  5.7; the soak is still owed.
 - **Its gates were tuned on this test set** – one real recording and six
   simulated ones. The noise reference adapts; the two fixed numbers (bit
   delta at twice the reference, carrier peak at 30 % of pulse energy)
