@@ -140,10 +140,19 @@ typedef struct {
     uint16_t gain_tenths;       // current tuner gain in tenths of dB (e.g. 496 = 49.6 dB)
     bool     gain_auto;         // true if using adaptive gain
     int      gain_phase;        // 1 = fast convergence, 2 = steady-state
-    float    crc_error_rate;    // CRC failure rate (0.0 – 1.0) over last evaluation window
+    float    crc_error_rate;    // 2.4 Msps demodulator: extended squitters lost / seen (0.0 – 1.0),
+                                // last window in phase 1, the running average in phase 2;
+                                // 2.0 Msps: failed candidates / all candidates
     float    pos_rate;          // position updates per second (EMA in phase 2)
     uint32_t avg_signal;        // avg preamble signal level of CRC-ok messages (0–65167)
     uint32_t avg_delta;         // avg bit delta / SNR proxy of CRC-ok messages (noise floor ~2550)
+    // Levels, as the gain loop sees them (2.4 Msps demodulator; gain_ctl.h)
+    bool     gain_by_levels;    // true: the gain loop steers on these, not on the error rate
+    bool     gain_sweep;        // a `gain sweep` is running
+    float    noise_counts;      // rms noise per ADC rail, in counts (0 = not measured yet)
+    float    headroom_db;       // ADC full scale over that noise, dB
+    float    loud_share;        // share of decoded frames within 3 dB of full scale; -1 = too few frames
+    float    clip_share;        // share of samples on an ADC rail
     char     dongle_model[64];  // human-readable RTL-SDR dongle description (e.g. "RTL-SDR Blog V4 (R828D)")
     // DF18: extended squitter from non-transponder sources. Decoded and
     // counted since the receiver started; not shown as aircraft.
@@ -265,6 +274,11 @@ extern void adsb_set_gain(int mode, uint16_t gain_tenths);
 
 // Restart adaptive gain from current level — re-enters P1 without resetting to max.
 extern void adsb_gain_restart(void);
+// Hold every gain step from the highest down to the loop's floor for
+// 'seconds' each and log what it yields (GAIN: [Sweep] lines), then go back
+// to the gain in use before. seconds <= 0 stops a sweep. Returns false if
+// this build's demodulator has no level statistics (2.0 Msps).
+extern bool adsb_gain_sweep(int seconds);
 
 // Sort column for on-device aircraft list
 typedef enum {

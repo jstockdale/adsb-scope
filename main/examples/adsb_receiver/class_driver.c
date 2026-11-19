@@ -13,6 +13,7 @@
 #include "rtlsdr_i2c.h"
 #include "sample_ring.h"
 #include "usb_stream.h"
+#include "gain_ctl.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -118,6 +119,12 @@ static int      s_load_line_windows = 0;
 #define ADSB_RING_SLOTS         192
 #define ADSB_DECODE_TASK_STACK  (12 * 1024)
 #define ADSB_DECODE_TASK_PRIO   3
+// The decoder is the one task here that can use a whole core, and it has
+// the second one: core 0 carries the USB host, the timer and network tasks
+// and every interrupt handler registered at start-up. Left unpinned (r9,
+// r10) it settled on core 0 on the first device test and kept that core's
+// idle task from running for as long as the log goes, with core 1 idle.
+#define ADSB_DECODE_TASK_CORE   1
 // The decoder is woken when this many transfers are waiting (9 ms of
 // signal), so it works in a few long runs instead of many short ones.
 #define ADSB_DECODE_BATCH_SLOTS 8
@@ -346,6 +353,35 @@ static volatile int      s_gain_floor_age = 0;          // windows since floor w
 #define GAIN_PROFILE_MIN_DELTA 0.25f // profile must be at least 0.25/s better (prevents noise probes)
 static float    s_gain_profile[R820T_GAIN_COUNT];      // EMA pos_rate at each level
 static uint16_t s_gain_profile_samples[R820T_GAIN_COUNT]; // windows observed at each level
+
+// ── Gain from levels and yield (gain_ctl.c) – the loop used with the 2.4 Msps
+// demodulator, for which the error rate above carries no information about
+// the gain (docs/DECODER.md section 5.8). The loop state and the level
+// histogram the decoder fills live in one PSRAM block. Everything here is
+// touched by the decoder task only, except the request words, which other
+// tasks write and the decoder task takes over between two runs.
+typedef struct {
+    gain_ctl_t ctl;
+    uint32_t   hist[MODE_S_LVL_BINS];
+} gain_level_mem_t;
+static gain_level_mem_t *s_gl = NULL;
+#define GL_REQ_RESTART_MAX  1u    // adaptive gain (re)started from the top
+#define GL_REQ_RESTART_KEEP 2u    // ... from the gain in use
+static volatile uint32_t s_gl_req = 0;
+static int64_t s_gl_settle_until = 0;             // a gain change is settling: no window is open
+// Level figures of the last window, for adsb_get_stats()
+static volatile float s_gain_noise = 0.0f, s_gain_headroom = 0.0f, s_gain_loud = -1.0f, s_gain_clip = 0.0f;
+// Sweep (`gain sweep`): hold each gain step for a while and print what it yields
+static volatile int32_t s_sweep_req = 0;          // > 0: start one with this many seconds a step;
+                                                  // -1: stop and go back; -2: stop, the gain was set by hand
+static volatile bool s_sweep_running = false;     // for other tasks to see
+static struct {
+    bool    active;
+    int     idx;            // step being measured
+    int     saved_idx;      // what to go back to
+    int64_t t0;             // start of the measurement at this step
+    int64_t dwell_us;
+} s_sweep;
 
 // ============================================================
 // CPR cache with timestamps — linear-probed hash table
@@ -683,6 +719,12 @@ adsb_stats_t adsb_get_stats(void) {
     stats.pos_rate = s_gain_pos_rate_ema;
     stats.avg_signal = s_gain_avg_signal;
     stats.avg_delta = s_gain_avg_delta;
+    stats.gain_by_levels = ADSB_DEMOD_IS_2400 != 0;
+    stats.gain_sweep = s_sweep_running;
+    stats.noise_counts = s_gain_noise;
+    stats.headroom_db = s_gain_headroom;
+    stats.loud_share = s_gain_loud;
+    stats.clip_share = s_gain_clip;
     stats.df18_total = s_df18_total;
     stats.df18_last_min = s_df18_last_min;
     stats.df18_tisb = s_df18_tisb;
@@ -786,6 +828,8 @@ void adsb_set_gain(int mode, uint16_t gain_tenths) {
         memset((void *)s_gain_profile_samples, 0, sizeof(s_gain_profile_samples));
         s_gain_idx = R820T_GAIN_COUNT - 1; // start at max
         s_gain_pending = true;  // deferred — USB task will apply
+        s_gl_req = GL_REQ_RESTART_MAX;
+        if (s_sweep_running) s_sweep_req = -2;
         g_settings.adsb_gain_mode = 0;
         char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
         serial_console_print("%sGAIN: Switched to adaptive gain (starting at %.1f dB, phase 1)\n",
@@ -794,6 +838,8 @@ void adsb_set_gain(int mode, uint16_t gain_tenths) {
         // Manual (fixed)
         s_gain_auto = false;
         s_gain_idx = gain_find_idx(gain_tenths);
+        s_gl_req = GL_REQ_RESTART_KEEP;   // a fresh window at the new gain
+        if (s_sweep_running) s_sweep_req = -2;
         g_settings.adsb_gain_mode = 1;
         g_settings.adsb_gain_tenths = R820T_GAINS[s_gain_idx];
         s_gain_pending = true;  // deferred — USB task will apply
@@ -803,6 +849,18 @@ void adsb_set_gain(int mode, uint16_t gain_tenths) {
                              s_gain_idx, (int)R820T_GAIN_COUNT - 1);
     }
     g_settings_save_pending = true;
+}
+
+// See class_driver.h.
+bool adsb_gain_sweep(int seconds) {
+    if (!ADSB_DEMOD_IS_2400) return false;
+    if (seconds <= 0) {
+        if (s_sweep_running) s_sweep_req = -1;
+        return true;
+    }
+    if (seconds > 600) seconds = 600;
+    s_sweep_req = seconds;
+    return true;
 }
 
 // Restart adaptive gain from current level — re-enters P1 without resetting to max.
@@ -832,6 +890,7 @@ void adsb_gain_restart(void) {
     s_gain_floor_strikes = 0;
     s_gain_floor_age = 0;
     s_gain_win_pos = 0;
+    s_gl_req = GL_REQ_RESTART_KEEP;
     // Keep gain profile — historical data is still useful
     // Keep s_gain_idx — don't reset to max
 
@@ -1468,6 +1527,249 @@ static void gain_evaluate(mode_s_t *st) {
                                  bounds);
         }
     }
+}
+
+// ============================================================
+// Gain from levels and yield (2.4 Msps demodulator) – see gain_ctl.h
+// ============================================================
+
+// What the decoder counted since the window was opened, and a fresh window.
+static void gain_window_take(mode_s_t *st, float secs, gain_obs_t *o)
+{
+    mode_s_level_t lv = {0};
+    uint32_t ok = st->stat_crc_ok;
+    memset(o, 0, sizeof(*o));
+    o->secs = secs;
+    o->ok = ok;
+    o->pos = s_gain_win_pos;
+    o->loud = st->stat_loud;
+    o->es_ok = st->stat_es_ok;
+    o->es_lost = st->stat_es_lost;
+    o->avg_signal = ok ? (uint32_t)(st->stat_signal_sum / ok) : 0;
+    o->avg_delta = ok ? (uint32_t)(st->stat_delta_sum / ok) : 0;
+    o->range_nm = (float)s_max_range_nm;
+    if (st->lvl_hist) {
+        mode_s_level_read(st->lvl_hist, &lv);
+        memset(st->lvl_hist, 0, MODE_S_LVL_BINS * sizeof(uint32_t));
+    }
+    o->noise = lv.noise;
+    o->clip = lv.clip;
+    st->stat_crc_ok = 0;
+    st->stat_crc_fail = 0;
+    st->stat_preambles = 0;
+    st->stat_signal_sum = 0;
+    st->stat_delta_sum = 0;
+    st->stat_loud = 0;
+    st->stat_es_ok = 0;
+    st->stat_es_lost = 0;
+    s_gain_win_pos = 0;
+}
+
+static void gain_levels_publish(const gain_obs_t *o)
+{
+    s_gain_noise = o->noise;
+    s_gain_headroom = gain_ctl_headroom_db(o->noise);
+    s_gain_loud = o->ok >= GAIN_LOUD_MIN_OK ? (float)o->loud / (float)o->ok : -1.0f;
+    s_gain_clip = o->clip;
+    s_gain_avg_signal = o->avg_signal;
+    s_gain_avg_delta = o->avg_delta;
+}
+
+// The level figures as text, for the lines this file writes itself.
+static void gain_levels_text(const gain_obs_t *o, char *buf, size_t n)
+{
+    char loud[16];
+    if (o->ok >= GAIN_LOUD_MIN_OK) snprintf(loud, sizeof(loud), "%.0f%%", 100.0 * o->loud / o->ok);
+    else snprintf(loud, sizeof(loud), "n/a");
+    if (o->noise > 0)
+        snprintf(buf, n, "loud=%s noise=%.1f headroom=%.0fdB clip=%.2f%%", loud, (double)o->noise,
+                 (double)gain_ctl_headroom_db(o->noise), (double)(o->clip * 100.0f));
+    else
+        snprintf(buf, n, "loud=%s noise=n/a clip=%.2f%%", loud, (double)(o->clip * 100.0f));
+}
+
+// Lines from gain_ctl.c, each given the time stamp and queued for the log
+// task: the decoder does not wait for the console (docs/UPLINK.md 2.2).
+static void gain_log_lines(char *text)
+{
+    char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+    for (char *line = text; line && *line; ) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        adsb_logq_printf("%s%s\n", _ts, line);
+        line = nl ? nl + 1 : NULL;
+    }
+}
+
+// A new gain: tell the tuner, and open no window until the samples taken at
+// the old gain have left the ring and the tuner has settled.
+static void gain_level_set(int idx, int64_t now)
+{
+    s_gain_idx = idx;
+    gain_apply();
+    s_gl_settle_until = now + GAIN_SETTLE_US;
+}
+
+// A sweep ends: back to the gain it started from (unless the gain has been
+// set by hand in the meantime). The adaptive loop, if it is on, carries on
+// from there with what it knew.
+static void gain_sweep_end(int64_t now, const char *how, bool restore)
+{
+    s_sweep.active = false;
+    s_sweep_running = false;
+    if (restore) {
+        gain_level_set(s_sweep.saved_idx, now);
+        if (s_gl) s_gl->ctl.idx = s_sweep.saved_idx;
+    } else {
+        s_gl_settle_until = now + GAIN_SETTLE_US;
+    }
+    char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+    adsb_logq_printf("%sGAIN: [Sweep] %s; now at %.1f dB (%s)\n", _ts, how,
+                     R820T_GAINS[s_gain_idx] / 10.0, s_gain_auto ? "adaptive" : "manual");
+}
+
+// One step of a sweep. Returns true while the sweep owns the gain.
+static bool gain_sweep_tick(mode_s_t *st, int64_t now)
+{
+    int32_t req = s_sweep_req;
+    if (req != 0) {
+        s_sweep_req = 0;
+        if (req > 0 && !s_sweep.active) {
+            s_sweep.active = true;
+            s_sweep_running = true;
+            s_sweep.saved_idx = s_gain_idx;
+            s_sweep.idx = (int)R820T_GAIN_COUNT - 1;
+            s_sweep.dwell_us = (int64_t)req * 1000000LL;
+            gain_level_set(s_sweep.idx, now);
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            adsb_logq_printf("%sGAIN: [Sweep] %d steps from %.1f down to %.1f dB, %ld s each; `gain sweep stop` ends it\n",
+                             _ts, (int)R820T_GAIN_COUNT - GAIN_FLOOR_IDX, R820T_GAINS[R820T_GAIN_COUNT - 1] / 10.0,
+                             R820T_GAINS[GAIN_FLOOR_IDX] / 10.0, (long)req);
+            return true;
+        }
+        if (req < 0 && s_sweep.active) {
+            gain_sweep_end(now, "stopped", req == -1);
+            return true;
+        }
+    }
+    if (!s_sweep.active) return false;
+
+    if (s_gl_settle_until) {
+        if (now < s_gl_settle_until) return true;
+        gain_obs_t drop;
+        s_gl_settle_until = 0;
+        gain_window_take(st, 1.0f, &drop);   // a fresh window at the new gain
+        s_sweep.t0 = now;
+        return true;
+    }
+    if (now - s_sweep.t0 < s_sweep.dwell_us) return true;
+
+    {
+        gain_obs_t o;
+        char lv[96];
+        float secs = (float)(now - s_sweep.t0) / 1e6f;
+        gain_window_take(st, secs, &o);
+        gain_levels_publish(&o);
+        gain_levels_text(&o, lv, sizeof(lv));
+        float err = gain_ctl_err(&o);
+        char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+        adsb_logq_printf("%sGAIN: [Sweep] %.1f dB: %.1f msg/s, ES %.1f/s, pos=%.1f/s, err=%.0f%%, sig=%lu delta=%lu, %s\n",
+                         _ts, R820T_GAINS[s_sweep.idx] / 10.0, (double)(o.ok / secs), (double)(o.es_ok / secs),
+                         (double)(o.pos / secs), (double)(err < 0 ? 0.0f : err * 100.0f),
+                         (unsigned long)o.avg_signal, (unsigned long)o.avg_delta, lv);
+    }
+    if (s_sweep.idx > GAIN_FLOOR_IDX) {
+        s_sweep.idx--;
+        gain_level_set(s_sweep.idx, now);
+        return true;
+    }
+    gain_sweep_end(now, "done", true);
+    return true;
+}
+
+// Called by the decoder task after every run of the decoder.
+static void gain_level_tick(mode_s_t *st)
+{
+    int64_t now = esp_timer_get_time();
+    if (s_gl == NULL) return;
+    gain_ctl_t *g = &s_gl->ctl;
+
+    uint32_t req = s_gl_req;
+    if (req) {
+        s_gl_req = 0;
+        gain_ctl_restart(g, req == GL_REQ_RESTART_MAX);
+        if (req == GL_REQ_RESTART_KEEP) g->idx = s_gain_idx;
+        s_gain_phase = 1;
+        s_gl_settle_until = now + GAIN_SETTLE_US;   // whoever asked has set the gain as well
+    }
+
+    if (gain_sweep_tick(st, now)) {
+        s_gain_last_eval = now;
+        return;
+    }
+
+    if (s_gl_settle_until) {
+        if (now < s_gl_settle_until) return;
+        gain_obs_t drop;
+        s_gl_settle_until = 0;
+        gain_window_take(st, 1.0f, &drop);
+        s_gain_last_eval = now;
+        return;
+    }
+
+    int64_t elapsed = now - s_gain_last_eval;
+
+    if (!s_gain_auto) {
+        // Fixed gain: the same figures once a minute, for whoever watches.
+        if (elapsed < GAIN_P2_WINDOW_US) return;
+        gain_obs_t o;
+        char lv[96];
+        float secs = (float)elapsed / 1e6f;
+        gain_window_take(st, secs, &o);
+        gain_levels_publish(&o);
+        gain_levels_text(&o, lv, sizeof(lv));
+        float err = gain_ctl_err(&o);
+        if (err >= 0) s_gain_error_rate = err;
+        s_gain_pos_rate_ema = o.pos / secs;
+        char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+        adsb_logq_printf("%sGAIN: [Manual] %.1f dB, err=%.0f%%, pos=%.1f/s, range=%.0fnm, sig=%lu delta=%lu, %s\n",
+                         _ts, R820T_GAINS[s_gain_idx] / 10.0, (double)(err < 0 ? 0.0f : err * 100.0f),
+                         (double)(o.pos / secs), s_max_range_nm,
+                         (unsigned long)o.avg_signal, (unsigned long)o.avg_delta, lv);
+        s_gain_last_eval = now;
+        return;
+    }
+
+    if (s_gain_warmup) {
+        // Let the decoder run for a while before the first window.
+        if (elapsed < GAIN_WARMUP_US) return;
+        gain_obs_t drop;
+        s_gain_warmup = false;
+        gain_window_take(st, 1.0f, &drop);
+        s_gain_last_eval = now;
+        char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+        adsb_logq_printf("%sGAIN: Warmup complete — starting adaptive gain (levels and yield)\n", _ts);
+        return;
+    }
+
+    // A window ends when its time is up; in phase 1 also once enough frames
+    // are DECODED (not: candidates seen) and it is at least two seconds old.
+    bool due = elapsed >= (int64_t)gain_ctl_window_us(g) ||
+               (g->phase == 1 && elapsed >= (int64_t)GAIN_P1_MIN_US && st->stat_crc_ok >= GAIN_P1_MSGS);
+    if (!due) return;
+
+    gain_obs_t o;
+    char text[640];
+    int old_idx = g->idx;
+    gain_window_take(st, (float)elapsed / 1e6f, &o);
+    gain_levels_publish(&o);
+    int idx = gain_ctl_window(g, &o, text, sizeof(text));
+    s_gain_phase = g->phase;
+    s_gain_error_rate = g->err_last;
+    s_gain_pos_rate_ema = g->pos_last;
+    gain_log_lines(text);
+    s_gain_last_eval = now;
+    if (idx != old_idx) gain_level_set(idx, now);
 }
 
 // --- Sort state for on-device aircraft list ---
@@ -3011,7 +3313,14 @@ static void adsb_decode_task(void *arg)
         // recording is replayed: its statistics say nothing about the dongle.
         if (s_replay_feed) {
             s_gain_last_eval = esp_timer_get_time();
+            s_gl_settle_until = s_gain_last_eval + GAIN_SETTLE_US;   // and what it counted is thrown away after it
+        } else if (ADSB_DEMOD_IS_2400) {
+            // Levels and yield (gain_ctl.c): adaptive, fixed-gain report and sweep
+            gain_level_tick(&state);
         } else if (s_gain_auto) {
+            // The error-rate loop, for the 2.0 Msps demodulator, whose
+            // preamble test lets few enough candidates through that
+            // "candidates" and "messages" are close to the same thing.
             int64_t now_gain = esp_timer_get_time();
             int64_t elapsed = now_gain - s_gain_last_eval;
             uint32_t msgs = state.stat_crc_ok + state.stat_crc_fail;
@@ -3050,7 +3359,8 @@ static void adsb_decode_task(void *arg)
         }
 
         // Manual-mode heartbeat: log stats every 60s for webapp visibility
-        if (!s_gain_auto) {
+        // (2.0 Msps demodulator; gain_level_tick() writes it otherwise)
+        if (!s_gain_auto && !ADSB_DEMOD_IS_2400) {
             static int64_t s_manual_hb_last = 0;
             static uint32_t s_manual_hb_ok = 0;
             static uint32_t s_manual_hb_fail = 0;
@@ -3169,6 +3479,22 @@ static void adsb_reader_task(void *arg)
     ESP_LOGI(TAG, "[APP] Free memory: %ld bytes", esp_get_free_heap_size());
 
     mode_s_init(&state);
+    if (ADSB_DEMOD_IS_2400) {
+        // The gain loop for this demodulator and the level histogram the
+        // decoder fills for it: 0.7 kB of PSRAM, allocated once and kept.
+        if (s_gl == NULL) {
+            s_gl = heap_caps_calloc(1, sizeof(*s_gl), MALLOC_CAP_SPIRAM);
+            if (s_gl) gain_ctl_init(&s_gl->ctl, R820T_GAINS, (int)R820T_GAIN_COUNT, GAIN_FLOOR_IDX);
+            else ESP_LOGE(TAG, "gain loop: no memory for its %u bytes - the gain stays where it is", (unsigned)sizeof(*s_gl));
+        }
+        if (s_gl) {
+            memset(s_gl->hist, 0, sizeof(s_gl->hist));
+            state.lvl_hist = s_gl->hist;
+            s_gl->ctl.idx = s_gain_idx;
+            s_gl_req = s_gain_auto ? GL_REQ_RESTART_MAX : GL_REQ_RESTART_KEEP;
+            s_gain_warmup = true;
+        }
+    }
     // Error correction beyond 1-bit and the coherent look: as Kconfig says
     // (ADSB_DECODE_SOFT / _COH / _FIX2 in main/Kconfig.projbuild,
     // docs/DECODER.md section 4), or as the console last asked (`adsb dec`,
@@ -3228,8 +3554,9 @@ static void adsb_reader_task(void *arg)
     xSemaphoreTake(s_decode_done, 0);   // clear a stale completion signal
     s_decode_stop = false;
     s_gain_last_eval = esp_timer_get_time();
-    if (xTaskCreateWithCaps(adsb_decode_task, "adsb_decode", ADSB_DECODE_TASK_STACK, NULL,
-                            ADSB_DECODE_TASK_PRIO, &s_decode_task_hdl, MALLOC_CAP_SPIRAM) != pdPASS) {
+    if (xTaskCreatePinnedToCoreWithCaps(adsb_decode_task, "adsb_decode", ADSB_DECODE_TASK_STACK, NULL,
+                                        ADSB_DECODE_TASK_PRIO, &s_decode_task_hdl, ADSB_DECODE_TASK_CORE,
+                                        MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "decoder task create failed");
         s_decode_task_hdl = NULL;
         free(s_mag_buf);

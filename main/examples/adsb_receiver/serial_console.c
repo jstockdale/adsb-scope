@@ -301,6 +301,7 @@ static void cmd_help(void) {
         "  \033[32mversion\033[0m           show firmware version\n"
         "  \033[32mtime\033[0m              show time source status\n"
         "  \033[32mgain\033[0m [auto|<dB>|band [<low> <high>]|restart]  tuner gain control\n"
+        "  \033[32mgain sweep\033[0m [secs|stop]  measure what each gain step yields\n"
         "\n"
         "  \033[33m── Config ──\033[0m\n"
         "  \033[32mtimezone\033[0m [auto|UTC±N] show or set timezone\n"
@@ -663,13 +664,25 @@ static void cmd_adsb(const char *subcmd) {
                                      st.rtlsdr_error ? "error" : "waiting for dongle");
         if (st.rtlsdr_connected) {
             printf("  Dongle:    %s\n", st.dongle_model);
-            printf("  Gain:      %.1f dB (%s)\n", st.gain_tenths / 10.0,
-                   st.gain_auto ? "adaptive" : "manual");
+            printf("  Gain:      %.1f dB (%s%s)\n", st.gain_tenths / 10.0,
+                   st.gain_auto ? "adaptive" : "manual",
+                   st.gain_sweep ? ", sweep running" : st.gain_auto ? (st.gain_phase == 1 ? ", converging" : ", steady") : "");
+            if (st.gain_by_levels) {
+                if (st.noise_counts > 0)
+                    printf("  Levels:    noise %.1f counts (headroom %.0f dB)", st.noise_counts, st.headroom_db);
+                else
+                    printf("  Levels:    noise not measured yet");
+                if (st.loud_share >= 0) printf(", %.0f%% of frames at full scale", st.loud_share * 100.0);
+                printf(", %.2f%% of samples clipped\n", st.clip_share * 100.0);
+            }
             printf("  Aircraft:  %d active\n", st.active_aircraft);
             printf("  Messages:  %lu total, %.1f/s\n",
                    (unsigned long)st.total_messages, st.msg_rate);
             printf("  Positions: %.1f/s\n", st.pos_rate);
-            printf("  CRC error: %.1f%%\n", st.crc_error_rate * 100.0);
+            if (st.gain_by_levels)
+                printf("  Squitters: %.1f%% lost of those seen (the error rate; `gain` explains)\n", st.crc_error_rate * 100.0);
+            else
+                printf("  CRC error: %.1f%%\n", st.crc_error_rate * 100.0);
             printf("  DF18:      %lu total, %lu in last min (decoded, not shown as aircraft)\n",
                    (unsigned long)st.df18_total, (unsigned long)st.df18_last_min);
             printf("             TIS-B %lu, ADS-R %lu, ADS-B non-transponder %lu, other %lu\n",
@@ -2536,10 +2549,32 @@ static void dispatch_command(char *line) {
                    st.gain_tenths / 10.0,
                    st.gain_auto ? "adaptive" : "manual",
                    st.gain_auto ? (st.gain_phase == 1 ? ", converging" : ", steady") : "");
-            printf("  CRC error rate: %.1f%% (%s)\n",
-                   st.crc_error_rate * 100.0,
-                   st.gain_auto ? (st.gain_phase == 1 ? "raw" : "EMA") : "raw");
-            printf("  Target band: %d–%d%%\n", g_settings.gain_err_low, g_settings.gain_err_high);
+            if (st.gain_by_levels) {
+                // 2.4 Msps demodulator: the loop steers on levels and yield
+                // (gain_ctl.h); the error rate is shown, not steered on.
+                if (st.gain_sweep) printf("  Sweep running (`gain sweep stop` ends it)\n");
+                if (st.noise_counts > 0)
+                    printf("  Noise: %.1f ADC counts rms, %.0f dB under full scale (headroom)\n",
+                           st.noise_counts, st.headroom_db);
+                else
+                    printf("  Noise: not measured yet\n");
+                if (st.loud_share >= 0)
+                    printf("  Loud frames: %.0f%% of those decoded are within 3 dB of full scale\n", st.loud_share * 100.0);
+                else
+                    printf("  Loud frames: too few frames to say\n");
+                printf("  Clipped samples: %.2f%%\n", st.clip_share * 100.0);
+                printf("  Squitters lost: %.1f%% of those seen (%s) - shown, not steered on\n",
+                       st.crc_error_rate * 100.0,
+                       st.gain_auto ? (st.gain_phase == 1 ? "last window" : "average") : "last minute");
+                printf("  Steps down at 35%% loud (20%% once steady), up while under 5%% loud with more than\n"
+                       "  30 dB of headroom; a step that costs 15%% of the positions is taken back.\n"
+                       "  (`gain band` belongs to the 2.0 Msps demodulator's loop and is not used here.)\n");
+            } else {
+                printf("  CRC error rate: %.1f%% (%s)\n",
+                       st.crc_error_rate * 100.0,
+                       st.gain_auto ? (st.gain_phase == 1 ? "raw" : "EMA") : "raw");
+                printf("  Target band: %d–%d%%\n", g_settings.gain_err_low, g_settings.gain_err_high);
+            }
             printf("  Position rate: %.1f/s\n", st.pos_rate);
             if (st.farthest_dist_nm > 0) {
                 printf("  Max range: %.1f nm (%06lX)\n", st.farthest_dist_nm, (unsigned long)st.farthest_icao);
@@ -2548,6 +2583,27 @@ static void dispatch_command(char *line) {
         } else if (strcmp(arg1, "auto") == 0) {
             adsb_set_gain(0, 0);
             printf("  Gain set to adaptive mode (starts at 49.6 dB, adjusts every 60s)\n");
+        } else if (strcmp(arg1, "sweep") == 0) {
+            // gain sweep [seconds per step | stop]
+            extern bool adsb_gain_sweep(int seconds);
+            if (arg2 && strcmp(arg2, "stop") == 0) {
+                adsb_gain_sweep(0);
+                printf("  Sweep stopped (if one was running)\n");
+            } else {
+                int secs = (arg2 && arg2[0]) ? atoi(arg2) : 10;
+                if (secs < 3 || secs > 600) {
+                    printf("  usage: gain sweep [seconds per step, 3-600; default 10] | gain sweep stop\n");
+                } else if (!st.rtlsdr_connected) {
+                    printf("  error: no dongle\n");
+                } else if (!adsb_gain_sweep(secs)) {
+                    printf("  error: this build's demodulator keeps no level statistics\n");
+                } else {
+                    printf("  Sweeping the gain from 49.6 dB down to 19.7 dB, %d s a step (about %d min).\n"
+                           "  One `GAIN: [Sweep]` line per step on the log (type `log` to watch); the gain\n"
+                           "  in use now comes back afterwards. `gain sweep stop` ends it early.\n",
+                           secs, (18 * (secs + 1) + 59) / 60);
+                }
+            }
         } else if (strcmp(arg1, "band") == 0) {
             if (!arg2) {
                 const char *preset = "";
@@ -2584,10 +2640,11 @@ static void dispatch_command(char *line) {
                 printf("  Restarting from current gain — re-entering phase 1\n");
             }
         } else {
-            // Parse dB value
-            float db = atof(arg1);
+            // Parse dB value. (A word that is no number must not be read
+            // as 0 dB, which is what atof() makes of it.)
+            float db = (arg1[0] >= '0' && arg1[0] <= '9') ? atof(arg1) : -1.0f;
             if (db < 0.0f || db > 49.6f) {
-                printf("  error: gain must be 0.0 – 49.6 dB (or 'auto', 'band', 'restart')\n");
+                printf("  error: gain must be 0.0 – 49.6 dB (or 'auto', 'band', 'restart', 'sweep')\n");
             } else {
                 uint16_t tenths = (uint16_t)(db * 10 + 0.5f);
                 adsb_set_gain(1, tenths);
