@@ -146,24 +146,56 @@ menu "Example Configuration"
                 signal strength.
     endchoice
 
+    config ADSB_DECODE_SOFT
+        bool "Soft rescue with the known-address gate"
+        depends on ADSB_DEMOD_2400
+        default y
+        help
+            A DF17/18 frame that fails its CRC is repaired if flipping up to
+            four of its eight least confident bits, and only those, accounts
+            exactly for the CRC error. Accepted only for an aircraft that was
+            heard error-free within the last 60 seconds, and only if its
+            CA/CF field holds a valid value - so a repair extends an existing
+            track and never creates one.
+
+            On since coh2 (2026-11-18): in a stress test of 400,000
+            overlapping frame pairs it delivered no more false frames than
+            1-bit correction alone (docs/DECODER.md section 5.7). Never
+            soaked on hardware. On the console: `adsb dec soft`; `adsb dec
+            default` goes back to 1-bit correction only.
+
+    config ADSB_DECODE_COH
+        bool "Coherent second look"
+        depends on ADSB_DEMOD_2400
+        default y
+        help
+            A frame that still fails its CRC is sliced again from the I/Q
+            samples on its own carrier (mode_s_coh.c, docs/DECODER.md
+            section 5.7), and the soft rescue, if enabled, gets a second
+            try with the better per-bit confidences that gives.
+
+            In the harness: 16 to 22 % more frames on a real capture for
+            5 to 6 % more decoder instructions, and no added false frames.
+            Never measured on a device. Takes 9.6 kB of PSRAM.
+
+            This sets the state at boot. `adsb coh on` / `adsb coh off` on
+            the console switches it while the receiver runs.
+
     config ADSB_DECODE_FIX2
-        bool "Extra error correction for extended squitter (experimental)"
+        bool "Exact 2-bit correction as well (not recommended)"
         default n
         help
-            Enables exact 2-bit CRC error correction for DF17/DF18 frames,
-            with strict CA/CF field validation and a known-address gate: a
-            repair is accepted only for an aircraft that was heard
-            error-free within the last 60 seconds, so repairs extend
-            existing tracks and never create one.
+            Adds exact 2-bit CRC error correction for DF17/DF18 frames to
+            the above, with the same strict validation and known-address
+            gate (and switches the soft rescue on with it).
 
-            With the 2.4 Msps demodulator it also enables the soft rescue:
-            a frame that fails its CRC is repaired if flipping some of its
-            eight least confident bits, and only those, accounts exactly
-            for the CRC error. Same known-address gate.
-
-            Measured in harness/ (see docs/DECODER.md): about +7% frames on
-            a real capture at 2.4 Msps, no false decodes in simulation. Off
-            by default until it has been soaked on hardware.
+            Not recommended since coh2: any two bits that satisfy the CRC
+            are accepted, and in a stress test of 400,000 overlapping frame
+            pairs that delivered 124 frames that were never sent, 113 of
+            them under a real aircraft's address; the configuration without
+            it delivered 12 (docs/DECODER.md section 5.7). With the coherent
+            second look on it adds under 1 % of frames. Kept for comparison:
+            `adsb dec fix2` on the console.
 
     # adsb-scope: this repo builds exactly one application.  The upstream
     # LilyGo tree offered ~30 examples here; the historical sdkconfig

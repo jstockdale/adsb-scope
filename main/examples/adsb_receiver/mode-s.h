@@ -210,14 +210,20 @@ void mode_s_detect_stream_2400(mode_s_t *self, unsigned char *iq, uint32_t iq_by
                                uint16_t *mag, mode_s_callback_t cb);
 
 // Coherent second look (mode_s_coh.c). The application allocates
-// mode_s_coh_work_size() bytes (any memory; PSRAM on the device), points
-// coh_work at them and sets coh_fix. mode_s_coh_reslice() re-slices the
+// mode_s_coh_work_size() bytes (any memory; PSRAM on the device) and hands
+// them to mode_s_coh_enable(). mode_s_coh_reslice() re-slices the
 // 112-bit frame whose preamble starts at mag[n] + f/5 of the current
 // streaming call: msg/conf receive bits and per-bit confidence, *dt_out the
 // timing correction it chose (fifths of a sample), *freq_hz the carrier
 // offset. Returns 1 if it sliced the frame, 0 if the IQ is not available,
 // -1 if the frame shows no single carrier (not worth slicing).
 size_t mode_s_coh_work_size(void);
+// Switch the look on or off. work: mode_s_coh_work_size() bytes that stay
+// valid for as long as it is on (NULL keeps the memory given earlier).
+// Call it between two detect calls, from the thread that makes them: it
+// also drops the IQ kept from the previous call, which may be stale.
+// Returns 1 if the look is on afterwards.
+int mode_s_coh_enable(mode_s_t *self, void *work, int on);
 int mode_s_coh_reslice(mode_s_t *self, uint32_t n, int f, unsigned char *msg, uint32_t *conf,
                        int *dt_out, float *freq_hz);
 void mode_s_coh_stream_begin(mode_s_t *self, const unsigned char *iq, uint32_t n, uint32_t tail);

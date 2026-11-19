@@ -46,6 +46,15 @@ Plus: RTL-SDR dongle (Blog V4 / V4 Lite / generic R820T/R828D handled),
    or ninja is missing, run
    `python3 $IDF_PATH/tools/idf_tools.py install cmake ninja` and
    re-source `export.sh`. A clean build is about 2200 compile steps.
+
+   The decoder's repair stages – soft rescue and coherent second look,
+   on by default – are described in `docs/DECODER.md` section 4 and can
+   be switched on the console (`adsb dec`, `adsb coh`). For an image
+   that boots without them, as r10 did:
+   ```
+   idf.py -B build-plain -D SDKCONFIG=build-plain/sdkconfig \
+          -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.plain" build
+   ```
 4. **C6 co-processor** must run the ESP-Hosted `network_adapter` SDIO
    slave, version **2.12.3** – the exact LilyGo build is committed at
    `firmware/c6/` (sha256 in VENDOR.md).  Flash it per LilyGo's C6

@@ -217,6 +217,9 @@ typedef struct {
     uint32_t decode_busy_ms;  // time spent inside the decoder for it
     uint32_t messages;        // messages decoded
     uint32_t ring_dropped;    // must be 0
+    char     decoder[96];     // the decoder options it ran with (adsb_decoder_describe)
+    uint32_t fix1, fix2, soft;            // frames repaired during the replay, by kind
+    uint32_t coh_try, coh_abort, coh_ok;  // coherent look: re-slices, stopped early, frames recovered
 } adsb_replay_status_t;
 
 bool adsb_replay_start(const char *path, char *err, size_t err_len);
@@ -224,6 +227,38 @@ void adsb_replay_stop(void);
 void adsb_replay_get(adsb_replay_status_t *out);
 
 extern adsb_stats_t adsb_get_stats(void);
+
+// ---- Decoder options, switchable while the receiver runs ----
+// Console: `adsb dec`, `adsb coh`. What they are and what each costs and
+// risks: docs/DECODER.md sections 4 and 5.7. Boot values come from Kconfig
+// (ADSB_DECODE_FIX2, ADSB_DECODE_SOFT, ADSB_DECODE_COH); nothing is stored.
+// A change is taken over by the decoder task between two of its runs, so
+// the decoder never sees one in mid-run.
+typedef struct {
+    bool    fix2;        // exact 2-bit CRC correction (DF17/18)
+    bool    strict;      // refuse extended squitters with a reserved CA/CF value
+    bool    known_addr;  // 2-bit and soft repairs only for an address heard error-free in the last 60 s
+    uint8_t soft;        // soft rescue: this many least confident bits considered (0 = off, 8 = usual)
+    bool    coh;         // coherent second look at frames that fail their CRC (2.4 Msps only)
+} adsb_decoder_opts_t;
+
+typedef struct {
+    bool     applied;      // the decoder runs with the options asked for (false: receiver stopped, or not yet taken over)
+    bool     coh_active;   // the coherent look is really on (it needs the 2.4 Msps demodulator and 9.6 kB of PSRAM)
+    uint32_t fix1, fix2, soft;        // frames repaired since the receiver started: 1-bit, 2-bit, soft rescue
+    uint32_t addr_refused;            // 2-bit repairs refused by the known-address gate
+    uint32_t strict_refused;          // CRC-ok frames refused by the strict check
+    uint32_t coh_try;                 // coherent look: re-slices run ...
+    uint32_t coh_abort;               // ... of which stopped early (no single carrier)
+    uint32_t coh_ok;                  // ... frames it recovered
+    uint32_t coh_soft;                // ... of which with the soft rescue as well
+    uint32_t stack_free;              // least free stack the decoder task has had, bytes (0 = not running)
+} adsb_decoder_info_t;
+
+void adsb_decoder_get(adsb_decoder_opts_t *opts, adsb_decoder_info_t *info);  // either may be NULL
+void adsb_decoder_set(const adsb_decoder_opts_t *opts);
+// One line saying what is on, e.g. "1-bit fix, soft rescue (known address, strict), coherent look".
+void adsb_decoder_describe(const adsb_decoder_opts_t *opts, char *buf, size_t len);
 
 // Set tuner gain: mode 0=auto (adaptive), mode 1=manual at gain_tenths
 extern void adsb_set_gain(int mode, uint16_t gain_tenths);

@@ -288,6 +288,8 @@ static void cmd_help(void) {
         "  \033[33m── Services ──\033[0m\n"
         "  \033[32madsb\033[0m [on|off|status]  ADS-B receiver control\n"
         "  \033[32madsb replay\033[0m <file>|stop  decode a recorded sample file (raw 8-bit I/Q); no argument: progress\n"
+        "  \033[32madsb dec\033[0m [default|soft|fix2]  error correction: 1-bit only, + soft rescue, + soft rescue and 2-bit\n"
+        "  \033[32madsb coh\033[0m [on|off]    coherent second look at frames that fail their CRC; no argument: show\n"
         "  \033[32mdiag\033[0m [mark]       everything a field report needs, in one block; mark: restart its checks\n"
         "  \033[32mmeshy\033[0m [on|off|status] Meshtastic radio control\n"
         "  \033[32musb\033[0m [status]          USB host status\n"
@@ -599,6 +601,56 @@ static void cmd_rmdir(const char *path) {
 // Service control commands
 // ---------------------------------------------------------------------------
 
+// What the decoder's repair stages are set to and what they have done.
+// Part of `adsb status` (and so of `diag`), and all of `adsb dec`.
+static void print_decoder_status(void) {
+    adsb_decoder_opts_t o;
+    adsb_decoder_info_t di;
+    char what[96];
+    adsb_decoder_get(&o, &di);
+    adsb_decoder_describe(&o, what, sizeof(what));
+    printf("  Decoder:   %s%s\n", what,
+           di.applied ? "" : " (asked for; the decoder takes it over when it next runs)");
+    if (o.coh && di.applied && !di.coh_active)
+        printf("             coherent look NOT running: it needs the 2.4 Msps demodulator and 9.6 kB of PSRAM\n");
+    printf("  Repairs:   1-bit %lu, soft %lu, 2-bit %lu since the receiver started (refused: unknown address %lu, strict %lu)\n",
+           (unsigned long)di.fix1, (unsigned long)di.soft, (unsigned long)di.fix2,
+           (unsigned long)di.addr_refused, (unsigned long)di.strict_refused);
+    printf("  Coherent:  %lu re-slices, %lu stopped early, %lu frames recovered (%lu of them with the soft rescue)\n",
+           (unsigned long)di.coh_try, (unsigned long)di.coh_abort, (unsigned long)di.coh_ok,
+           (unsigned long)di.coh_soft);
+    if (di.stack_free)
+        printf("             decoder task stack: %lu bytes never used\n", (unsigned long)di.stack_free);
+}
+
+// adsb dec [default|soft|fix2]   and   adsb coh [on|off]
+static void cmd_adsb_decoder(const char *which, const char *arg) {
+    adsb_decoder_opts_t o;
+    adsb_decoder_get(&o, NULL);
+    if (arg && strcmp(which, "coh") == 0 && (strcmp(arg, "on") == 0 || strcmp(arg, "off") == 0)) {
+        o.coh = (strcmp(arg, "on") == 0);
+    } else if (arg && strcmp(which, "dec") == 0 && strcmp(arg, "default") == 0) {
+        o.fix2 = false; o.strict = false; o.known_addr = false; o.soft = 0;
+    } else if (arg && strcmp(which, "dec") == 0 && strcmp(arg, "soft") == 0) {
+        o.fix2 = false; o.strict = true; o.known_addr = true; o.soft = 8;
+    } else if (arg && strcmp(which, "dec") == 0 && strcmp(arg, "fix2") == 0) {
+        o.fix2 = true; o.strict = true; o.known_addr = true; o.soft = 8;
+    } else if (arg) {
+        printf("  usage: adsb dec [default|soft|fix2]   error correction: 1-bit only | + soft rescue | + soft rescue and 2-bit\n");
+        printf("         adsb coh [on|off]              coherent second look at frames that fail their CRC\n");
+        printf("         (not stored: a restart returns to the build's settings; docs/DECODER.md 5.7)\n");
+        return;
+    }
+    if (arg) {
+        adsb_decoder_set(&o);
+        vTaskDelay(pdMS_TO_TICKS(50));   // the decoder takes it over between two runs
+    }
+    print_decoder_status();
+    if (!arg) {
+        printf("  Change:    adsb dec default|soft|fix2 ; adsb coh on|off  (not stored across a restart)\n");
+    }
+}
+
 static void cmd_adsb(const char *subcmd) {
     extern adsb_stats_t adsb_get_stats(void);
     adsb_stats_t st = adsb_get_stats();
@@ -623,6 +675,7 @@ static void cmd_adsb(const char *subcmd) {
             printf("             TIS-B %lu, ADS-R %lu, ADS-B non-transponder %lu, other %lu\n",
                    (unsigned long)st.df18_tisb, (unsigned long)st.df18_adsr,
                    (unsigned long)st.df18_adsb_nt, (unsigned long)st.df18_other);
+            print_decoder_status();
             printf("  Decode:    %.1f%% of one core, peak %.1f%% (last 5 s; must stay under 100%% to keep up; 'top' shows all tasks)\n",
                    st.decode_load * 100.0, st.peak_decode_load * 100.0);
             printf("             of which SD log %.1f%%\n", st.sdlog_load * 100.0);
@@ -672,7 +725,7 @@ static void cmd_adsb(const char *subcmd) {
             printf("  ADS-B stopped. USB host shut down.\n");
         }
     } else {
-        printf("  usage: adsb [on|off|status]\n");
+        printf("  usage: adsb [on|off|status] | adsb dec [default|soft|fix2] | adsb coh [on|off] | adsb replay <file>|stop\n");
     }
 }
 
@@ -1794,6 +1847,10 @@ static void print_replay_status(void) {
         printf("             decoder busy %lu ms = %.1f%% of one core at real time; %lu transfers dropped; took %lu s\n",
                (unsigned long)r.decode_busy_ms, share, (unsigned long)r.ring_dropped,
                (unsigned long)(r.wall_ms / 1000));
+        printf("             decoder: %s; repaired 1-bit %lu, soft %lu, 2-bit %lu;\n"
+               "             coherent look %lu re-slices, %lu stopped early, %lu frames recovered\n",
+               r.decoder, (unsigned long)r.fix1, (unsigned long)r.soft, (unsigned long)r.fix2,
+               (unsigned long)r.coh_try, (unsigned long)r.coh_abort, (unsigned long)r.coh_ok);
     } else if (r.done) {
         printf("  Replay:    %s: failed: %s (%llu bytes fed, %lu messages)\n",
                r.path, r.error, (unsigned long long)r.fed_bytes, (unsigned long)r.messages);
@@ -1942,6 +1999,7 @@ static void dispatch_command(char *line) {
     // ── Service control ──────────────────────────────────────────────
     } else if (strcmp(cmd, "adsb") == 0) {
         if (arg1 && strcmp(arg1, "replay") == 0) cmd_adsb_replay(arg2);
+        else if (arg1 && (strcmp(arg1, "dec") == 0 || strcmp(arg1, "coh") == 0)) cmd_adsb_decoder(arg1, arg2);
         else cmd_adsb(arg1);
     } else if (strcmp(cmd, "diag") == 0) {
         cmd_diag(arg1);

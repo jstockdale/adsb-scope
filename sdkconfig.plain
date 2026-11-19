@@ -1,0 +1,9 @@
+# adsb-scope: decoder as r10's default image - 1-bit correction only, no
+# soft rescue, no coherent second look. For a baseline to set the default
+# build against (docs/DECODER.md section 4). Used on top of
+# sdkconfig.defaults:
+#   idf.py -B build-plain -D SDKCONFIG=build-plain/sdkconfig \
+#          -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.plain" build
+# The console reaches the same state on any build: adsb dec default ; adsb coh off
+CONFIG_ADSB_DECODE_SOFT=n
+CONFIG_ADSB_DECODE_COH=n

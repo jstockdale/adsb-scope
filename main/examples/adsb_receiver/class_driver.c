@@ -179,6 +179,59 @@ static volatile uint32_t s_replay_msgs = 0;
 static uint64_t s_replay_busy_us = 0;              // decoder task only
 static adsb_replay_status_t s_replay;              // written by the replay task
 
+// ---- Decoder options (adsb_decoder_opts_t in class_driver.h) ----
+// s_dec_req is what was asked for, packed into one word so that a change
+// is a single store; the decoder task copies it into the decoder state
+// between two of its runs (decoder_apply_options) and notes in
+// s_dec_applied what it runs with. Boot values from Kconfig
+// (ADSB_DECODE_SOFT / _COH / _FIX2 in main/Kconfig.projbuild).
+#define DEC_FIX2    0x100u
+#define DEC_STRICT  0x200u
+#define DEC_KNOWN   0x400u
+#define DEC_COH     0x800u
+#define DEC_SOFT(w) ((w) & 0xFFu)
+#if defined(CONFIG_ADSB_DECODE_FIX2)
+#define DEC_BOOT_FIX (DEC_FIX2 | DEC_STRICT | DEC_KNOWN | 8u)
+#elif defined(CONFIG_ADSB_DECODE_SOFT)
+#define DEC_BOOT_FIX (DEC_STRICT | DEC_KNOWN | 8u)
+#else
+#define DEC_BOOT_FIX 0u
+#endif
+#ifdef CONFIG_ADSB_DECODE_COH
+#define DEC_BOOT_COH DEC_COH
+#else
+#define DEC_BOOT_COH 0u
+#endif
+static volatile uint32_t s_dec_req = DEC_BOOT_FIX | DEC_BOOT_COH;
+static volatile uint32_t s_dec_applied = 0xFFFFFFFFu;   // nothing applied yet
+static volatile bool     s_coh_active = false;          // the coherent look is really on
+static void             *s_coh_work = NULL;             // its working memory (PSRAM); allocated on first use, kept
+static volatile uint32_t s_decode_stack_free = 0;       // least free stack of the decoder task, bytes
+// Decoder repair counters at three moments: the start and end of a replay
+// (decoder task) and the last DECODER: log line.
+typedef struct { uint32_t fix1, fix2, soft, coh_try, coh_abort, coh_ok; } dec_counts_t;
+static dec_counts_t s_replay_cnt0, s_replay_cnt1, s_dec_line_cnt;
+static int64_t s_dec_line_us = 0;                       // when s_dec_line_cnt was taken
+
+static void dec_counts_now(dec_counts_t *c)
+{
+    c->fix1 = state.stat_fix1;
+    c->fix2 = state.stat_fix2;
+    c->soft = state.stat_soft_fix;
+    c->coh_try = state.stat_coh_try;
+    c->coh_abort = state.stat_coh_abort;
+    c->coh_ok = state.stat_coh_ok;
+}
+
+static void dec_unpack(uint32_t v, adsb_decoder_opts_t *o)
+{
+    o->fix2 = (v & DEC_FIX2) != 0;
+    o->strict = (v & DEC_STRICT) != 0;
+    o->known_addr = (v & DEC_KNOWN) != 0;
+    o->coh = (v & DEC_COH) != 0;
+    o->soft = (uint8_t)(v & 0xFFu);
+}
+
 // ADS-B statistics — updated by on_msg, read by adsb_get_stats
 static volatile uint32_t s_total_messages = 0;
 static volatile uint32_t s_msg_count_window = 0;  // messages in current 1s window
@@ -2268,6 +2321,74 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 // demodulate — uses pre-allocated magnitude buffer
 // ============================================================
 
+// Copy the options asked for into the decoder state. Called by the reader
+// task after mode_s_init() (no decoder task exists then) and by the decoder
+// task between two runs - never while the decoder is inside a run.
+static void decoder_apply_options(void)
+{
+    const uint32_t req = s_dec_req;
+    adsb_decoder_opts_t o;
+    dec_unpack(req, &o);
+    state.fix2 = o.fix2;
+    state.strict_es = o.strict;
+    state.fix2_known_icao = o.known_addr;
+    state.soft_fix = o.soft; // soft rescue; used by the 2.4 Msps demodulator only
+    bool coh = o.coh && ADSB_DEMOD_IS_2400;
+    if (coh && s_coh_work == NULL) {
+        s_coh_work = heap_caps_malloc(mode_s_coh_work_size(), MALLOC_CAP_SPIRAM);
+        if (s_coh_work == NULL)
+            ESP_LOGE(TAG, "coherent look: no memory for its %u bytes - it stays off", (unsigned)mode_s_coh_work_size());
+    }
+    s_coh_active = mode_s_coh_enable(&state, s_coh_work, coh) != 0;
+    s_dec_applied = req;
+    dec_counts_now(&s_dec_line_cnt);   // the next DECODER: line counts from here
+    s_dec_line_us = esp_timer_get_time();
+}
+
+void adsb_decoder_set(const adsb_decoder_opts_t *opts)
+{
+    uint32_t v = DEC_SOFT(opts->soft > 8 ? 8 : opts->soft);
+    if (opts->fix2) v |= DEC_FIX2;
+    if (opts->strict) v |= DEC_STRICT;
+    if (opts->known_addr) v |= DEC_KNOWN;
+    if (opts->coh) v |= DEC_COH;
+    s_dec_req = v;
+    if (s_decode_task_hdl) xTaskNotifyGive(s_decode_task_hdl);   // do not wait for the next batch of samples
+}
+
+void adsb_decoder_get(adsb_decoder_opts_t *opts, adsb_decoder_info_t *info)
+{
+    if (opts) dec_unpack(s_dec_req, opts);
+    if (info) {
+        const bool running = (s_decode_task_hdl != NULL) && !s_decode_stop;
+        memset(info, 0, sizeof(*info));
+        info->applied = running && (s_dec_applied == s_dec_req);
+        info->coh_active = running && s_coh_active;
+        info->fix1 = state.stat_fix1;
+        info->fix2 = state.stat_fix2;
+        info->soft = state.stat_soft_fix;
+        info->addr_refused = state.stat_fix2_icao_rej;
+        info->strict_refused = state.stat_strict_rej;
+        info->coh_try = state.stat_coh_try;
+        info->coh_abort = state.stat_coh_abort;
+        info->coh_ok = state.stat_coh_ok;
+        info->coh_soft = state.stat_coh_soft;
+        info->stack_free = running ? s_decode_stack_free : 0;
+    }
+}
+
+void adsb_decoder_describe(const adsb_decoder_opts_t *o, char *buf, size_t len)
+{
+    char gates[40] = "";
+    if (o->fix2 || o->soft)
+        snprintf(gates, sizeof(gates), " (%s%s)", o->known_addr ? "known address" : "any address",
+                 o->strict ? ", strict" : "");
+    else if (o->strict)
+        snprintf(gates, sizeof(gates), ", strict");
+    snprintf(buf, len, "1-bit fix%s%s%s%s", o->soft ? ", soft rescue" : "", o->fix2 ? ", 2-bit fix" : "",
+             gates, o->coh ? ", coherent look" : "");
+}
+
 // Mirror the decoder's DF18 counters for adsb_get_stats() and, once a
 // minute, log them if any DF18 arrived during that minute. The line starts
 // with "DF18:" directly after the timestamp, so the web app's aircraft-line
@@ -2356,6 +2477,7 @@ void demodulate(uint8_t *source, int length)
         s_log_dropped_win = dropped_total - s_win_log_dropped0;
         if (cap_pm < s_min_capture_permille) s_min_capture_permille = cap_pm;
         if (dec_pm > s_peak_decode_permille) s_peak_decode_permille = dec_pm;
+        s_decode_stack_free = (uint32_t)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
         // Once a minute, on the log itself, so a recorded log shows how
         // the receiver was doing at any point in a session.
         if (++s_load_line_windows >= 12) {
@@ -2373,6 +2495,28 @@ void demodulate(uint8_t *source, int length)
                              (unsigned long)s_ring.dropped, (unsigned long)s_usb_starved,
                              (unsigned long)lines_s, (unsigned long)bytes_s, (unsigned long)dropped_total,
                              (double)s_msg_rate);
+            // And what the decoder's repair stages did since the last such
+            // line (or since the options changed). "DECODER:" cannot be
+            // taken for an aircraft line: 'O' is not a hex digit.
+            {
+                adsb_decoder_opts_t o;
+                dec_counts_t c;
+                char what[96];
+                dec_unpack(s_dec_applied, &o);
+                o.coh = s_coh_active;
+                adsb_decoder_describe(&o, what, sizeof(what));
+                dec_counts_now(&c);
+                adsb_logq_printf("%sDECODER: %s; in the last %lu s: repaired 1-bit %lu, soft %lu, 2-bit %lu; "
+                                 "coherent look %lu re-slices, %lu stopped early, %lu frames recovered\n",
+                                 _ts, what, (unsigned long)((t1 - s_dec_line_us) / 1000000LL),
+                                 (unsigned long)(c.fix1 - s_dec_line_cnt.fix1), (unsigned long)(c.soft - s_dec_line_cnt.soft),
+                                 (unsigned long)(c.fix2 - s_dec_line_cnt.fix2),
+                                 (unsigned long)(c.coh_try - s_dec_line_cnt.coh_try),
+                                 (unsigned long)(c.coh_abort - s_dec_line_cnt.coh_abort),
+                                 (unsigned long)(c.coh_ok - s_dec_line_cnt.coh_ok));
+                s_dec_line_cnt = c;
+                s_dec_line_us = t1;
+            }
         }
         s_decode_busy_us = 0;
         s_sdlog_busy_us = 0;
@@ -2565,13 +2709,17 @@ static void replay_service_idle(void)
     if (s_replay_phase == 1) {
         aircraft_table_clear();
         mode_s_cache_clock(&state, ADSB_SAMPLE_RATE);  // the recording's clock, not the wall's
+        decoder_apply_options();   // and the coherent look's noise reference starts afresh, as on a PC
         s_replay_msgs = 0;
         s_replay_busy_us = 0;
+        dec_counts_now(&s_replay_cnt0);
         s_replay_counting = true;
         s_replay_phase = 2;
     } else if (s_replay_phase == 3) {
+        dec_counts_now(&s_replay_cnt1);
         s_replay_counting = false;
         mode_s_cache_clock(&state, 0);
+        decoder_apply_options();   // nothing of the recording's levels is carried into live reception
         aircraft_table_clear();
         s_replay_phase = 0;
     }
@@ -2647,9 +2795,22 @@ out:
         }
         if (s_replay_phase != 0) {
             // The decoder task has gone (dongle removed): undo by hand.
+            dec_counts_now(&s_replay_cnt1);
             s_replay_counting = false;
             s_replay_phase = 0;
         }
+        {
+            adsb_decoder_opts_t o;
+            dec_unpack(s_dec_applied, &o);
+            o.coh = s_coh_active;
+            adsb_decoder_describe(&o, s_replay.decoder, sizeof(s_replay.decoder));
+        }
+        s_replay.fix1      = s_replay_cnt1.fix1 - s_replay_cnt0.fix1;
+        s_replay.fix2      = s_replay_cnt1.fix2 - s_replay_cnt0.fix2;
+        s_replay.soft      = s_replay_cnt1.soft - s_replay_cnt0.soft;
+        s_replay.coh_try   = s_replay_cnt1.coh_try - s_replay_cnt0.coh_try;
+        s_replay.coh_abort = s_replay_cnt1.coh_abort - s_replay_cnt0.coh_abort;
+        s_replay.coh_ok    = s_replay_cnt1.coh_ok - s_replay_cnt0.coh_ok;
         s_replay.messages       = s_replay_msgs;
         s_replay.decode_busy_ms = (uint32_t)(s_replay_busy_us / 1000);
         s_replay.ring_dropped   = s_ring.dropped - dropped0;
@@ -2674,6 +2835,12 @@ out:
                                  (unsigned long)s_replay.messages, (unsigned long)s_replay.decode_busy_ms,
                                  (unsigned long)(share_pm / 10), (unsigned long)(share_pm % 10),
                                  (unsigned long)s_replay.ring_dropped, (unsigned long)(s_replay.wall_ms / 1000));
+            // A second line, so that the first keeps the form it had in r10.
+            serial_console_print("%sREPLAY: decoder: %s; repaired 1-bit %lu, soft %lu, 2-bit %lu; "
+                                 "coherent look %lu re-slices, %lu stopped early, %lu frames recovered\n",
+                                 _ts, s_replay.decoder, (unsigned long)s_replay.fix1, (unsigned long)s_replay.soft,
+                                 (unsigned long)s_replay.fix2, (unsigned long)s_replay.coh_try,
+                                 (unsigned long)s_replay.coh_abort, (unsigned long)s_replay.coh_ok);
         } else {
             serial_console_print("%sREPLAY: %s: failed: %s (%llu bytes fed, %lu messages)\n",
                                  _ts, s_replay.path, s_replay.error,
@@ -2803,6 +2970,10 @@ static void adsb_decode_task(void *arg)
             vTaskDelay(1);
             last_rest_us = esp_timer_get_time();
         }
+
+        // Options changed from the console are taken over here, between
+        // two runs of the decoder.
+        if (s_dec_applied != s_dec_req) decoder_apply_options();
 
         const uint8_t *data;
         uint32_t bytes, lost;
@@ -2998,14 +3169,12 @@ static void adsb_reader_task(void *arg)
     ESP_LOGI(TAG, "[APP] Free memory: %ld bytes", esp_get_free_heap_size());
 
     mode_s_init(&state);
-#ifdef CONFIG_ADSB_DECODE_FIX2
-    // Exact 2-bit correction with false-decode discipline; see the help
-    // text of ADSB_DECODE_FIX2 in main/Kconfig.projbuild and docs/DECODER.md.
-    state.fix2 = 1;
-    state.strict_es = 1;
-    state.fix2_known_icao = 1;
-    state.soft_fix = 8; // soft rescue; used by the 2.4 Msps demodulator only
-#endif
+    // Error correction beyond 1-bit and the coherent look: as Kconfig says
+    // (ADSB_DECODE_SOFT / _COH / _FIX2 in main/Kconfig.projbuild,
+    // docs/DECODER.md section 4), or as the console last asked (`adsb dec`,
+    // `adsb coh`). mode_s_init() has just switched them all off, so put
+    // them back.
+    decoder_apply_options();
     ESP_LOGI(TAG, "mode_s_init done, stack HWM: %u free, heap: %s",
              (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)),
              heap_caps_check_integrity_all(true) ? "OK" : "CORRUPT");

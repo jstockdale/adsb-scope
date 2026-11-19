@@ -67,6 +67,7 @@ static void usage(const char *a0)
             "       [--rate 2.0|2.4]   2.4 selects the 2.4 Msps demodulator, with\n"
             "       [--gate N] [--gate2 N] [--pre N] [--tries N] [--soft N]  (its tuning; see mode-s.h)\n"
             "       [--coh 0|1] [--coh-ts N] [--coh-gate N] [--coh-df 0|1|2]  coherent second look (mode_s_coh.c)\n"
+            "       [--coh-on-at BYTE] [--coh-off-at BYTE]   switch it between two chunks, as the firmware does\n"
 #endif
             "defaults: chunk=262144 (the firmware's DEFAULT_BUF_LENGTH), stream=0,\n"
             "          fix=1, everything else 0 except --df18 1 (deliver DF18 so it\n"
@@ -83,6 +84,7 @@ int main(int argc, char **argv)
     uint32_t fix2_delta = 0;
     int gate = -1, gate2 = -1, pre = -1, tries = -1, soft = -1;
     int coh = 0, coh_ts = -1, coh_gate = -1, coh_df = -1;
+    long coh_on_at = -1, coh_off_at = -1; // switch the look at the first chunk boundary at or after this byte
     // One loss of samples in the stream (stream mode only): at byte offset
     // gap_at of the input, gap_skip bytes are thrown away and the decoder
     // is told gap_lost samples went missing.
@@ -153,6 +155,10 @@ int main(int argc, char **argv)
             coh_gate = atoi(v);
         else if (!strcmp(a, "--coh-df"))
             coh_df = atoi(v);
+        else if (!strcmp(a, "--coh-on-at"))
+            coh_on_at = strtol(v, NULL, 0);
+        else if (!strcmp(a, "--coh-off-at"))
+            coh_off_at = strtol(v, NULL, 0);
         else
         {
             usage(argv[0]);
@@ -193,7 +199,7 @@ int main(int argc, char **argv)
         return 2;
     }
     (void)df18; (void)gate; (void)gate2; (void)pre; (void)tries; (void)soft;
-    (void)coh; (void)coh_ts; (void)coh_gate; (void)coh_df;
+    (void)coh; (void)coh_ts; (void)coh_gate; (void)coh_df; (void)coh_on_at; (void)coh_off_at;
 #else
     st.fix2 = fix2;
     st.strict_es = strict;
@@ -205,11 +211,14 @@ int main(int argc, char **argv)
     if (pre >= 0) st.d24_pre_x100 = (uint16_t)pre;
     if (tries >= 0) st.d24_tries = (uint8_t)tries;
     if (soft >= 0) st.soft_fix = (uint8_t)soft;
-    if (coh)
+    void *coh_mem = (coh || coh_on_at >= 0) ? malloc(mode_s_coh_work_size()) : NULL;
+    if ((coh || coh_on_at >= 0) && !coh_mem)
     {
-        st.coh_work = malloc(mode_s_coh_work_size());
-        st.coh_fix = (st.coh_work != NULL);
+        fprintf(stderr, "no memory for the coherent second look\n");
+        return 2;
     }
+    if (coh)
+        mode_s_coh_enable(&st, coh_mem, 1);
     if (coh_ts >= 0) st.coh_tsearch = (uint8_t)coh_ts;
     if (coh_gate >= 0) st.coh_gate_x100 = (uint16_t)coh_gate;
     if (coh_df >= 0) st.coh_df_gate = (uint8_t)coh_df;
@@ -250,6 +259,18 @@ int main(int argc, char **argv)
         }
         if (gap_at >= 0 && fed + (long)want > gap_at)
             want = (size_t)(gap_at - fed); // stop exactly at the loss
+        // The firmware changes decoder options between two runs of the
+        // decoder (class_driver.c, decoder_apply_options); so does this.
+        if (coh_on_at >= 0 && fed >= coh_on_at)
+        {
+            mode_s_coh_enable(&st, coh_mem, 1);
+            coh_on_at = -1;
+        }
+        if (coh_off_at >= 0 && fed >= coh_off_at)
+        {
+            mode_s_coh_enable(&st, NULL, 0);
+            coh_off_at = -1;
+        }
 #endif
         size_t got = fread(buf, 1, want, f);
         got &= ~(size_t)1; // whole I/Q pairs

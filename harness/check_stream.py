@@ -10,6 +10,8 @@
    chunk size.
 4. The coherent second look (2.4 Msps, streaming only) must give the same
    output at every chunk size, add frames, and add none that was not sent.
+   Switched on and off in mid-stream it must leave the output outside that
+   interval exactly as it is with the look off.
 Uses synth.py, so it needs no external tools. Exits non-zero on failure.
 """
 import os, subprocess, sys, tempfile
@@ -91,6 +93,30 @@ def main():
         same = off == ref24
         ok &= same
         print(f"  single buffer (no IQ kept), option on: {'IDENTICAL to option off' if same else 'MISMATCH'}")
+        # ---- switching the look while the stream runs, as the firmware's
+        # console commands do (between two runs of the decoder). Before the
+        # switch-on and well after the switch-off the output must be exactly
+        # what it is with the look off; in between it must add frames, and
+        # none that was never sent.
+        def samp(l):
+            return int(re.search(r"samp=(\d+)", l).group(1))
+        nbytes = os.path.getsize(p24) & ~1
+        on_at, off_at = (nbytes // 3) & ~1, (2 * nbytes // 3) & ~1
+        plain = run("host_mode_s", p24, *soft, "--chunk", "5632", "--stream", "1")
+        for chunk in ("5632", "45056", "1000"):
+            sw = run("host_mode_s", p24, *soft, "--chunk", chunk, "--stream", "1",
+                     "--coh-on-at", str(on_at), "--coh-off-at", str(off_at))
+            lo, hi = on_at // 2, off_at // 2 + int(chunk) // 2 + 2000   # a chunk and a few frames of slack
+            before = [l for l in sw if samp(l) < lo - 400] == [l for l in plain if samp(l) < lo - 400]
+            after = [l for l in sw if samp(l) >= hi] == [l for l in plain if samp(l) >= hi]
+            mid_sw = {l.rsplit("hex=", 1)[1] for l in sw if lo <= samp(l) < off_at // 2}
+            mid_plain = {l.rsplit("hex=", 1)[1] for l in plain if lo <= samp(l) < off_at // 2}
+            stray = ({l.rsplit("hex=", 1)[1] for l in sw} - {l.rsplit("hex=", 1)[1] for l in plain}) - truth24
+            good = before and after and len(mid_sw) > len(mid_plain) and not stray
+            ok &= good
+            print(f"  switched on at 1/3, off at 2/3, chunk={chunk:>6s}: before {'IDENTICAL' if before else 'MISMATCH'}, "
+                  f"after {'IDENTICAL' if after else 'MISMATCH'}, between +{len(mid_sw) - len(mid_plain)} frames, "
+                  f"{len(stray)} never sent  {'OK' if good else 'MISMATCH'}")
     # ---- a loss of samples in the stream (mode_s_stream_gap): the frames
     # decoded must be exactly those of the two sides decoded as separate
     # streams, with the second side's sample times moved on by the first

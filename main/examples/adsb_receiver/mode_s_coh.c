@@ -33,7 +33,8 @@
 // instructions on the Madrid capture, 13 % at 2,000 messages/s and
 // nothing on a quiet band.
 // Working memory: mode_s_coh_work_size() bytes (9.6 kB), supplied by the
-// application (PSRAM on the device). No heap, no static RAM, no doubles.
+// application through mode_s_coh_enable() (PSRAM on the device). No heap,
+// no static RAM, no doubles.
 //
 // Written for this project; it shares no code with other decoders.
 
@@ -133,6 +134,22 @@ static void fft64(float *re, float *im)
 size_t mode_s_coh_work_size(void)
 {
     return sizeof(struct mode_s_coh_work);
+}
+
+int mode_s_coh_enable(mode_s_t *self, void *work, int on)
+{
+    if (work)
+        self->coh_work = work;
+    self->coh_fix = (uint8_t)(on && self->coh_work != NULL);
+    // Nothing kept from before the switch is to be trusted: not the IQ of
+    // the carried samples, not the noise reference, not the last attempt.
+    self->iq_cur = NULL;
+    self->iq_cur_n = 0;
+    self->iq_tail_n = 0;
+    self->iq_tail_valid = 0;
+    self->coh_ref = 0;
+    self->coh_last_tick = 0;
+    return self->coh_fix;
 }
 
 // Called by the streaming front end around each detect call (mode-s.c).
