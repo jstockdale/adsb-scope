@@ -33,6 +33,10 @@ static mode_s_t st;
 static uint64_t g_base = 0; // abs sample index of mag[0] (legacy path)
 static int g_stream = 0;
 static int g_rate24 = 0;    // 1: input is 2.4 Msps, use the 2.4 Msps demodulator
+static uint32_t g_pos_msgs = 0; // DF17/18 position messages delivered (surface or airborne)
+#ifndef BASELINE
+static uint32_t g_lvl[MODE_S_LVL_BINS]; // level histogram, as the firmware keeps for gain control
+#endif
 
 static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 {
@@ -43,6 +47,9 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     else
 #endif
         samp = g_base + self->last_frame_offset;
+    if (mm->crcok && (mm->msgtype == 17 || mm->msgtype == 18) &&
+        ((mm->metype >= 5 && mm->metype <= 18) || (mm->metype >= 20 && mm->metype <= 22)))
+        g_pos_msgs++;
     printf("MSG samp=%llu df=%d bits=%d crcok=%d err=%d delta=%u ",
            (unsigned long long)samp, mm->msgtype, mm->msgbits, mm->crcok,
            mm->errorbit, self->last_delta);
@@ -68,6 +75,8 @@ static void usage(const char *a0)
             "       [--gate N] [--gate2 N] [--pre N] [--tries N] [--soft N]  (its tuning; see mode-s.h)\n"
             "       [--coh 0|1] [--coh-ts N] [--coh-gate N] [--coh-df 0|1|2]  coherent second look (mode_s_coh.c)\n"
             "       [--coh-on-at BYTE] [--coh-off-at BYTE]   switch it between two chunks, as the firmware does\n"
+            "       [--win SECONDS]   a WIN line on stderr per window of signal: what the gain\n"
+            "                         control is given (stream mode; counters restart per window)\n"
 #endif
             "defaults: chunk=262144 (the firmware's DEFAULT_BUF_LENGTH), stream=0,\n"
             "          fix=1, everything else 0 except --df18 1 (deliver DF18 so it\n"
@@ -91,6 +100,7 @@ int main(int argc, char **argv)
     long gap_at = -1, gap_skip = 0;
     unsigned long long gap_lost = 0;
     int cache_clock = 0; // 1: the ICAO cache ages by samples, as in the device's replay mode
+    double win_s = 0;    // > 0: print gain-control windows of this many seconds of signal
 
     for (int i = 1; i < argc; i++)
     {
@@ -159,6 +169,8 @@ int main(int argc, char **argv)
             coh_on_at = strtol(v, NULL, 0);
         else if (!strcmp(a, "--coh-off-at"))
             coh_off_at = strtol(v, NULL, 0);
+        else if (!strcmp(a, "--win"))
+            win_s = atof(v);
         else
         {
             usage(argv[0]);
@@ -200,7 +212,9 @@ int main(int argc, char **argv)
     }
     (void)df18; (void)gate; (void)gate2; (void)pre; (void)tries; (void)soft;
     (void)coh; (void)coh_ts; (void)coh_gate; (void)coh_df; (void)coh_on_at; (void)coh_off_at;
+    (void)win_s;
 #else
+    st.lvl_hist = g_lvl; // counted in stream mode; it changes nothing that is decoded
     st.fix2 = fix2;
     st.strict_es = strict;
     st.fix2_known_icao = known;
@@ -246,6 +260,11 @@ int main(int argc, char **argv)
 
     uint64_t consumed = 0;
     long fed = 0; // bytes of the input handed to the decoder so far
+#ifndef BASELINE
+    uint64_t win_start = 0;
+    static uint32_t tot_lvl[MODE_S_LVL_BINS];
+    struct { uint32_t preambles, ok, fail, es_ok, es_lost, loud, pos; } tot = {0};
+#endif
     for (;;)
     {
         size_t want = chunk;
@@ -301,9 +320,54 @@ int main(int argc, char **argv)
                 mode_s_detect(&st, mag, (uint32_t)(got / 2), on_msg);
         }
         consumed += got / 2;
+#ifndef BASELINE
+        if (win_s > 0)
+        {
+            // What class_driver.c hands the gain control per window, read
+            // and cleared the same way. The totals go on to the STATS line.
+            const double rate = g_rate24 ? 2.4e6 : 2.0e6;
+            if ((double)(consumed - win_start) >= win_s * rate)
+            {
+                mode_s_level_t lv;
+                mode_s_level_read(g_lvl, &lv);
+                fprintf(stderr, "WIN t=%.2f secs=%.3f ok=%u es_ok=%u es_lost=%u loud=%u pos=%u noise=%.3f clip=%.6f "
+                                "sig=%u delta=%u cand=%u\n",
+                        (double)consumed / rate, (double)(consumed - win_start) / rate,
+                        st.stat_crc_ok, st.stat_es_ok, st.stat_es_lost, st.stat_loud, g_pos_msgs,
+                        (double)lv.noise, (double)lv.clip,
+                        st.stat_crc_ok ? (unsigned)(st.stat_signal_sum / st.stat_crc_ok) : 0u,
+                        st.stat_crc_ok ? (unsigned)(st.stat_delta_sum / st.stat_crc_ok) : 0u,
+                        st.stat_preambles);
+                for (int k = 0; k < MODE_S_LVL_BINS; k++)
+                    tot_lvl[k] += g_lvl[k];
+                memset(g_lvl, 0, sizeof(g_lvl));
+                tot.preambles += st.stat_preambles; st.stat_preambles = 0;
+                tot.ok += st.stat_crc_ok; st.stat_crc_ok = 0;
+                tot.fail += st.stat_crc_fail; st.stat_crc_fail = 0;
+                tot.es_ok += st.stat_es_ok; st.stat_es_ok = 0;
+                tot.es_lost += st.stat_es_lost; st.stat_es_lost = 0;
+                tot.loud += st.stat_loud; st.stat_loud = 0;
+                tot.pos += g_pos_msgs; g_pos_msgs = 0;
+                st.stat_signal_sum = 0;
+                st.stat_delta_sum = 0;
+                win_start = consumed;
+            }
+        }
+#endif
     }
     fclose(f);
 
+#ifndef BASELINE
+    for (int k = 0; k < MODE_S_LVL_BINS; k++)
+        g_lvl[k] += tot_lvl[k];
+    st.stat_preambles += tot.preambles;
+    st.stat_crc_ok += tot.ok;
+    st.stat_crc_fail += tot.fail;
+    st.stat_es_ok += tot.es_ok;
+    st.stat_es_lost += tot.es_lost;
+    st.stat_loud += tot.loud;
+    g_pos_msgs += tot.pos;
+#endif
     fprintf(stderr, "STATS preambles=%u crc_ok=%u crc_fail=%u",
             st.stat_preambles, st.stat_crc_ok, st.stat_crc_fail);
 #ifndef BASELINE
@@ -313,6 +377,12 @@ int main(int argc, char **argv)
             st.stat_crc_fail ? (double)st.stat_fail_delta_sum / st.stat_crc_fail : 0.0);
     fprintf(stderr, " coh_gated=%u coh_try=%u coh_abort=%u coh_ok=%u coh_soft=%u",
             st.stat_coh_gated, st.stat_coh_try, st.stat_coh_abort, st.stat_coh_ok, st.stat_coh_soft);
+    {
+        mode_s_level_t lv;
+        mode_s_level_read(g_lvl, &lv);
+        fprintf(stderr, " es_ok=%u es_lost=%u loud=%u pos=%u noise=%.3f clip=%.6f",
+                st.stat_es_ok, st.stat_es_lost, st.stat_loud, g_pos_msgs, (double)lv.noise, (double)lv.clip);
+    }
 #endif
     fprintf(stderr, " samples=%llu\n", (unsigned long long)consumed);
     free(buf);

@@ -73,5 +73,32 @@ int main(void)
     }
     printf("OK: validity equivalence (40k frames), exhaustive 1-bit and 2-bit location "
            "(40 frames x 6328 patterns), 56-bit single-bit (2000 frames x 56)\n");
+
+    // 4) the faster forms in mode-s.c give what the historical ones gave:
+    //    the checksum by byte-wise table against the bit-by-bit parity table
+    //    (random frames, both lengths), and the magnitude table against the
+    //    square root, for every sample pair there is.
+    for (int t = 0; t < 2000000; t++)
+    {
+        unsigned char m[14];
+        int bits = (t & 1) ? 112 : 56;
+        for (int i = 0; i < 14; i++) m[i] = rand() & 0xFF;
+        if (mode_s_checksum(m, bits) != mode_s_checksum_reference(m, bits))
+        { printf("FAIL checksum bits=%d\n", bits); return 1; }
+    }
+    {
+        static mode_s_t st;
+        mode_s_init(&st); // builds the table
+        for (int i = 0; i < 256; i++)
+            for (int q = 0; q < 256; q++)
+            {
+                unsigned char d[2] = {(unsigned char)i, (unsigned char)q};
+                uint16_t mg;
+                mode_s_compute_magnitude_vector(d, &mg, 2);
+                if (mg != mode_s_magnitude_reference(d[0], d[1]))
+                { printf("FAIL magnitude I=%d Q=%d\n", i, q); return 1; }
+            }
+    }
+    printf("OK: checksum by table == bit by bit (2M frames), magnitude table == square root (65536 pairs)\n");
     return 0;
 }

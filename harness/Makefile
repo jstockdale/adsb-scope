@@ -2,7 +2,8 @@
 #   make          build the three decoder variants + unit test
 #   make check    table proofs, C-level fixer tests, stream-equivalence test,
 #                 (including samples lost mid-stream), MQTT feeder batch
-#                 tests, sample ring tests (two threads)
+#                 tests, sample ring tests (two threads), the gain loop on
+#                 model receivers (gain/check_gain.sh)
 #   make old_batch_size IDF_PATH=...   size of the pre-r7 feeder's batches,
 #                 built with ESP-IDF's own cJSON (optional, not part of check)
 #   make bench    fixer micro-benchmark (historical brute force vs syndrome)
@@ -14,7 +15,7 @@ CC     ?= gcc
 PYTHON ?= python3
 CFLAGS := -std=gnu17 -O2 -Wall
 LDLIBS := -lm
-BINS   := host_mode_s host_mode_s_df18off host_mode_s_baseline test_fix_c test_batch test_ring
+BINS   := host_mode_s host_mode_s_plain host_mode_s_df18off host_mode_s_baseline test_fix_c test_batch test_ring sim_gain
 
 all: $(BINS)
 
@@ -23,6 +24,16 @@ $(APP)/mode_s_syndromes.h: gen_syndrome_tables.py
 
 host_mode_s: host_mode_s.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(APP)/mode_s_coh.c $(APP)/mode-s.h $(APP)/mode_s_syndromes.h
 	$(CC) $(CFLAGS) -I$(APP) -o $@ host_mode_s.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(APP)/mode_s_coh.c $(LDLIBS)
+
+# The 2.4 Msps demodulator with its chip sums in the plain form (loops over
+# the position tables) instead of written out: check_stream.py holds the two
+# to identical output.
+host_mode_s_plain: host_mode_s.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(APP)/mode_s_coh.c $(APP)/mode-s.h $(APP)/mode_s_syndromes.h
+	$(CC) $(CFLAGS) -I$(APP) -DMODE_S_2400_PLAIN -o $@ host_mode_s.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(APP)/mode_s_coh.c $(LDLIBS)
+
+# The firmware's gain loop against a model receiver (gain/README in sim_gain.c)
+sim_gain: gain/sim_gain.c $(APP)/gain_ctl.c $(APP)/gain_ctl.h
+	$(CC) $(CFLAGS) -Wextra -I$(APP) -o $@ gain/sim_gain.c $(APP)/gain_ctl.c $(LDLIBS)
 
 host_mode_s_df18off: host_mode_s.c $(APP)/mode-s.c $(APP)/mode-s.h $(APP)/mode_s_syndromes.h
 	$(CC) $(CFLAGS) -I$(APP) -DMODE_S_DF18_FIX=0 -o $@ host_mode_s.c $(APP)/mode-s.c $(APP)/mode_s_2400.c $(APP)/mode_s_coh.c $(LDLIBS)
@@ -52,6 +63,7 @@ check: all
 	$(PYTHON) check_stream.py
 	$(PYTHON) feeder/check_feeder.py ./test_batch
 	./test_ring
+	sh gain/check_gain.sh
 
 bench: all
 	$(PYTHON) bench_fix.py

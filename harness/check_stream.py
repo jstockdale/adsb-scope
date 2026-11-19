@@ -26,7 +26,7 @@ def run(binary, path, *args):
     return [l for l in r.stdout.splitlines() if l.startswith("MSG ")]
 
 def main():
-    for b in ("host_mode_s", "host_mode_s_df18off", "host_mode_s_baseline"):
+    for b in ("host_mode_s", "host_mode_s_plain", "host_mode_s_df18off", "host_mode_s_baseline"):
         if not os.path.exists(os.path.join(HERE, b)):
             sys.exit(f"error: {b} not built; run `make` in {HERE} first")
     path = sys.argv[1] if len(sys.argv) > 1 else None
@@ -71,6 +71,15 @@ def main():
             same = got == ref24
             ok &= same
             print(f"  stream chunk={chunk:>7s}: {len(got):6d} frames  {'IDENTICAL' if same else 'MISMATCH'}")
+        # ---- the demodulator's written-out chip sums (mode_s_2400.c) against
+        # the plain form they stand for (host_mode_s_plain, -DMODE_S_2400_PLAIN):
+        # the same frames, bit deltas and times, with and without the repairs.
+        for label, opts in (("defaults", []), ("soft rescue + coherent look", ["--soft", "8", "--coh", "1"])):
+            a = run("host_mode_s", p24, "--rate", "2.4", *opts, "--chunk", "5632", "--stream", "1")
+            b = run("host_mode_s_plain", p24, "--rate", "2.4", *opts, "--chunk", "5632", "--stream", "1")
+            same = a == b and len(a) > 0
+            ok &= same
+            print(f"  written-out chip sums vs plain form, {label}: {len(a)} frames  {'IDENTICAL' if same else 'MISMATCH'}")
         # ---- the coherent second look (mode_s_coh.c). It needs the IQ behind
         # the magnitudes, so it only runs on the streaming path, where the IQ
         # of the carried tail is kept between calls: its output must not

@@ -45,13 +45,17 @@ feeder tests, `../docs/UPLINK.md`.
 | `experiments/xcheck_madrid.py` | the Madrid capture has no ground truth: compares our frames with more1090's decodes of the 8 Msps original (set `MORE1090`) → `results/coh_madrid_xcheck.txt` |
 | `experiments/cost_coh.py` | instruction counts with and without the coherent second look (needs valgrind) → `results/coh_cost.txt` |
 | `experiments/replay_expect.py` | what `adsb replay <file>` should report on the device in each console setting (`adsb dec`, `adsb coh`): runs the host decoder on the same file the way the device replays it → `results/coh_replay_expect.txt` |
+| `experiments/gain_sweep.py` | the Madrid capture through an 8-bit ADC at a series of gains: level statistics, yield, loud share and error rates at each → `results/gain_sweep.txt`; `--model` writes the per-window table `sim_gain` replays (`gain/madrid_model.txt`) |
+| `experiments/es_lost_truth.py` | the decoder's squitter error rate (lost / seen) against what the simulator really sent → `results/gain_es_lost_truth.txt` |
+| `gain/sim_gain.c`, `gain/check_gain.sh` | the firmware's gain loop (`gain_ctl.c`) on model receivers; part of `make check` → `results/gain_sim.txt` |
+| `experiments/cost_rv32.py` | what the decoder costs in the device's own instructions: built with the firmware's compiler, run under qemu-riscv32 (needs both) → `results/cost_rv32.txt` |
 | `results/` | CSVs and plot from the runs reported in `docs/DECODER.md` |
 
 ## Checks that need nothing but gcc and Python
 
 ```
 cd harness
-make check     # table proofs, exhaustive fixer tests, stream equivalence, parity
+make check     # table proofs, exhaustive fixer tests, stream equivalence, parity, the gain loop on model receivers
 make bench     # fixer micro-benchmark
 ```
 
@@ -184,6 +188,52 @@ echo "done - results in $R"
 `results/coh_collide.txt` is the three `collide.py` outputs in one file.
 To set the cost of this build against an older one, build that one's
 `host_mode_s` elsewhere and add `--old path/to/it` to `cost_coh.py`.
+
+## Gain and cost (`../docs/DECODER.md` sections 5.8 and 5.9)
+
+Everything in `results/gain_*.txt` and `results/cost_rv32.txt`. Needs the
+test set and the Madrid download of the block above (`WORK` the same
+directory); the last step also needs ESP-IDF v5.4.1's toolchain and
+qemu-riscv32, and is skipped with a note if either is missing. About 15
+minutes. Checks first, runs in a subshell; edit the three variables, then
+paste.
+
+```sh
+(
+REPO="$HOME/adsb-scope"            # your checkout, on a branch that has gain_ctl.c
+WORK="$HOME/adsb-harness-work"     # where the block above left the test set and the capture
+IDF_EXPORT="$HOME/esp/esp-idf/export.sh"   # ESP-IDF v5.4.1's export.sh (only for the last step)
+
+fail() { echo "STOP: $1"; exit 1; }   # leaves only this subshell
+for c in gcc make python3; do
+  command -v "$c" >/dev/null 2>&1 || fail "missing '$c'  (Debian/Ubuntu: sudo apt install build-essential python3)"
+done
+python3 -c "import numpy, scipy" 2>/dev/null || fail "missing Python packages  (pip install numpy scipy) - or this shell has ESP-IDF's python: use a fresh one"
+[ -f "$REPO/main/examples/adsb_receiver/gain_ctl.c" ] || fail "REPO=$REPO has no gain_ctl.c - wrong checkout or branch"
+[ -f "$WORK/madrid.sigmf-meta" ] && [ -f "$WORK/madrid.sigmf-data" ] || fail "no Madrid capture in $WORK - run the block above first"
+[ -f "$WORK/set/dense.cu8" ] && [ -f "$WORK/set/madrid_lo.cu8" ] || fail "no test set in $WORK/set - run the block above first"
+mkdir -p "$WORK/results" || fail "cannot create $WORK/results"
+set -e
+R="$WORK/results"
+cd "$REPO/harness"
+make                                                                       # host_mode_s, sim_gain
+python3 experiments/gain_sweep.py "$WORK/madrid.sigmf-meta"               > "$R/gain_sweep.txt";         cat "$R/gain_sweep.txt"
+python3 experiments/es_lost_truth.py "$WORK/set"                           > "$R/gain_es_lost_truth.txt"; cat "$R/gain_es_lost_truth.txt"
+sh gain/check_gain.sh                                                      > "$R/gain_sim.txt";           tail -1 "$R/gain_sim.txt"
+# the model sim_gain replays (in the repository already; this remakes it, 64 decodes of the capture):
+#   python3 experiments/gain_sweep.py "$WORK/madrid.sigmf-meta" --model gain/madrid_model.txt
+if [ -f "$IDF_EXPORT" ] && command -v qemu-riscv32 >/dev/null 2>&1; then
+  ( . "$IDF_EXPORT" >/dev/null 2>&1 && python3 experiments/cost_rv32.py "$WORK/set/madrid_lo.cu8" ) > "$R/cost_rv32.txt"; cat "$R/cost_rv32.txt"
+else
+  echo "note: skipped cost_rv32.py - needs $IDF_EXPORT and qemu-riscv32 (Debian/Ubuntu: sudo apt install qemu-user)"
+fi
+echo "done - results in $R"
+)
+```
+
+To watch the loop work: `./sim_gain gain/madrid_model.txt --site 21 --hours 1 --log`
+prints its log lines on a model site whose top gain step is 21 dB too hot.
+`--site 0` is a site where the top step is right.
 
 ## Things to know when reading the numbers
 

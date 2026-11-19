@@ -13,6 +13,8 @@ __pycache__/
 harness/host_mode_s
 harness/host_mode_s_df18off
 harness/host_mode_s_baseline
+harness/host_mode_s_plain
+harness/sim_gain
 harness/test_fix_c
 harness/test_batch
 harness/test_ring

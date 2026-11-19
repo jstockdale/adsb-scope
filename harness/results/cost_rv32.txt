@@ -1,0 +1,10 @@
+0.2 s of madrid_lo.cu8, the firmware's default decoder; RISC-V instructions per second of signal (millions)
+
+this tree, -Og:    190 M/s  (100% of the first row); start-up 27 M once; frames/CRC-ok/candidates: 33 33 1267
+    mode_s_detect_2400 45%, mode_s_compute_magnitude_vector 19%, slice_bits 18%, soft_rescue 3%, slice_coherent 2%
+this tree, -O2:    149 M/s  (78% of the first row); start-up 26 M once; frames/CRC-ok/candidates: 33 33 1267
+    mode_s_detect_2400 50%, stream_run 18%, slice_bits 16%, mode_s_coh_reslice 3%, memcpy 3%
+coh2 (8afa109), -Og:    288 M/s  (152% of the first row); start-up 26 M once; frames/CRC-ok/candidates: 33 33 1267
+    mode_s_detect_2400 44%, mode_s_compute_magnitude_vector 18%, slice_bits 10%, mode_s_checksum 8%, chip_sum 8%
+coh2 (8afa109), -O2:    221 M/s  (116% of the first row); start-up 26 M once; frames/CRC-ok/candidates: 33 33 1267
+    mode_s_detect_2400 48%, mode_s_compute_magnitude_vector 19%, slice_bits 17%, mode_s_decode 5%, mode_s_coh_reslice 2%
