@@ -1,0 +1,60 @@
+Coherent second look (mode_s_coh.c): what it costs (2026-11-18)
+
+Method: experiments/cost_coh.py - valgrind --tool=callgrind on the host build (x86-64, -O2),
+start-up subtracted, on the first 2 s of three inputs of the test set: the Madrid capture at
+low gain (real traffic), the 2,000 messages/s scenario (worst case) and noise (a quiet band).
+"older build" is host_mode_s built from the r10 tip (c786797).
+
+x86-64 instructions per input sample, first 2 s of each input (4800000 samples), start-up subtracted
+
+configuration                           Madrid     dense     noise   re-slices in Madrid / dense (stopped early), instructions per re-slice
+older build, default image               95.39     80.76     70.48
+older build, fix2 image                  99.10     84.95     71.54
+default image                            95.39     80.76     70.48
+default image + coherent                100.70     90.92     70.55   673 (365), 37,883 / 1017 (48), 47,920
+fix2 image                               97.15     82.78     70.99
+fix2 image + coherent                   102.40     93.59     71.06   659 (367), 38,242 / 1017 (48), 51,064
+fix2 image minus 2-bit fix               97.08     82.65     70.96
+fix2 image minus 2-bit + coherent       102.34     93.48     71.03   661 (367), 38,203 / 1017 (48), 51,089
+
+overhead of the coherent look, percent of decoder instructions:
+  default image + coherent          Madrid +5.6 %   dense +12.6 %   noise +0.1 %
+  fix2 image + coherent             Madrid +5.4 %   dense +13.1 %   noise +0.1 %
+  fix2 image minus 2-bit + coherent Madrid +5.4 %   dense +13.1 %   noise +0.1 %
+
+Reading it
+- Option off: the default image costs exactly what r10 does. The fix2 image is cheaper than
+  r10's (99.1 -> 97.2 on Madrid) because the soft rescue now walks its bit subsets in
+  Gray-code order - same result, one XOR per subset instead of eight.
+- Option on: 5-6 % more decoder instructions on real traffic, 13 % in the worst case, nothing
+  on a quiet band (the gates pass no candidate from noise).
+- Per second on Madrid: 2.4 Msps x 5.3 = 12.7 M instructions on top of 229 M.
+- A re-slice costs about 38,000 instructions on Madrid, where 54 % of them stop early (no
+  single carrier), and 48,000-51,000 in the dense scenario, where 5 % do. Solving the two
+  for the two kinds: about 29,000 for one that stops early, about 49,000 for a full one.
+  Most of the early part is fetching the IQ, the chip filter and the FFT, so a cheaper
+  first test (coherence of the lag products, before the FFT) could save perhaps a fifth
+  of the look's cost on real traffic. Not tried.
+- These are x86-64 instruction counts. They rank configurations and give relative overhead;
+  they are not ESP32-P4 cycles. The decoder's share of a P4 core is still unmeasured
+  (`adsb status` -> Decode), so the absolute cost on the device is unknown.
+
+On the device (ESP32-P4: rv32imafc, ilp32f) - compiled only, never run
+Compiler: riscv64-unknown-elf-gcc 13.2.0 -Og with picolibc headers. This is not the ESP-IDF
+toolchain or its C library; it shows the code compiles for the instruction set, what it
+needs, and roughly how big it is.
+  flash         mode_s_coh.o 3,628 bytes (3,268 code, 360 constants)
+                mode_s_2400.o +862 bytes (2,990 -> 3,852), mode-s.o +170 bytes
+                total about 4.7 kB
+  static RAM    none: mode_s_coh.o has no .data and no .bss
+  mode_s_t      +64 bytes (32,952 -> 33,016)
+  work memory   9,604 bytes, allocated by the application and used only during a re-slice,
+                so PSRAM will do
+  stack         704 bytes below mode_s_detect_2400() on the deepest path
+                (coh_second_look 528, mode_s_coh_reslice 112, chips_at 64);
+                mode_s_detect_2400's own frame is unchanged (1,248)
+  arithmetic    single-precision float only: no double instruction, no soft-float call
+                (-Wdouble-promotion clean). Library calls per re-slice: atan2f x2, cosf x3,
+                sinf x3, roundf x1; sqrtf compiles to the fsqrt.s instruction.
+  warnings      none from -Wall -Wextra on the three decoder files beyond one that r10
+                already has (mode-s.h: `void runme();`)

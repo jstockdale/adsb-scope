@@ -39,6 +39,11 @@ feeder tests, `../docs/UPLINK.md`.
 | `experiments/prep_2400.py`, `eval_2400.py` | build the fixed 2.4 Msps test set, and score the 2.4 Msps demodulator on it next to dump1090-fa |
 | `experiments/toa_error.py` | frame time-of-arrival error of the 2.4 Msps demodulator against simulator truth (uses the `prep_2400.py` test set) |
 | `experiments/rate_24.py` | 2.0 Msps (single / dual grid) vs a reference 2.4 Msps demodulator (dump1090-fa, set `DUMP1090`) on identical inputs |
+| `experiments/prep_dense.py` | adds two heavy-traffic scenarios (1,000 and 2,000 messages/s) to the `prep_2400.py` test set |
+| `experiments/eval_coh.py` | the coherent second look (`mode_s_coh.c`, `host_mode_s --coh 1`): decode with and without it in eight configurations, and how often it runs → `results/coh_eval.txt` |
+| `experiments/collide.py` | pairs of overlapping frames at a chosen strength gap – which of the two comes out; `--stress N` counts false frames over N collisions → `results/coh_collide.txt` |
+| `experiments/xcheck_madrid.py` | the Madrid capture has no ground truth: compares our frames with more1090's decodes of the 8 Msps original (set `MORE1090`) → `results/coh_madrid_xcheck.txt` |
+| `experiments/cost_coh.py` | instruction counts with and without the coherent second look (needs valgrind) → `results/coh_cost.txt` |
 | `results/` | CSVs and plot from the runs reported in `docs/DECODER.md` |
 
 ## Checks that need nothing but gcc and Python
@@ -116,6 +121,67 @@ echo "done – results in $WORK/results"
 
 `scenario_curve.py` and `sweep.py` *append* to their CSV, so remove the
 file (as step 3 does) before repeating a run with the same seeds.
+
+## The coherent second look (`../docs/DECODER.md` section 5.7)
+
+Everything in `results/coh_*.txt`, from nothing. Needs what the block above
+needs, plus valgrind; about 4 GB of scratch disk and 25 minutes on one
+core. It reuses more1090 and the Madrid download if `WORK` is the same
+directory as above. Checks first, runs in a subshell; edit the two
+variables, then paste.
+
+```sh
+(
+REPO="$HOME/adsb-scope"            # your checkout, on a branch that has mode_s_coh.c
+WORK="$HOME/adsb-harness-work"     # scratch space, ~4 GB
+
+fail() { echo "STOP: $1"; exit 1; }   # leaves only this subshell
+for c in gcc make python3 git curl valgrind; do
+  command -v "$c" >/dev/null 2>&1 || fail "missing '$c'  (Debian/Ubuntu: sudo apt install build-essential python3 git curl valgrind)"
+done
+python3 -c "import numpy, scipy" 2>/dev/null || fail "missing Python packages  (pip install numpy scipy)"
+command -v cargo >/dev/null 2>&1 || fail "missing Rust toolchain  (curl -sSf https://sh.rustup.rs | sh ; then open a new shell)"
+[ -f "$REPO/harness/experiments/eval_coh.py" ] || fail "REPO=$REPO has no harness/experiments/eval_coh.py - wrong checkout or branch"
+[ -f "$REPO/main/examples/adsb_receiver/mode_s_coh.c" ] || fail "REPO=$REPO has no mode_s_coh.c - wrong branch"
+mkdir -p "$WORK/set" "$WORK/results" || fail "cannot create $WORK"
+set -e
+R="$WORK/results"
+
+# 1. decoder builds + self-checks (includes the coherent path at every chunk size)
+cd "$REPO/harness"
+make
+make check
+
+# 2. more1090 v0.2.0: its simulator makes the test data, its receiver is the reference.
+#    Some stable Rust releases refuse one library feature it uses; the second form builds there.
+[ -d "$WORK/more1090" ] || git clone https://github.com/daniestevez/more1090.git "$WORK/more1090"
+( cd "$WORK/more1090" && git checkout -q v0.2.0 &&
+  { cargo build --release ||
+    RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Zcrate-attr=feature(float_algebraic)" cargo build --release; } )
+export MORE1090_SIM="$WORK/more1090/target/release/more1090-simulator"
+export MORE1090="$WORK/more1090/target/release/more1090"
+
+# 3. the Madrid capture (640 MB, Zenodo record 23360412) and the test set
+Z="https://zenodo.org/api/records/23360412/files/ADS-B_8Msps_2026-08-27T08:36:39"
+[ -f "$WORK/madrid.sigmf-meta" ] || curl -L -o "$WORK/madrid.sigmf-meta" "$Z.sigmf-meta/content"
+[ -f "$WORK/madrid.sigmf-data" ] || curl -L -o "$WORK/madrid.sigmf-data" "$Z.sigmf-data/content"
+python3 experiments/prep_2400.py "$WORK/set" --madrid "$WORK/madrid.sigmf-meta"
+python3 experiments/prep_dense.py "$WORK/set"
+
+# 4. the measurements
+python3 experiments/eval_coh.py "$WORK/set"                                > "$R/coh_eval.txt";          cat "$R/coh_eval.txt"
+python3 experiments/xcheck_madrid.py "$WORK/madrid.sigmf-meta" "$WORK/set" > "$R/coh_madrid_xcheck.txt"; cat "$R/coh_madrid_xcheck.txt"
+python3 experiments/collide.py                   --out "$R/coh_collide_full.txt"
+python3 experiments/collide.py --tau-us 100,120  --out "$R/coh_collide_tail.txt"
+python3 experiments/collide.py --stress 400000   --out "$R/coh_collide_stress.txt"
+python3 experiments/cost_coh.py "$WORK/set"                                > "$R/coh_cost.txt";          cat "$R/coh_cost.txt"
+echo "done - results in $R"
+)
+```
+
+`results/coh_collide.txt` is the three `collide.py` outputs in one file.
+To set the cost of this build against an older one, build that one's
+`host_mode_s` elsewhere and add `--old path/to/it` to `cost_coh.py`.
 
 ## Things to know when reading the numbers
 

@@ -1,0 +1,23 @@
+Coherent second look: are the frames it adds on the Madrid capture real? (2026-11-18)
+
+Method: experiments/xcheck_madrid.py. Reference: more1090 v0.2.0 run on the original 8 Msps recording
+(error correction level 2 for the frame list, level 0 for the list of addresses heard error-free).
+Ours: 2.4 Msps, 8-bit, at the two gains of the test set.
+in ref = the reference decoded the same 112 bits; new addr = not in ref and from an address the
+reference never decoded error-free (where a false frame would almost always land).
+
+reference (more1090 v0.2.0 at 8 Msps, up to 2 bits corrected): 2633 extended squitters, 1581 distinct; error-free: 2246 from 41 addresses
+
+                                                        low gain                             high gain
+configuration                               frames  in ref not in ref new addr    frames  in ref not in ref new addr
+default image                                 1646    1633         13        6      1571    1559         12        5
+default image + coherent                      1918    1899         19        6      1872    1854         18        5
+fix2 image                                    1755    1740         15        7      1718    1703         15        6
+fix2 image + coherent                         2077    2050         27        7      2056    2027         29        6
+fix2 image minus 2-bit fix                    1708    1694         14        7      1676    1663         13        6
+fix2 image minus 2-bit + coherent             2062    2036         26        7      2043    2016         27        6
+soft rescue + coherent, no address gate       2086    2058         28        8      2063    2034         29        8
+
+Frames the coherent look adds, and where they fall:
+  default image   low gain +272: 266 in ref, 6 not in ref, 0 new addr     high gain +301: 295 / 6 / 0
+  fix2 image      low gain +322: 310 in ref, 12 not in ref, 0 new addr    high gain +338: 324 / 14 / 0

@@ -1,0 +1,138 @@
+Coherent second look (mode_s_coh.c): pairs of overlapping frames (2026-11-18)
+
+Method: experiments/collide.py. Two DF17 frames per trial in complex baseband, each with its own
+amplitude, carrier offset (normal, 100 kHz sigma) and phase; rendered at 12 Msps, box-averaged to
+2.4 Msps, noise added, quantised to 8 bits, decoded by the host build. Idealised: rectangular
+pulses, no multipath, exactly two frames per collision. It measures the decoder's logic, not a
+channel. Three runs follow: (1) the second frame starts 0-100 us after the first, so at least
+20 us of the two overlap; (2) it starts 100-120 us after, so only the tail of the first frame
+is hit; (3) 400,000 collisions to count frames that were never sent.
+
+==== (1) collide.py ====
+
+Two overlapping DF17 frames, start offset 0,100 us, 2000 pairs per row, weak frame at amplitude 10 LSB, noise 1 LSB per rail
+pct of frames decoded: S = stronger, W = weaker, both = both from one pair, false = decoded frames matching neither
+
+[default image (1-bit fix)]
+case                            S      W   both  false    W if S first W if W first
+no overlap (control)       100.0% 100.0% 100.0%      0          100.0%        99.9%
+overlap, S 0 dB up           0.7%   0.9%   0.0%      0            0.1%         1.7%
+overlap, S 3 dB up          10.3%   0.0%   0.0%      0            0.0%         0.0%
+overlap, S 6 dB up          65.8%   0.0%   0.0%      0            0.0%         0.0%
+overlap, S 10 dB up        100.0%   0.0%   0.0%      1            0.0%         0.0%
+overlap, S 15 dB up        100.0%   0.0%   0.0%      0            0.0%         0.0%
+overlap, S 20 dB up        100.0%   0.0%   0.0%      0            0.0%         0.0%
+
+[default image + coherent second look]
+case                            S      W   both  false    W if S first W if W first
+no overlap (control)       100.0% 100.0% 100.0%      0          100.0%       100.0%
+overlap, S 0 dB up           4.8%   5.0%   0.0%      0            0.7%         9.2%
+overlap, S 3 dB up          28.9%   0.8%   0.0%      0            0.0%         1.6%
+overlap, S 6 dB up          81.9%   0.1%   0.0%      0            0.0%         0.1%
+overlap, S 10 dB up        100.0%   0.0%   0.0%      1            0.0%         0.0%
+overlap, S 15 dB up        100.0%   0.0%   0.0%      0            0.0%         0.0%
+overlap, S 20 dB up        100.0%   0.0%   0.0%      0            0.0%         0.0%
+
+[soft rescue + 2-bit fix]
+case                            S      W   both  false    W if S first W if W first
+no overlap (control)       100.0%  99.9%  99.9%      1           99.9%        99.9%
+overlap, S 0 dB up           1.9%   2.7%   0.0%      3            0.1%         5.2%
+overlap, S 3 dB up          20.4%   0.3%   0.0%      4            0.0%         0.7%
+overlap, S 6 dB up          84.9%   0.0%   0.0%      4            0.0%         0.0%
+overlap, S 10 dB up        100.0%   0.0%   0.0%      2            0.0%         0.0%
+overlap, S 15 dB up         99.8%   0.1%   0.0%      2            0.0%         0.1%
+overlap, S 20 dB up        100.0%   0.0%   0.0%      1            0.0%         0.0%
+
+[soft rescue + 2-bit fix + coherent second look]
+case                            S      W   both  false    W if S first W if W first
+no overlap (control)       100.0% 100.0% 100.0%      1           99.9%       100.0%
+overlap, S 0 dB up          19.4%  18.8%   0.0%      3            0.7%        36.0%
+overlap, S 3 dB up          54.5%   4.3%   0.0%      2            0.0%         8.7%
+overlap, S 6 dB up          91.0%   0.5%   0.0%      4            0.0%         1.0%
+overlap, S 10 dB up        100.0%   0.0%   0.0%      2            0.0%         0.0%
+overlap, S 15 dB up         99.8%   0.1%   0.0%      2            0.0%         0.1%
+overlap, S 20 dB up        100.0%   0.0%   0.0%      1            0.0%         0.0%
+
+==== (2) collide.py --tau-us 100,120 ====
+
+Two overlapping DF17 frames, start offset 100,120 us, 2000 pairs per row, weak frame at amplitude 10 LSB, noise 1 LSB per rail
+pct of frames decoded: S = stronger, W = weaker, both = both from one pair, false = decoded frames matching neither
+
+[default image (1-bit fix)]
+case                            S      W   both  false    W if S first W if W first
+no overlap (control)       100.0% 100.0% 100.0%      0          100.0%        99.9%
+overlap, S 0 dB up          36.0%  36.4%   1.4%      0            2.3%        68.8%
+overlap, S 3 dB up          54.7%  25.3%   1.8%      0            2.0%        48.4%
+overlap, S 6 dB up          78.3%  16.5%   2.0%      0            2.5%        30.8%
+overlap, S 10 dB up         87.1%  15.1%   2.2%      1            2.8%        28.6%
+overlap, S 15 dB up         88.8%  13.6%   2.4%      0            2.4%        24.8%
+overlap, S 20 dB up         90.2%  12.2%   2.4%      0            1.4%        22.3%
+
+[default image + coherent second look]
+case                            S      W   both  false    W if S first W if W first
+no overlap (control)       100.0% 100.0% 100.0%      0          100.0%       100.0%
+overlap, S 0 dB up          41.3%  42.9%   2.1%      0            2.7%        81.2%
+overlap, S 3 dB up          55.4%  31.4%   2.1%      0            2.5%        60.0%
+overlap, S 6 dB up          75.7%  21.8%   2.5%      0            3.0%        40.9%
+overlap, S 10 dB up         85.1%  17.4%   2.5%      1            3.1%        33.2%
+overlap, S 15 dB up         87.5%  15.3%   2.9%      0            3.0%        27.7%
+overlap, S 20 dB up         90.2%  12.6%   2.8%      0            1.7%        22.9%
+
+[soft rescue + 2-bit fix]
+case                            S      W   both  false    W if S first W if W first
+no overlap (control)       100.0%  99.9%  99.9%      1           99.9%        99.9%
+overlap, S 0 dB up          44.8%  47.0%   2.0%      1            1.9%        89.8%
+overlap, S 3 dB up          53.5%  35.5%   1.9%      0            2.2%        68.6%
+overlap, S 6 dB up          69.8%  26.2%   2.1%      3            2.6%        50.4%
+overlap, S 10 dB up         80.5%  21.9%   2.3%      1            3.0%        42.5%
+overlap, S 15 dB up         80.8%  21.6%   2.5%      3            2.5%        40.6%
+overlap, S 20 dB up         80.9%  21.6%   2.6%      1            1.7%        40.5%
+
+[soft rescue + 2-bit fix + coherent second look]
+case                            S      W   both  false    W if S first W if W first
+no overlap (control)       100.0% 100.0% 100.0%      1           99.9%       100.0%
+overlap, S 0 dB up          49.1%  51.1%   2.2%      1            2.0%        97.9%
+overlap, S 3 dB up          53.0%  43.6%   2.3%      0            2.7%        84.2%
+overlap, S 6 dB up          65.7%  33.4%   2.8%      3            3.4%        64.0%
+overlap, S 10 dB up         78.5%  24.2%   2.7%      1            3.3%        47.2%
+overlap, S 15 dB up         80.1%  22.6%   2.9%      3            3.0%        42.3%
+overlap, S 20 dB up         81.1%  21.7%   2.9%      1            1.7%        40.6%
+
+==== (3) collide.py --stress 400000 ====
+
+400000 pairs of overlapping DF17 frames, start offset 0,100 us, stronger frame 0-10 dB up (one gap per batch of 2000),
+40 aircraft addresses per batch, each heard once cleanly first; seed 1
+false = decoded frames matching nothing that was sent; real address = of those, frames carrying an aircraft's address
+
+configuration                      frames decoded  false  per million decoded  real address
+default image                              170678     12                   70             3
+default image + coherent                   220877     12                   54             3
+soft rescue, no address gate               198886     17                   85             5
+soft rescue + coherent, no gate            291396     18                   62             5
+fix2 image                                 206940    124                  599           117
+fix2 image + coherent                      290621    110                  378           103
+fix2 image minus 2-bit fix                 198306     12                   61             5
+... + coherent                             289940     12                   41             5
+
+Reading (3)
+- The coherent look adds 50,000-92,000 frames and no false ones (12 -> 12, 17 -> 18, 12 -> 12).
+- The fix2 image stands apart: ten times the false frames of every other row, and 117 of its 124
+  carry a real aircraft's address. By the repair that produced them: 113 exact 2-bit repairs
+  (every one under a real address), 7 one-bit repairs, 1 soft rescue, and 3 DF16 frames accepted
+  through the address/parity check. In a 2-bit case the frame's address field came through the
+  collision, other bits did not, and one of the 6,216 two-bit patterns happened to match the CRC
+  error (6,216 of 16.7 million syndromes: about 1 in 2,700 frames damaged beyond two bits). The
+  known-address gate checks the address, which is right, so it lets them through.
+- The other rows by the same count: default image 9 one-bit repairs and the 3 DF16; fix2 image
+  with the coherent look 99 two-bit, 7 one-bit, 1 soft, 3 DF16; fix2 image without the 2-bit fix,
+  with the coherent look, 7 one-bit, 2 soft, 3 DF16; soft rescue with the coherent look and no
+  gate 8 one-bit, 7 soft, 3 DF16.
+- The soft rescue tries at most 162 patterns, all confined to the least confident bits; the
+  coherent look uses only that. Hence the last two rows: the fix2 image without its 2-bit fix
+  has the false-frame count of the default image, and with the coherent look decodes as many
+  frames as the fix2 image does with it (289,940 against 290,621).
+- With the coherent look the fix2 image's count falls (124 -> 110) because a frame it recovers
+  is jumped over, and the damaged candidates behind it never reach the 2-bit fix.
+- "Per million decoded" is per frame decoded in a test where every frame is hit by another
+  within 10 dB. On the air most frames are not, so the rate per decoded frame is lower by
+  whatever share of frames collide; the ratios between rows are what carries over.

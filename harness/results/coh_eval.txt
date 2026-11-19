@@ -1,0 +1,21 @@
+Coherent second look (mode_s_coh.c): decode on the fixed test set (2026-11-18)
+
+Method: experiments/eval_coh.py on the prep_2400.py test set (strong / mid / weak: 300 messages/s,
+10 s each; the Madrid capture at two gains; 20 s of noise) plus prep_dense.py (busy: 1,000 messages/s,
+dense: 2,000 messages/s, 5 s each). 2.4 Msps, 8-bit, streaming path.
+Simulated sets: percent of extended squitters decoded / frames matching no truth frame.
+Madrid: extended-squitter frames (no ground truth here; see coh_madrid_xcheck.txt). Noise: frames decoded.
+In simulation every frame carries a new random address, so the known-address gate refuses every repair
+there and the gated rows equal the default image; their Madrid columns show the real effect.
+"recovered/s" counts every frame the re-slice decoded. About half of those on Madrid would have been
+decoded from the next candidate position anyway; the frame counts show the net gain.
+
+configuration                              strong        mid       weak       busy      dense madrid_lo madrid_hi  noise  re-slices/s (recovered/s): madrid_lo, dense, noise
+default image                           96.0%/0    96.1%/0    36.8%/0    41.5%/0    35.7%/0        1646      1571      0  0 (0.0), 0 (0.0), 0 (0.0)
+default image + coherent                96.4%/0    96.6%/0    45.4%/0    48.8%/0    42.3%/0        1918      1872      0  338 (26.9), 495 (109.0), 0 (0.0)
+soft rescue                             96.2%/0    96.4%/0    43.4%/0    46.2%/0    40.1%/0        1715      1685      0  0 (0.0), 0 (0.0), 0 (0.0)
+soft rescue + coherent                  97.1%/0    97.8%/0    62.5%/0    62.0%/0    54.3%/0        2086      2063      0  333 (31.6), 447 (183.6), 0 (0.0)
+fix2 image (soft, 2-bit, known addr)    96.0%/0    96.1%/0    36.8%/0    41.5%/0    35.7%/0        1755      1718      0  0 (0.0), 0 (0.0), 0 (0.0)
+fix2 image + coherent                   96.4%/0    96.6%/0    45.4%/0    48.8%/0    42.3%/0        2077      2056      0  331 (28.6), 495 (109.0), 0 (0.0)
+fix2 image minus 2-bit fix              96.0%/0    96.1%/0    36.8%/0    41.5%/0    35.7%/0        1708      1676      0  0 (0.0), 0 (0.0), 0 (0.0)
+fix2 image minus 2-bit + coherent       96.4%/0    96.6%/0    45.4%/0    48.8%/0    42.3%/0        2062      2043      0  334 (30.6), 495 (109.0), 0 (0.0)
