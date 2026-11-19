@@ -50,6 +50,8 @@
 #ifndef COH_DEDUP
 #define COH_DEDUP 4u                // a second look within this many ticks of the last one is the same frame
 #endif
+#define ES_LOST_HOLD 288u           // samples a long frame lasts (120 us): one lost squitter is counted once
+#define ES_LOST_SAME 3u             // a decode this close after a "lost" one is the same frame
 
 // Pulse chip start offsets within the preamble, in U: 0, 1.0, 3.5, 4.5 us.
 static const uint8_t PULSE_U[4] = {0, 12, 42, 54};
@@ -90,6 +92,18 @@ static inline uint32_t chip_sum(const uint16_t *m, uint32_t i, uint32_t f)
     return (5 - f) * (uint32_t)m[i] + (1 + f) * (uint32_t)m[i + 1];
 }
 
+// The chip that starts u fifths of a sample after m[0], for a u the compiler
+// knows: the sample index and the two weights fold to constants. PULSES_AT(f)
+// and QUIET_AT(f) are the four pulse chips and the twelve quiet chips of a
+// preamble that starts f fifths in - the same positions PULSE_U and QUIET_U
+// list above, which the tables t_pi.. hold for the plain form.
+#define CHIP_AT(u) ((uint32_t)(5 - (u) % 5) * m[(u) / 5] + (uint32_t)(1 + (u) % 5) * m[(u) / 5 + 1])
+#define PULSES_AT(f) (CHIP_AT((f) + 0) + CHIP_AT((f) + 12) + CHIP_AT((f) + 42) + CHIP_AT((f) + 54))
+#define QUIET_AT(f)                                                                                  \
+    (CHIP_AT((f) + 6) + CHIP_AT((f) + 18) + CHIP_AT((f) + 24) + CHIP_AT((f) + 30) + CHIP_AT((f) + 36) + \
+     CHIP_AT((f) + 48) + CHIP_AT((f) + 60) + CHIP_AT((f) + 66) + CHIP_AT((f) + 72) + CHIP_AT((f) + 78) + \
+     CHIP_AT((f) + 84) + CHIP_AT((f) + 90))
+
 // Slice bits [from, to) of a frame whose data starts at sample m[0] + f0/5.
 // Sets bits in msg, stores |first chip - second chip| per bit in conf, and
 // returns the sum of those confidences.
@@ -103,17 +117,45 @@ static uint32_t slice_bits(const uint16_t *m, uint32_t f0, int from, int to,
     int k;
     for (k = from; k < to; k++)
     {
-        uint32_t ib = i + 1, fb = f + 1; // second chip: +6 U
-        int32_t a, b, d;
+        int32_t d;
         uint32_t ad;
+#ifdef MODE_S_2400_PLAIN
+        // As the model reads: the bit's first chip minus its second.
+        uint32_t ib = i + 1, fb = f + 1; // second chip: +6 U
         if (fb >= 5)
         {
             fb -= 5;
             ib++;
         }
-        a = (int32_t)chip_sum(m, i, f);
-        b = (int32_t)chip_sum(m, ib, fb);
-        d = a - b;
+        d = (int32_t)chip_sum(m, i, f) - (int32_t)chip_sum(m, ib, fb);
+#else
+        // The same difference with the two chip sums written out. For a
+        // chip at fraction f the first is (5-f) m[i] + (1+f) m[i+1] and the
+        // second, one sample and one fifth on, (4-f) m[i+1] + (2+f) m[i+2]
+        // (at f = 4 it starts on a sample: 5 m[i+2] + m[i+3]), so the bit is
+        // a three- or four-tap filter whose weights depend on f alone.
+        // Half the work of two chip sums; harness/check_stream.py holds the
+        // two forms to identical output.
+        const int32_t m0 = m[i], m1 = m[i + 1], m2 = m[i + 2];
+        switch (f)
+        {
+        case 0:
+            d = 5 * m0 - 3 * m1 - 2 * m2;
+            break;
+        case 1:
+            d = 4 * m0 - m1 - 3 * m2;
+            break;
+        case 2:
+            d = 3 * m0 + m1 - 4 * m2;
+            break;
+        case 3:
+            d = 2 * m0 + 3 * m1 - 5 * m2;
+            break;
+        default:
+            d = m0 + 5 * m1 - 5 * m2 - (int32_t)m[i + 3];
+            break;
+        }
+#endif
         if (d > 0)
             msg[k >> 3] |= (unsigned char)(0x80 >> (k & 7));
         ad = (uint32_t)(d < 0 ? -d : d);
@@ -335,7 +377,7 @@ void mode_s_detect_2400(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_c
         int f, k, a;
         unsigned char msg[MODE_S_LONG_MSG_BYTES], first_msg[MODE_S_LONG_MSG_BYTES];
         uint32_t conf[LONG_BITS], first_conf[LONG_BITS];
-        uint32_t delta = 0, first_delta = 0, signal = 0;
+        uint32_t delta = 0, first_delta = 0, signal = 0, ref_before;
         int nbits = 0, first_bits = 0, attempted = 0, first_f = 0;
         struct mode_s_msg mm;
 
@@ -374,6 +416,7 @@ void mode_s_detect_2400(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_c
         // ---- 2. timing: rank the five sub-sample offsets -------------------
         // by the energy in the four pulse chips; the true alignment
         // maximises it.
+#ifdef MODE_S_2400_PLAIN
         for (f = 0; f < 5; f++)
         {
             uint32_t h = 0;
@@ -382,6 +425,17 @@ void mode_s_detect_2400(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_c
             H[f] = h;
             order[f] = f;
         }
+#else
+        // The same sums with every chip position worked out by the
+        // compiler (PULSES_AT): no table to read, no loop.
+        H[0] = PULSES_AT(0);
+        H[1] = PULSES_AT(1);
+        H[2] = PULSES_AT(2);
+        H[3] = PULSES_AT(3);
+        H[4] = PULSES_AT(4);
+        for (f = 0; f < 5; f++)
+            order[f] = f;
+#endif
         for (k = 1; k < 5; k++) // sort offsets by pulse energy, best first
         {
             int o = order[k];
@@ -407,8 +461,29 @@ void mode_s_detect_2400(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_c
             // Full preamble test at this alignment: the mean of the four
             // pulse chips must be at least pre/100 times the mean of the
             // twelve quiet chips:  (H/4) >= (pre/100) * (L/12)
+#ifdef MODE_S_2400_PLAIN
             for (k = 0; k < 12; k++)
                 l += chip_sum(m + t_qi[f][k], 0, t_qf[f][k]);
+#else
+            switch (f)
+            {
+            case 0:
+                l = QUIET_AT(0);
+                break;
+            case 1:
+                l = QUIET_AT(1);
+                break;
+            case 2:
+                l = QUIET_AT(2);
+                break;
+            case 3:
+                l = QUIET_AT(3);
+                break;
+            default:
+                l = QUIET_AT(4);
+                break;
+            }
+#endif
             if (H[f] * 300u < pre * l)
                 continue;
             delta = slice_frame(m, (uint32_t)f, msg, conf, &nbits);
@@ -469,13 +544,16 @@ void mode_s_detect_2400(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_c
             if (coh_second_look(self, n, first_f, first_msg, first_delta, &mm))
                 delta = first_delta;
         }
-        if (!mm.crcok && self->coh_fix)
+        ref_before = self->coh_ref;
+        if (!mm.crcok)
         {
             // Noise reference: the lower quartile of the bit delta of failed
             // candidates (x16), tracked by stepping up a little when a
             // candidate is above it and three times as far down when below.
             // Most failed candidates are noise, and those that are real
             // signals sit above the quartile, so traffic does not drag it up.
+            // (Kept whether or not the coherent look is on: the squitter
+            // accounting below uses it too. Nothing else reads it.)
             uint32_t d16 = first_delta << 4;
             if (!self->coh_ref)
                 self->coh_ref = d16;
@@ -490,17 +568,50 @@ void mode_s_detect_2400(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_c
         }
 
         // ---- accounting and delivery (mirrors mode_s_detect) -----------------
+        // stat_crc_fail counts EVERY candidate that did not decode. At this
+        // demodulator's thresholds most of them are not Mode S frames at all
+        // (Mode A/C replies, pulse noise), and their number does not depend
+        // on the gain: stat_crc_fail / stat_preambles is close to 1 whatever
+        // the receiver is doing, and is NOT an error rate. The figures meant
+        // for that are stat_es_ok and stat_es_lost.
         self->stat_preambles++;
         if (mm.crcok)
         {
             self->stat_crc_ok++;
             self->stat_signal_sum += signal;
             self->stat_delta_sum += delta;
+            if (signal >= MODE_S_LOUD_LEVEL)
+                self->stat_loud++;
+            if (mm.msgtype == 17 || mm.msgtype == 18)
+            {
+                uint64_t at = self->stream_base + n + 1u;
+                self->stat_es_ok++;
+                // The same frame, counted as lost a sample or two earlier on
+                // a neighbouring alignment, was not lost after all.
+                if (self->es_lost_at && at - self->es_lost_at <= ES_LOST_SAME && self->stat_es_lost)
+                    self->stat_es_lost--;
+                self->es_lost_at = 0;
+            }
         }
         else
         {
             self->stat_crc_fail++;
             self->stat_fail_delta_sum += first_delta;
+            // A squitter that was there and could not be read: the slice
+            // says DF17 or DF18, and its bits stand at least twice as far
+            // apart as those of the run of failed candidates (the level the
+            // coherent look asks for too). Counted once per frame: whatever
+            // else fails inside the 120 us it lasts is the same frame.
+            if (first_bits == LONG_BITS && ref_before && (uint64_t)first_delta * 8u >= ref_before &&
+                ((first_msg[0] >> 3) == 17 || (first_msg[0] >> 3) == 18))
+            {
+                uint64_t at = self->stream_base + n + 1u;
+                if (!self->es_lost_at || at - self->es_lost_at >= ES_LOST_HOLD)
+                {
+                    self->stat_es_lost++;
+                    self->es_lost_at = at;
+                }
+            }
         }
         if (self->check_crc == 0 || mm.crcok)
         {

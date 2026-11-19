@@ -115,7 +115,47 @@ typedef struct
     volatile uint32_t stat_coh_abort; // ... of which stopped early: no single carrier in the frame
     volatile uint32_t stat_coh_ok;    // frames recovered by the re-slice ...
     volatile uint32_t stat_coh_soft;  // ... of which needed the soft rescue as well
+
+    // Level statistics and squitter accounting, for gain control. Nothing
+    // here changes what is decoded. The application reads the counters once
+    // per evaluation window and clears them.
+    uint32_t *lvl_hist;      // NULL = off. MODE_S_LVL_BINS counters supplied by the application:
+                             // every MODE_S_LVL_STRIDE-th I and Q sample is counted by its distance
+                             // from mid-scale in ADC counts, 0-127 (127 = the sample is on a rail)
+    uint32_t lvl_skip;       // samples to pass before the next one counted (carried between chunks)
+    volatile uint32_t stat_loud;    // CRC-ok frames whose pulses are within 3 dB of ADC full scale
+    volatile uint32_t stat_es_ok;   // CRC-ok DF17/18 frames
+    volatile uint32_t stat_es_lost; // DF17/18 frames that were clearly there and could not be read
+                                    // (2.4 Msps demodulator; see mode_s_2400.c)
+    uint64_t es_lost_at;     // absolute sample of the last one counted, plus 1 (0 = none)
 } mode_s_t;
+
+// Level statistics. One I/Q pair in MODE_S_LVL_STRIDE is looked at (a prime,
+// so the choice does not lock to anything periodic in the signal).
+#define MODE_S_LVL_BINS 128
+#define MODE_S_LVL_STRIDE 67u
+// A frame is "loud" when its mean pulse level (the signal figure handed to
+// stat_signal_sum, 360 per ADC count) is within 3 dB of a full-scale tone,
+// 127.5 counts: 127.5 * 360 / sqrt(2) = 32456.
+#define MODE_S_LOUD_LEVEL 32456u
+
+// What the histogram says. noise: rms noise per rail in ADC counts, from the
+// level below which half of the samples lie, taken as Gaussian - signals
+// occupy the other half first, so traffic moves it little (a few percent at
+// 10 % occupancy). Below about one count the ADC's own steps are all that is
+// left to see and the figure only means "under one count". clip: fraction of
+// the samples that sat on a rail. Both are 0 when 'samples' is 0.
+typedef struct
+{
+    uint32_t samples; // I and Q samples counted
+    float noise;      // rms per rail, ADC counts
+    float clip;       // 0..1
+} mode_s_level_t;
+void mode_s_level_read(const uint32_t *hist, mode_s_level_t *out);
+// Headroom: how far full scale is above the noise, in dB (0 if noise is 0).
+float mode_s_level_headroom_db(float noise);
+// Called by the streaming front ends for every chunk; public for tests.
+void mode_s_level_count(mode_s_t *self, const unsigned char *iq, uint32_t n);
 
 // The struct we use to store information about a decoded message
 struct mode_s_msg
@@ -169,6 +209,11 @@ void mode_s_init(mode_s_t *self);
 void mode_s_compute_magnitude_vector(unsigned char *data, uint16_t *mag, uint32_t size);
 void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_callback_t);
 void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg);
+
+// References the faster forms in mode-s.c are tested against (test_fix_c).
+uint16_t mode_s_magnitude_reference(unsigned char i_raw, unsigned char q_raw);
+uint32_t mode_s_checksum_reference(unsigned char *msg, int bits);
+uint32_t mode_s_checksum(unsigned char *msg, int bits);
 
 // CRC-24 over the whole frame (data + parity), one table step per byte.
 // 0 exactly when the frame is valid; otherwise the error syndrome.

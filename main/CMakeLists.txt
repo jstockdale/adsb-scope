@@ -21,6 +21,17 @@ set_source_files_properties(tuner_r82xx.c "class_driver.c"
     "-Wno-unused-function -Wno-unused-variable -Wno-incompatible-pointer-types"
 )
 
+# The decoder runs on every sample, 2.4 million a second, and is compiled for
+# speed whatever the project's level is (it is -Og, for the debugger). At
+# -Og the same code takes about 30 % more instructions, which is the
+# difference between a decoder that has a core to itself with room to spare
+# and one that is close to filling it (docs/DECODER.md section 5.9).
+set_source_files_properties(
+    "${COMPONENT_DIR}/${project_path}mode-s.c"
+    "${COMPONENT_DIR}/${project_path}mode_s_2400.c"
+    "${COMPONENT_DIR}/${project_path}mode_s_coh.c"
+    PROPERTIES COMPILE_OPTIONS "-O2")
+
 target_compile_options(
     ${COMPONENT_LIB}
     PRIVATE -Wno-error=unused-const-variable -Wno-error=delete-non-virtual-dtor

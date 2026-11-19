@@ -18,8 +18,33 @@
 
 #define MODE_S_ICAO_CACHE_TTL 60 // Time to live of cached addresses.
 
-static uint16_t maglut[129 * 129 * 2];
+// I/Q -> magnitude table, indexed by the sample pair as it lies in the
+// buffer: I + 256 * Q. One load per sample; the older table (indexed by
+// |I - 127| and |Q - 127|) cost two subtractions, two absolute values and a
+// multiplication to reach, a tenth of the decoder's time at 2.4 Msps. The
+// values are the same ones. 128 kB: on the device it lives in PSRAM (the
+// part of it that noise touches fits the cache), where the older table took
+// 66 kB of internal RAM.
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#include "esp_attr.h"
+#ifndef CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY
+#error "mode-s.c keeps a 128 kB table in PSRAM: set CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y"
+#endif
+#define MODE_S_IN_PSRAM EXT_RAM_BSS_ATTR
+#else
+#define MODE_S_IN_PSRAM
+#endif
+static MODE_S_IN_PSRAM uint16_t maglut[65536];
 static int maglut_initialized = 0;
+
+// The magnitude of one sample pair, computed the long way. Fills the table,
+// and stands as the reference the table is tested against.
+uint16_t mode_s_magnitude_reference(unsigned char i_raw, unsigned char q_raw)
+{
+    int i = i_raw - 127, q = q_raw - 127;
+    return (uint16_t)round(sqrt(i * i + q * q) * 360);
+}
 
 // =============================== Initialization ===========================
 
@@ -71,6 +96,12 @@ void mode_s_init(mode_s_t *self)
     self->stat_coh_abort = 0;
     self->stat_coh_ok = 0;
     self->stat_coh_soft = 0;
+    self->lvl_hist = NULL;
+    self->lvl_skip = 0;
+    self->stat_loud = 0;
+    self->stat_es_ok = 0;
+    self->stat_es_lost = 0;
+    self->es_lost_at = 0;
     mode_s_stream_reset(self);
 
     // Allocate the ICAO address cache. We use two uint32_t for every entry
@@ -86,13 +117,17 @@ void mode_s_init(mode_s_t *self)
     // any resolution.
     if (!maglut_initialized)
     {
-        for (i = 0; i <= 128; i++)
-        {
-            for (q = 0; q <= 128; q++)
-            {
-                maglut[i * 129 + q] = round(sqrt(i * i + q * q) * 360);
-            }
-        }
+        // The magnitude depends on |I - 127| and |Q - 127| only: work out
+        // the quarter with both at or above 127 (the square roots are in
+        // double precision, which this processor does in software), then
+        // copy it to the other three.
+        for (q = 127; q < 256; q++)
+            for (i = 127; i < 256; i++)
+                maglut[i + 256 * q] = mode_s_magnitude_reference((unsigned char)i, (unsigned char)q);
+        for (q = 0; q < 256; q++)
+            for (i = 0; i < 256; i++)
+                if (i < 127 || q < 127)
+                    maglut[i + 256 * q] = maglut[(i < 127 ? 254 - i : i) + 256 * (q < 127 ? 254 - q : q)];
         maglut_initialized = 1;
     }
 }
@@ -132,7 +167,18 @@ uint32_t mode_s_checksum_table[] = {
     0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000,
     0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000};
 
+// The parity a frame's data bits call for: what its last three bytes hold
+// when it is valid. That is the byte-wise CRC-24 (mode_s_crc_syndrome) run
+// over the data bytes alone - eleven table steps for a long frame where the
+// loop over the table above took one per bit, a twentieth of the decoder's
+// time at 2.4 Msps. test_fix_c checks the two forms agree.
 uint32_t mode_s_checksum(unsigned char *msg, int bits)
+{
+    return mode_s_crc_syndrome(msg, bits - 24);
+}
+
+// The same, bit by bit from the parity table: the historical form.
+uint32_t mode_s_checksum_reference(unsigned char *msg, int bits)
 {
     uint32_t crc = 0;
     int offset = (bits == 112) ? 0 : (112 - 56);
@@ -696,21 +742,11 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
 // Turn I/Q samples pointed by `data` into the magnitude vector pointed by `mag`
 void mode_s_compute_magnitude_vector(unsigned char *data, uint16_t *mag, uint32_t size)
 {
-    uint32_t j;
+    uint32_t j, n = size / 2;
 
-    // Compute the magnitude vector. It's just SQRT(I^2 + Q^2), but we rescale
-    // to the 0-255 range to exploit the full resolution.
-    for (j = 0; j < size; j += 2)
-    {
-        int i = data[j] - 127;
-        int q = data[j + 1] - 127;
-
-        if (i < 0)
-            i = -i;
-        if (q < 0)
-            q = -q;
-        mag[j / 2] = maglut[i * 129 + q];
-    }
+    // SQRT(I^2 + Q^2) * 360 from the table (see maglut above).
+    for (j = 0; j < n; j++)
+        mag[j] = maglut[data[2 * j] | ((unsigned)data[2 * j + 1] << 8)];
 }
 
 // Return -1 if the message is out of fase left-side
@@ -992,6 +1028,10 @@ void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_callba
                 // These preamble samples are never modified by phase correction
                 // (which only affects data bits at offset >= MODE_S_PREAMBLE_US*2).
                 self->stat_signal_sum += (uint32_t)(mag[j] + mag[j+2] + mag[j+7] + mag[j+9]) / 4;
+                if ((uint32_t)(mag[j] + mag[j+2] + mag[j+7] + mag[j+9]) / 4 >= MODE_S_LOUD_LEVEL)
+                    self->stat_loud++;
+                if (mm.msgtype == 17 || mm.msgtype == 18)
+                    self->stat_es_ok++;
                 // Bit delta: average |high−low| across all bit pairs in the message.
                 // Computed on original (restored) magnitudes — represents actual
                 // received SNR. Higher = cleaner decode. Noise floor at 2550.
@@ -1051,6 +1091,8 @@ void mode_s_stream_reset(mode_s_t *self)
     self->stream_base = 0;
     self->iq_tail_valid = 0;
     self->coh_last_tick = 0;
+    self->es_lost_at = 0;
+    self->lvl_skip = 0;
 }
 
 void mode_s_stream_gap(mode_s_t *self, uint64_t lost_samples)
@@ -1060,6 +1102,71 @@ void mode_s_stream_gap(mode_s_t *self, uint64_t lost_samples)
     self->stream_tail = 0;
     self->stream_samples += lost_samples;
     self->iq_tail_valid = 0;
+}
+
+// ---- Level statistics (mode-s.h) -------------------------------------------
+
+void mode_s_level_count(mode_s_t *self, const unsigned char *iq, uint32_t n)
+{
+    uint32_t *h = self->lvl_hist;
+    uint32_t k = self->lvl_skip;
+    if (!h)
+        return;
+    while (k < n)
+    {
+        unsigned v = iq[2 * k], w = iq[2 * k + 1];
+        h[v >= 128 ? v - 128 : 127 - v]++;
+        h[w >= 128 ? w - 128 : 127 - w]++;
+        k += MODE_S_LVL_STRIDE;
+    }
+    self->lvl_skip = k - n;
+}
+
+// Inverse error function, Winitzki's closed form (a = 0.147). Within 0.2 %
+// over the range used here, far inside what the estimate itself is good for.
+static float erfinv_approx(float x)
+{
+    const float a = 0.147f;
+    float l = logf(1.0f - x * x);
+    float t = 2.0f / (3.14159265f * a) + 0.5f * l;
+    return sqrtf(sqrtf(t * t - l / a) - t);
+}
+
+void mode_s_level_read(const uint32_t *hist, mode_s_level_t *out)
+{
+    uint64_t n = 0, below = 0;
+    int k;
+    out->samples = 0;
+    out->noise = 0;
+    out->clip = 0;
+    for (k = 0; k < MODE_S_LVL_BINS; k++)
+        n += hist[k];
+    if (n == 0)
+        return;
+    out->samples = (uint32_t)(n > 0xffffffffu ? 0xffffffffu : n);
+    out->clip = (float)hist[MODE_S_LVL_BINS - 1] / (float)n;
+    // Bin k holds the samples whose distance from mid-scale is in [k, k+1)
+    // counts, so the sum of bins 0..k-1 is P(|v| < k) exactly. Take the
+    // first k where that reaches one half and solve erf(k / (s sqrt 2)) for s.
+    for (k = 1; k < MODE_S_LVL_BINS; k++)
+    {
+        below += hist[k - 1];
+        if (2 * below >= n)
+            break;
+    }
+    {
+        float c = (float)below / (float)n;
+        if (c > 0.9999f)
+            c = 0.9999f; // everything inside the first step: under one count
+        if (c < 0.01f)
+            c = 0.01f;   // half of the samples on the rails: hopeless, but finite
+        out->noise = (float)k / (1.41421356f * erfinv_approx(c));
+    }
+}
+
+float mode_s_level_headroom_db(float noise)
+{
+    return noise > 0 ? 20.0f * log10f(127.5f / noise) : 0.0f;
 }
 
 // See mode-s.h. Layout of 'mag' during a call:
@@ -1086,6 +1193,8 @@ static void stream_run(mode_s_t *self, unsigned char *iq, uint32_t iq_bytes,
     uint32_t first_unexamined, keep_from;
 
     mode_s_compute_magnitude_vector(iq, mag + tail, n * 2);
+    if (self->lvl_hist)
+        mode_s_level_count(self, iq, n);
     self->stream_base = self->stream_samples - tail;
     self->stream_samples += n;
 
