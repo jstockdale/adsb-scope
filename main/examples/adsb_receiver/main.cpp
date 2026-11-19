@@ -4472,7 +4472,17 @@ extern "C" void app_main(void)
         printf("[USB] WARNING: failed to reserve DMA block\n");
     }
 
-    XL9535->begin();
+    // The expander keeps its supply through a reset of the P4. A reset in
+    // the middle of a transfer (after flashing, say, with meshy_rx reading
+    // it a thousand times a second) leaves it holding the data line, and
+    // the first probe times out; a few tens of milliseconds and a bus reset
+    // or two later it answers. Its pins are the screen and touch resets
+    // and the power enables set up below, so wait for it rather than carry
+    // on with every one of those writes failing.
+    for (int attempt = 1; !XL9535->begin() && attempt < 5; attempt++) {
+        printf("[XL9535] no answer at start-up (attempt %d of 5), trying again\n", attempt);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
 
     XL9535->pin_mode(XL9535_SCREEN_RST, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
     XL9535->pin_mode(XL9535_TOUCH_RST, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);

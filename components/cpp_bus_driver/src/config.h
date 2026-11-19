@@ -67,7 +67,7 @@
 #include "tool.h"
 
 // #define CPP_BUS_DRIVER_LOG_LEVEL_DEBUG  // disabled — suppresses raw NMEA sentence dump
-#define CPP_BUS_DRIVER_LOG_LEVEL_INFO
+// #define CPP_BUS_DRIVER_LOG_LEVEL_INFO   // disabled — two lines a second from the GNSS parser, a dozen per bus at start-up
 #define CPP_BUS_DRIVER_LOG_LEVEL_BUS
 #define CPP_BUS_DRIVER_LOG_LEVEL_CHIP
 

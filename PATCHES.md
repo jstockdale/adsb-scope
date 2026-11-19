@@ -124,3 +124,11 @@ reviewable.  Contents:
   switching).  Upstream later implemented the same idea independently
   (`set_clock_reconfig`, cbd 2026-04-14) – noted for any future rebase.
 - `dma_desc_num = 6` for I2S channel config; comment normalization.
+- **Log levels (`src/config.h`).**  `DEBUG` off (it dumps every NMEA
+  sentence) and, since coh3, `INFO` off as well: it printed two lines a
+  second from the GNSS parser and a dozen per bus at start-up, each about
+  130 characters on a 115200-baud console.  `BUS` and `CHIP` – the levels
+  failures are reported at – stay on.  (The build the first device test
+  replaced, `5b1dbb7-dirty` of 2026-04-18, did not print them either.)
+  Re-checked 2026-11-18: the patch applies to a fresh clone at the pin and
+  the result is byte-identical to `components/cpp_bus_driver`.
