@@ -8,7 +8,9 @@
 #                 (test_link), and - against a simulated device on a
 #                 pseudo-terminal - the logger (link/check_fastlog.py, 2 min)
 #                 and the web app's own serial code (link/check_page.js,
-#                 4 min; needs node 18+, skipped with a notice without it)
+#                 4 min) and its flashing with "keep settings"
+#                 (link/check_page_flash.js, 30 s); the two web app tests
+#                 need node 18+ and are skipped with a notice without it
 #   make check-quick   everything in check except the two that take minutes
 #   make old_batch_size IDF_PATH=...   size of the pre-r7 feeder's batches,
 #                 built with ESP-IDF's own cJSON (optional, not part of check)
@@ -85,8 +87,8 @@ check: all
 	./test_fmt
 	./test_link
 	$(PYTHON) link/check_fastlog.py
-	@if command -v node >/dev/null 2>&1; then node link/check_page.js; \
-	 else echo "SKIPPED: link/check_page.js (the web app's serial code against the simulated device) - node 18 or later is not installed"; fi
+	@if command -v node >/dev/null 2>&1; then node link/check_page_flash.js && node link/check_page.js; \
+	 else echo "SKIPPED: link/check_page_flash.js and link/check_page.js (the web app's own code) - node 18 or later is not installed"; fi
 
 check-quick: all
 	$(PYTHON) gen_syndrome_tables.py /tmp/mode_s_syndromes.check.h
@@ -98,6 +100,8 @@ check-quick: all
 	sh gain/check_gain.sh
 	./test_fmt
 	./test_link
+	@if command -v node >/dev/null 2>&1; then node link/check_page_flash.js; \
+	 else echo "SKIPPED: link/check_page_flash.js (the web app's flashing code) - node 18 or later is not installed"; fi
 
 bench: all
 	$(PYTHON) bench_fix.py

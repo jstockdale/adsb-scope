@@ -54,6 +54,8 @@ feeder tests, `../docs/UPLINK.md`.
 | `link/sim_device.c` | a stand-in for the device's console on a pseudo-terminal, running `console_link.c`: wire speed, garbage on a speed mismatch, reset on open, older firmware, download mode |
 | `link/check_fastlog.py` | `../tools/adsb-fastlog.py` and the bare speed protocol against `sim_device`, ten cases; part of `make check` → `results/link.txt` |
 | `link/check_page.js` | the web app's own script (`adsb_scope.htm`, run in Node) against `sim_device`, nine cases; part of `make check` when Node is installed → `results/link.txt` |
+| `link/check_page_flash.js` | the web app's flashing code against a stand-in for esptool-js that writes to a flash image held in the test: "keep settings" in twelve cases (`IMAGE=<merged .bin>` for a real image); part of `make check` and `make check-quick` when Node is installed → `results/link.txt` |
+| `link/page_env.js` | loads the web app's whole script into Node with the browser's objects stubbed, for the two tests above |
 | `experiments/cost_app_rv32.py` | what a decoded message and a list refresh cost in the device's instructions, before and after coh4 (needs the ESP-IDF toolchain and qemu-riscv32) → `results/cost_app_rv32.txt` |
 | `results/` | CSVs and plot from the runs reported in `docs/DECODER.md` |
 
@@ -253,10 +255,12 @@ make and Python 3, the page test in the second also Node 18 or later
 cd ~/adsb-scope/harness && make check-quick
 ```
 
-Seconds. Everything `make check` runs except the two below, including
-`test_fmt` (number text against `printf`, distance and bearing against the
-old double-precision `haversine()`) and `test_link` (the console-speed
-state machine). `./test_fmt --report` prints the figures.
+Half a minute. Everything `make check` runs except the two below,
+including `test_fmt` (number text against `printf`, distance and bearing
+against the old double-precision `haversine()`), `test_link` (the
+console-speed state machine) and, with Node, `link/check_page_flash.js`
+(the web app's flashing, with and without "keep settings").
+`./test_fmt --report` prints the figures.
 
 ```sh
 cd ~/adsb-scope/harness && make check

@@ -48,7 +48,7 @@ check_fastlog: ok
   ok    the port was opened at 115200, then once more at 921600 (115200, 921600)
   ok    the page says what it is doing
   ok    the version read from the first boot log is kept
-  ok    lines arrive at 921600 (1251 in 5 s)
+  ok    lines arrive at 921600 (1250 in 5 s)
   ok    none missing among the last 1000 (0)
   ok    keepalive answers do not reach the log or the parser
   ok    the boot log at the wrong speed is not shown as garbage
@@ -87,3 +87,55 @@ check_fastlog: ok
   ok    four writes asked for at once go out one after another
 
 check_page: ok
+
+# link/check_page_flash.js: the web app's flashing, with and without "keep settings", against a stand-in for esptool-js
+1. keep settings (the default) on a device with the current layout
+  ok    the flash completes
+  ok    the settings partition (0x9000 to 0xEFFF) is as it was, byte for byte
+  ok    everything else up to the end of the image is the new image
+  ok    nothing beyond the image is touched
+  ok    two writes: from 0x0 and from 0xF000 (0x0, 0xf000)
+  ok    the device's partition table was read first
+  ok    the log says so
+  ok    no question asked
+2. keep settings on a device still on the April layout (two OTA slots)
+  ok    new boot loader, table and application; the settings partition untouched
+3. "Keep settings" unticked
+  ok    the whole image is written from 0x0, as before
+  ok    the settings partition is erased
+  ok    one write, no read of the device
+  ok    the log says the settings were reset
+4. keep settings, but the device has its settings somewhere else – and the user says go on
+  ok    the page asks, and says where the device has them
+  ok    then the whole image is written
+  ok    and the log says the settings are reset
+5. the same, and the user says no
+  ok    nothing is written
+  ok    and the device is restarted into the firmware it has
+  ok    the log says it was not flashed
+6. keep settings on a device that has never been flashed
+  ok    the image is written around an empty settings partition
+  ok    no question; the log says there was nothing to keep
+7. the device's partition table cannot be read
+  ok    the settings partition is left unwritten all the same
+  ok    and the log says the table could not be read
+8. the boot loader does not answer at the faster speed
+  ok    tried at 460800, done at 115200
+  ok    settings kept
+  ok    the faster speed is remembered as not working
+9. a write fails at the faster speed
+  ok    the whole flash is done again at 115200
+  ok    the result is complete, settings kept
+  ok    the device's table is not read a second time
+10. keep settings with a file that is not a merged image
+  ok    refused before the port is touched
+  ok    the log says why
+11. the same file with "Keep settings" unticked, and the user says no to the warning
+  ok    the page warns that it does not look like a merged image
+  ok    and writes nothing
+12. the setting is kept between visits
+  ok    on by default
+  ok    off once unticked, and stored
+(image: made up, 365536 bytes)
+
+check_page_flash: ok

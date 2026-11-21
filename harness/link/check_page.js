@@ -13,9 +13,9 @@
 //
 // usage: node check_page.js        (make check runs it; about 3 minutes)
 // needs: node 18 or later, ./sim_device built, stty
-const fs = require('fs'), vm = require('vm'), path = require('path'), cp = require('child_process');
+const fs = require('fs'), path = require('path'), cp = require('child_process');
 const HERE = __dirname;
-const PAGE = path.join(HERE, '..', '..', 'main', 'examples', 'adsb_receiver', 'adsb_scope.htm');
+const { loadPage, PAGE } = require('./page_env.js');
 const SIM = path.join(HERE, '..', 'sim_device');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const fails = [];
@@ -23,9 +23,6 @@ function check(cond, what) { console.log((cond ? '  ok    ' : '  FAIL  ') + what
 
 for (const [tool, hint] of [[SIM, 'run make in harness/'], [PAGE, 'the web app']]) if (!fs.existsSync(tool)) { console.error('error: ' + tool + ' not found (' + hint + ')'); process.exit(2); }
 if (cp.spawnSync('stty', ['--version']).status !== 0) { console.error('error: stty not found'); process.exit(2); }
-
-const html = fs.readFileSync(PAGE, 'utf8');
-const script = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]).sort((a, b) => b.length - a.length)[0];
 
 function startSim(args) {
   return new Promise((res, rej) => {
@@ -84,32 +81,6 @@ class MockPort {
     fs.closeSync(this.fd); this.fd = -1; this.readable = null; this.writable = null; this.locked = false;
   }
   getInfo() { return {}; }
-}
-
-// The page, in a context of its own
-function loadPage(port, settings) {
-  const U = new Proxy(function () {}, {
-    get: (t, k) => { if (k === Symbol.toPrimitive) return () => ''; if (k === 'then') return undefined; if (k === Symbol.iterator) return function* () {}; if (k === 'length') return 0; return U; },
-    apply: () => U, construct: () => U, set: () => true, has: () => true,
-  });
-  const store = new Map(Object.entries(settings || {}));
-  const ctx = { console, setTimeout, setInterval, clearTimeout, clearInterval, TextDecoder, TextEncoder, URL, Blob: U, Promise, Date, Math, JSON,
-    document: U, window: U, L: U, mqtt: U, THREE: U, Image: U, Audio: U, AudioContext: U, WebSocket: U, Worker: U, ResizeObserver: U, IntersectionObserver: U,
-    MutationObserver: U, XMLHttpRequest: U, FileReader: U, CustomEvent: U, Event: U, HTMLElement: U, screen: U, history: U, innerWidth: 1200, innerHeight: 800, devicePixelRatio: 1,
-    location: { href: 'http://localhost/', search: '', hash: '', protocol: 'http:', host: 'localhost' },
-    navigator: { serial: { requestPort: async () => port }, userAgent: 'node' },
-    localStorage: { getItem: k => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: k => store.delete(k) },
-    fetch: async () => { throw new Error('offline'); }, alert: () => {}, confirm: () => true, requestAnimationFrame: () => 0, performance: { now: () => Date.now() },
-    addEventListener: () => {}, matchMedia: () => U, getComputedStyle: () => U, crypto: require('crypto').webcrypto,
-    atob: s => Buffer.from(s, 'base64').toString('binary'), btoa: s => Buffer.from(s, 'binary').toString('base64'),
-    __logs: [], __lines: [] };
-  ctx.globalThis = ctx; ctx.self = ctx;
-  vm.createContext(ctx);
-  vm.runInContext(script, ctx, { timeout: 10000, filename: 'adsb_scope.htm.js' });
-  // Listen in on what the page logs and parses, without changing it
-  vm.runInContext('{const a=addLog,p=parse;addLog=function(l){__logs.push(l);return a(l)};parse=function(l){__lines.push(l);return p(l)}}', ctx);
-  const q = expr => vm.runInContext(expr, ctx);
-  return { ctx, q, logs: ctx.__logs, lines: ctx.__lines };
 }
 
 async function until(fn, ms, step = 100) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (fn()) return true; await sleep(step); } return fn(); }
