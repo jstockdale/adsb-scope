@@ -671,12 +671,12 @@ VENDOR.md / PATCHES.md         provenance and patch mechanism
 
 ## Pending Work
 
-> Items 1–16 and the struck-through list are as they stood in April 2026 (v1.0.8). They have **not been re-checked** against the current tree; what has been added since is under "Since April 2026" below.
+> Items 1–16 and the struck-through list are as they stood in April 2026 (v1.0.8). Items 3, 4, 12, 13 and 15 were settled on 2026-11-21; the others have **not been re-checked** against the current tree. What has been added since is under "Next" and "Since April 2026" below.
 
 1. **PKI DM sending** – `buildPkiTx` with recipient pubkey lookup, DM recipient selector in UI
 2. **Webapp PKI DM display** – show decrypted DM text in Meshy panel
-3. **First WiFi field test** – verify ESP-Hosted init, NTP sync, time_manager end-to-end
-4. **Flash C6 with ESP-Hosted slave firmware** – manual hardware step required for WiFi
+3. ~~First WiFi field test~~ – done: WiFi has run on a device (confirmed by John, 2026-11-21)
+4. ~~Flash C6 with ESP-Hosted slave firmware~~ – done on the unit(s) in use – WiFi could not have run otherwise; still a manual step for every new board (Building from Source)
 5. **tz-embedded open source release** – timezone library as standalone repo
 6. **scope_aircraft_t array consolidation** – three separate 64-slot arrays in lvgl_ui.cpp (~10 KB .bss savings)
 7. **Meshy decode-failed packet logging** – log raw bytes for protocol debugging
@@ -684,10 +684,10 @@ VENDOR.md / PATCHES.md         provenance and patch mechanism
 9. **Meshy rebroadcast** – implement relay behavior for Router/ClientMute roles
 10. **Clock sync indicators** – on-device display of GPS-synced vs NTP-synced status
 11. **Multi-chunk recv sessions** – stream chunks without returning to command mode between each; would cut ~10 minutes overhead from 27MB transfers
-12. **Webapp retry on RECV_ERR** – currently gives up on first error; should retry the failed chunk N times before declaring failure
-13. **Webapp CHUNK v1.1 header** – send `CHUNK <size>` before base64 data (firmware is ready, backward compatible)
+12. ~~Webapp retry on RECV_ERR~~ – done: the upload loop in `adsb_scope.htm` retries a failed chunk up to `MAX_RETRIES` times before aborting (seen in the code, 2026-11-21)
+13. ~~Webapp CHUNK v1.1 header~~ – done: the page sends `CHUNK <size>` before the base64 data (seen in the code, 2026-11-21)
 14. **Strip recv debug diagnostics** – remove `[recv] phase1/phase2` diagnostic output once transfer is proven reliable long-term
-15. **mqtt_feeder forward declaration warning** – minor compiler warning to clean up
+15. ~~mqtt_feeder forward declaration warning~~ – gone: the coh5 build has no warning in `mqtt_feeder` (build log, 2026-11-20)
 16. **Monitor SD card health post-DMA-fence** – long-term validation that AXI bus contention fix eliminates FAT corruption
 33. ~~AXI DMA corruption~~ – fixed: DMA fence in `sd_io_take/give` serializes GP-SPI SD card with ESP-Hosted WiFi SDIO DMA on shared AXI interconnect
 34. ~~Serial file transfer~~ – done: `recv` command with CRC32-verified chunked transfer, resume, CHUNK v1.1 truncation detection, `verify_crc32` with progress
@@ -711,6 +711,12 @@ VENDOR.md / PATCHES.md         provenance and patch mechanism
 30. ~~CLIENT_MUTE blocking TX~~ – fixed: CLIENT_MUTE only suppresses relay, not origination
 31. ~~NVS crash on settings save~~ – fixed: NVS write from PSRAM-stack task crashed on cache disable; now dispatches to internal-RAM helper task
 32. ~~MSC crash on enter~~ – fixed: reordered sd_msc_enter() to stop RTL-SDR before unmounting SD, preventing in-flight SPI DMA from overwriting freed PSRAM
+
+### Next: WiFi and MQTT (agreed 2026-11-21, not started)
+
+- **WiFi + MQTT indicator in the status bar** – today the bar shows a WiFi glyph when connected and nothing otherwise, and says nothing about MQTT. One group: WiFi state, and whether MQTT is actually feeding
+- **WiFi that comes back** – `wifi_hosted.h` gives up for good after 10 reconnect attempts (55 s in all) and waits inside the event handler while it does; replace with a supervisor that retries forever with capped backoff, notices a link that is up but dead, and can power-cycle the C6
+- **More than one network** – a saved list with a priority order instead of the single SSID in the settings; on loss (and at boot) scan and take the best saved network in range; `wifi list/add/remove` on the console, the settings screen and the web app
 
 ### Since April 2026
 
