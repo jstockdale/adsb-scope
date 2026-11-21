@@ -1,0 +1,143 @@
+# page/profile_page.js: the web app's own JavaScript in Node, the browser's objects stubbed (v1.0.10)
+
+== 20 aircraft, 50 lines/s, 10.0 s measured after 3 s warm-up ==
+page JavaScript: 10.5 ms per second (1.0 % of one core here): lines 9.7, timers 0.3, frames 0.5
+per line: 193.7 us   (500 lines)
+
+  own ms/s   with callees   calls/s   function
+      2.60           4.32        51   parse
+      1.16           1.66        50   updAc
+      1.01           8.28        51   handleLine
+      0.98           0.98        51   logFollow
+      0.44           0.44       102   stripAnsi
+      0.36           0.67        51   appendLogLine
+      0.35           2.00        51   addLog
+      0.29           0.29        51   linkLineHook
+      0.18           0.28        70   acStale
+      0.17           0.17        51   logType
+      0.10           0.10        51   recvLineHook
+      0.10           0.10        51   parseDeviceTs
+
+  per second   what the page asks of the browser (document, elements, Leaflet)
+         163   getElementById()
+          96   textContent =
+          71   appendChild()
+          53   className =
+          51   createElement()
+          51   lt =
+          51   display =
+          47   scrollTop =
+          46   setLatLng()
+          22   addLatLng()
+           2   classList.contains()
+           2   title =
+           2   polyline()
+           2   clearLayers()
+           1   divIcon()
+           1   remove()
+           1   innerHTML =
+           1   addLayer()
+
+== 60 aircraft, 300 lines/s, 10.0 s measured after 3 s warm-up ==
+page JavaScript: 23.0 ms per second (2.3 % of one core here): lines 22.1, timers 0.5, frames 0.4
+per line: 73.7 us   (2999 lines)
+
+  own ms/s   with callees   calls/s   function
+      6.82          12.26       301   parse
+      3.82           5.30       300   updAc
+      1.98          19.79       301   handleLine
+      1.01           1.86       301   appendLogLine
+      0.92           0.92       301   linkLineHook
+      0.86           3.42       301   addLog
+      0.79           0.79       602   stripAnsi
+      0.70           0.70       301   logFollow
+      0.47           0.52       134   appendTrailSeg
+      0.43           0.43       301   logType
+      0.42           0.75       360   acStale
+      0.33           0.33       361   nowTime
+
+  per second   what the page asks of the browser (document, elements, Leaflet)
+         913   getElementById()
+         426   textContent =
+         361   appendChild()
+         303   className =
+         301   lt =
+         301   display =
+         267   setLatLng()
+         134   addLatLng()
+         110   createElement()
+          48   scrollTop =
+           2   classList.contains()
+           2   title =
+           1   remove()
+           1   innerHTML =
+           0   polyline()
+           0   addLayer()
+
+== 120 aircraft, 600 lines/s, 10.0 s measured after 3 s warm-up ==
+page JavaScript: 29.6 ms per second (3.0 % of one core here): lines 28.2, timers 1.1, frames 0.4
+per line: 47.0 us   (5999 lines)
+
+  own ms/s   with callees   calls/s   function
+      9.78          16.20       601   parse
+      4.16           6.24       600   updAc
+      2.54          25.58       601   handleLine
+      1.50           2.89       601   appendLogLine
+      1.30           4.71       601   addLog
+      1.19           1.19      1202   stripAnsi
+      0.79           0.89       270   appendTrailSeg
+      0.72           0.72       601   logType
+      0.68           0.68       601   linkLineHook
+      0.62           0.99       720   acStale
+      0.51           0.51       601   logFollow
+      0.51           0.67       120   tblUpdateRow
+
+  per second   what the page asks of the browser (document, elements, Leaflet)
+        1813   getElementById()
+         847   textContent =
+         721   appendChild()
+         603   className =
+         601   lt =
+         601   display =
+         540   setLatLng()
+         270   addLatLng()
+          48   scrollTop =
+          20   createElement()
+           2   classList.contains()
+           2   title =
+           1   remove()
+           1   innerHTML =
+           1   polyline()
+           1   addLayer()
+
+# page/browser_profile.js: the same load in a real Chrome (headless, software rendering) - the page as of coh4 (v1.0.9)
+page v1.0.9 in Chrome/153.0.8010.12; refused: https://fonts.googleapis.com, https://www.googletagmanager.com, https://adsb-scope.offx1.com
+loaded without a script error
+
+ aircraft  lines/s  log panel |  script   style   layout   all main-thread work (ms per second) | layouts/s | frames/s  worst frame  long tasks
+       60        0   closed  |      4       0       2      25                                |         1 |       58        67 ms       0 (0 ms)
+       60        0     open  |      4       0       2      29                                |         1 |       57        67 ms       0 (0 ms)
+       60      300   closed  |     29      24      11     167                                |       134 |       39        83 ms       0 (0 ms)
+       60      300     open  |     53      49     566     874                                |       300 |       20        83 ms    15 (883 ms)
+      150     1000   closed  |     75      78      43     364                                |       453 |       24       100 ms       0 (0 ms)
+      150     1000     open  |    107     173    1587    1881                                |      1000 |        1      3333 ms   8 (12911 ms)
+
+(this version of the page has no meter)
+
+
+# page/browser_profile.js: the same, the page as it is now (v1.0.10)
+page v1.0.10 in Chrome/153.0.8010.12; refused: https://fonts.googleapis.com, https://www.googletagmanager.com, https://adsb-scope.offx1.com
+loaded without a script error
+
+ aircraft  lines/s  log panel |  script   style   layout   all main-thread work (ms per second) | layouts/s | frames/s  worst frame  long tasks
+       60        0   closed  |      4       1       2      24                                |         1 |       58        67 ms       0 (0 ms)
+       60        0     open  |      4       0       2      24                                |         1 |       58        67 ms       0 (0 ms)
+       60      300   closed  |     27      15      10     162                                |        38 |       41        67 ms       0 (0 ms)
+       60      300     open  |     29      15      51     281                                |        20 |       21        83 ms       0 (0 ms)
+      150     1000   closed  |     55      24      15     266                                |        22 |       24       100 ms       0 (0 ms)
+      150     1000     open  |     69      34      63     456                                |        19 |       20       100 ms     3 (160 ms)
+
+the page's own meter at 60 aircraft, 300 lines/s, log open:
+  [scope] perf: 300 lines/s, 21 ms/s in handleLine (70 us a line), 20 frames/s, worst frame 67 ms, long tasks 1 (56 ms)
+  [scope] perf: 300 lines/s, 20 ms/s in handleLine (68 us a line), 21 frames/s, worst frame 100 ms, long tasks 1 (54 ms)
+

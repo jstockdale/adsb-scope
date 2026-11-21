@@ -54,8 +54,12 @@ feeder tests, `../docs/UPLINK.md`.
 | `link/sim_device.c` | a stand-in for the device's console on a pseudo-terminal, running `console_link.c`: wire speed, garbage on a speed mismatch, reset on open, older firmware, download mode |
 | `link/check_fastlog.py` | `../tools/adsb-fastlog.py` and the bare speed protocol against `sim_device`, ten cases; part of `make check` → `results/link.txt` |
 | `link/check_page.js` | the web app's own script (`adsb_scope.htm`, run in Node) against `sim_device`, nine cases; part of `make check` when Node is installed → `results/link.txt` |
-| `link/check_page_flash.js` | the web app's flashing code against a stand-in for esptool-js that writes to a flash image held in the test: "keep settings" in twelve cases (`IMAGE=<merged .bin>` for a real image); part of `make check` and `make check-quick` when Node is installed → `results/link.txt` |
-| `link/page_env.js` | loads the web app's whole script into Node with the browser's objects stubbed, for the two tests above |
+| `link/check_page_flash.js` | the web app's flashing (`doFlash()` as it is) with the **real esptool-js 0.5.4** against an emulated chip: "keep settings", the speeds, a loader that does not answer, the restart – thirteen cases (`IMAGE=<merged .bin>` for a real image). Needs the esptool-js bundle: `make esptool-js` (npm; checked against a pinned sha256), skipped with a notice without it; part of `make check`, its quick cases of `make check-quick` → `results/link.txt` |
+| `link/fake_esp.js` | the emulated chip: reset and boot-mode lines, the ROM loader's and the flasher stub's protocol, a flash memory erased as the stub erases |
+| `link/page_env.js` | loads the web app's whole script into Node with the browser's objects stubbed (and, for the profile, counted) |
+| `page/profile_page.js` | the web app's own JavaScript under a made-up device log, in Node: time per function, and what it asks of the DOM and the map, per second → `results/page.txt` |
+| `page/browser_profile.js` | the same load on the page in a real headless Chrome: script, style, layout, layouts and frames per second, and the page's own meter next to them; fails on a script error at load. Needs a Chrome and `make page-deps` (npm). `PAGE=<file>` measures another version → `results/page.txt` |
+| `page/fake_log.js` | the made-up device log both use |
 | `experiments/cost_app_rv32.py` | what a decoded message and a list refresh cost in the device's instructions, before and after coh4 (needs the ESP-IDF toolchain and qemu-riscv32) → `results/cost_app_rv32.txt` |
 | `results/` | CSVs and plot from the runs reported in `docs/DECODER.md` |
 
@@ -243,7 +247,7 @@ To watch the loop work: `./sim_gain gain/madrid_model.txt --site 21 --hours 1 --
 prints its log lines on a model site whose top gain step is 21 dB too hot.
 `--site 0` is a site where the top step is right.
 
-## Around the decoder and the console link (`../docs/UPLINK.md` sections 9.7 and 9.8)
+## Around the decoder, the console link and the web app (`../docs/UPLINK.md` sections 9.7 to 9.9)
 
 What coh4 added, and how each number in `results/fmt.txt`,
 `results/link.txt` and `results/cost_app_rv32.txt` is made. No recordings
@@ -258,8 +262,9 @@ cd ~/adsb-scope/harness && make check-quick
 Half a minute. Everything `make check` runs except the two below,
 including `test_fmt` (number text against `printf`, distance and bearing
 against the old double-precision `haversine()`), `test_link` (the
-console-speed state machine) and, with Node, `link/check_page_flash.js`
-(the web app's flashing, with and without "keep settings").
+console-speed state machine) and, with Node and the esptool-js bundle
+(`make esptool-js`, once), the cases of `link/check_page_flash.js` that
+need no waiting.
 `./test_fmt --report` prints the figures.
 
 ```sh
@@ -281,6 +286,19 @@ A few minutes. What a decoded message and a list refresh cost in RISC-V
 instructions, before and after; needs ESP-IDF v5.4.1's toolchain and
 qemu-riscv32 (`sudo apt install qemu-user`), and says so if either is
 missing.
+
+```sh
+cd ~/adsb-scope/harness && make esptool-js && make page-deps      # once; npm and the network
+cd ~/adsb-scope/harness && make page-profile
+```
+
+The first two fetch what is not in the repository: the esptool-js bundle
+the web app loads (for `link/check_page_flash.js`, which `make check` then
+runs in full: a minute and a half), and the browser driver with local
+copies of the page's libraries. `make page-profile` then measures the web
+app under a made-up device log, first its own JavaScript in Node, then
+the whole page in a headless Chrome (`CHROME=<path>` if it is not on the
+PATH) – `../docs/UPLINK.md` section 9.9, `results/page.txt`.
 
 To play with the stand-in by hand: `./sim_device --rate 300 --reset-on-open`
 prints the path of a terminal (`/dev/pts/N`); `python3

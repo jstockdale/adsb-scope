@@ -88,16 +88,23 @@ check_fastlog: ok
 
 check_page: ok
 
-# link/check_page_flash.js: the web app's flashing, with and without "keep settings", against a stand-in for esptool-js
+# link/check_page_flash.js: the web app's flashing with the real esptool-js 0.5.4 against an emulated chip (link/fake_esp.js)
+esptool-js: 0.5.4 (the bundle the page loads, sha256 2a896d5e520ea9b6...)
+  ok    the bundle has ESPLoader and Transport
+  ok    and no ESPLoader.hardReset() - which the page called until 1.0.10
 1. keep settings (the default) on a device with the current layout
   ok    the flash completes
   ok    the settings partition (0x9000 to 0xEFFF) is as it was, byte for byte
   ok    everything else up to the end of the image is the new image
   ok    nothing beyond the image is touched
-  ok    two writes: from 0x0 and from 0xF000 (0x0, 0xf000)
-  ok    the device's partition table was read first
+  ok    the stub was given two writes: 0x0 + 0x9000, 0xf000 + 0x4a3e0
+  ok    the device's partition table was read first (0x8000, 3072 bytes)
   ok    the log says so
   ok    no question asked
+  ok    the port was opened once, at 460800, and no speed change was asked of the loader
+  ok    esptool-js loaded its stub (3840 bytes) and sent nothing the chip does not know
+  ok    reset into the loader once, and restarted into the firmware at the end (download, firmware)
+  ok    without "Auto-reset failed"
 2. keep settings on a device still on the April layout (two OTA slots)
   ok    new boot loader, table and application; the settings partition untouched
 3. "Keep settings" unticked
@@ -105,7 +112,7 @@ check_page: ok
   ok    the settings partition is erased
   ok    one write, no read of the device
   ok    the log says the settings were reset
-4. keep settings, but the device has its settings somewhere else – and the user says go on
+4. keep settings, but the device has its settings somewhere else - and the user says go on
   ok    the page asks, and says where the device has them
   ok    then the whole image is written
   ok    and the log says the settings are reset
@@ -116,26 +123,34 @@ check_page: ok
 6. keep settings on a device that has never been flashed
   ok    the image is written around an empty settings partition
   ok    no question; the log says there was nothing to keep
-7. the device's partition table cannot be read
+7. the device's partition table cannot be read (the stub does not answer the read)
   ok    the settings partition is left unwritten all the same
   ok    and the log says the table could not be read
-8. the boot loader does not answer at the faster speed
-  ok    tried at 460800, done at 115200
+8. the ROM loader does not answer at the faster speed
+  ok    tried at 460800, done at 115200 (10 s in all)
+  ok    the page gave up on 460800 by itself and says so
   ok    settings kept
   ok    the faster speed is remembered as not working
-9. a write fails at the faster speed
+9. a write stalls at the faster speed
   ok    the whole flash is done again at 115200
+  ok    the log says the write failed at 460800
   ok    the result is complete, settings kept
-  ok    the device's table is not read a second time
+  ok    the device's table is not read a second time (the first attempt may have replaced it)
+  ok    the faster speed is not written off: the loader did answer at it
 10. keep settings with a file that is not a merged image
-  ok    refused before the port is touched
+  ok    refused before the port is opened
   ok    the log says why
 11. the same file with "Keep settings" unticked, and the user says no to the warning
   ok    the page warns that it does not look like a merged image
   ok    and writes nothing
-12. the setting is kept between visits
+12. a device that does not go into its loader at all (boot pin not reached)
+  ok    nothing is written
+  ok    the page gives up by itself: 45 s, 13 resets (esptool-js 0.5.4's main() would make 460800 attempts)
+  ok    after trying both speeds, with "Bootloader connection failed"
+  ok    and the faster speed is not blamed for it
+13. the setting is kept between visits
   ok    on by default
   ok    off once unticked, and stored
-(image: made up, 365536 bytes)
+(image: made up, 365536 bytes; 93 read timeouts reported by esptool-js while loaders did not answer)
 
 check_page_flash: ok

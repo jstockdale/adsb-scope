@@ -1,6 +1,6 @@
 // page_env.js - the web app (adsb_scope.htm) loaded into Node: its whole
 // script, as it is, in a context where the browser's objects are stand-ins.
-// Used by check_page.js and check_page_flash.js.
+// Used by check_page.js, check_page_flash.js and page/profile_page.js.
 const fs = require('fs'), vm = require('vm'), path = require('path');
 const PAGE = path.join(__dirname, '..', '..', 'main', 'examples', 'adsb_receiver', 'adsb_scope.htm');
 
@@ -12,12 +12,26 @@ function pageScript() {
 // port: what navigator.serial.requestPort() gives the page.
 // settings: the page's localStorage to start with.
 // hooks.confirm(text): the answer to a confirm() dialog (default: true).
+// hooks.counts: an object {get,call,set} to count, by name, what the page asks
+//   of the browser's objects (document, Leaflet, ...): the last name read
+//   before a call is the name the call is counted under.
+// hooks.raf: a requestAnimationFrame for the page (default: never calls back).
 function loadPage(port, settings, hooks) {
   hooks = hooks || {};
   // An object that answers anything: every property is itself, every call returns itself
+  const C = hooks.counts || null; let last = '';
+  const bump = (m, k) => { if (typeof k === 'string') m[k] = (m[k] || 0) + 1; };
   const U = new Proxy(function () {}, {
-    get: (t, k) => { if (k === Symbol.toPrimitive) return () => ''; if (k === 'then') return undefined; if (k === Symbol.iterator) return function* () {}; if (k === 'length') return 0; return U; },
-    apply: () => U, construct: () => U, set: () => true, has: () => true,
+    get: (t, k) => { if (k === Symbol.toPrimitive) return () => ''; if (k === 'then') return undefined; if (k === Symbol.iterator) return function* () {}; if (k === 'length') return 0;
+                     if (C) {       // counting: also answer the few questions whose answer decides what the page then does
+                       const prev = last; last = k; bump(C.get, k);
+                       if (k === 'contains' && prev === 'classList') return () => { bump(C.call, 'classList.contains'); return false; };   // no panel collapsed, nothing hidden
+                       if (k === 'checked') return true;                                                                                   // every log filter on, log live
+                       if (k === 'textContent' || k === 'value' || k === 'innerHTML') return '';
+                     }
+                     return U; },
+    apply: () => { if (C) bump(C.call, last); return U; }, construct: () => { if (C) bump(C.call, 'new ' + String(last)); return U; },
+    set: (t, k) => { if (C) bump(C.set, k); return true; }, has: () => true,
   });
   const store = new Map(Object.entries(settings || {}));
   const ctx = { console, setTimeout, setInterval, clearTimeout, clearInterval, TextDecoder, TextEncoder, URL, Blob: U, Promise, Date, Math, JSON,
@@ -26,7 +40,7 @@ function loadPage(port, settings, hooks) {
     location: { href: 'http://localhost/', search: '', hash: '', protocol: 'http:', host: 'localhost' },
     navigator: { serial: { requestPort: async () => port }, userAgent: 'node' },
     localStorage: { getItem: k => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: k => store.delete(k) },
-    fetch: async () => { throw new Error('offline'); }, alert: () => {}, requestAnimationFrame: () => 0, performance: { now: () => Date.now() },
+    fetch: async () => { throw new Error('offline'); }, alert: () => {}, requestAnimationFrame: hooks.raf || (() => 0), performance: { now: () => performance.now() },
     confirm: text => { ctx.__confirms.push(text); return hooks.confirm ? hooks.confirm(text) : true; },
     addEventListener: () => {}, matchMedia: () => U, getComputedStyle: () => U, crypto: require('crypto').webcrypto,
     atob: s => Buffer.from(s, 'base64').toString('binary'), btoa: s => Buffer.from(s, 'binary').toString('base64'),

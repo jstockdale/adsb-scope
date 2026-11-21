@@ -24,3 +24,4 @@ harness/sim_device
 harness/old_batch_size
 harness/*.so
 harness/results/work/
+harness/.cache/

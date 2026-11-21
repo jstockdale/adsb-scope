@@ -8,9 +8,15 @@
 #                 (test_link), and - against a simulated device on a
 #                 pseudo-terminal - the logger (link/check_fastlog.py, 2 min)
 #                 and the web app's own serial code (link/check_page.js,
-#                 4 min) and its flashing with "keep settings"
-#                 (link/check_page_flash.js, 30 s); the two web app tests
-#                 need node 18+ and are skipped with a notice without it
+#                 4 min) and its flashing, with the real esptool-js against
+#                 an emulated chip (link/check_page_flash.js, 90 s); the two
+#                 web app tests need node 18+ and are skipped with a notice
+#                 without it, the second also without the esptool-js bundle
+#   make esptool-js    fetches that bundle (esptool-js 0.5.4, the version the
+#                 web app loads) with npm into .cache/ and checks its sha256
+#   make page-profile  the web app under a made-up device log: where its
+#                 JavaScript goes (Node) and what a real Chrome spends on it
+#                 (page/browser_profile.js; "make page-deps" once, npm)
 #   make check-quick   everything in check except the two that take minutes
 #   make old_batch_size IDF_PATH=...   size of the pre-r7 feeder's batches,
 #                 built with ESP-IDF's own cJSON (optional, not part of check)
@@ -100,13 +106,40 @@ check-quick: all
 	sh gain/check_gain.sh
 	./test_fmt
 	./test_link
-	@if command -v node >/dev/null 2>&1; then node link/check_page_flash.js; \
+	@if command -v node >/dev/null 2>&1; then ONLY=1,2,3,4,5,6,10,11 node link/check_page_flash.js; \
 	 else echo "SKIPPED: link/check_page_flash.js (the web app's flashing code) - node 18 or later is not installed"; fi
 
 bench: all
 	$(PYTHON) bench_fix.py
 
+# The esptool-js bundle the web app loads from unpkg.com, for link/check_page_flash.js.
+# Not in the repository: fetched from the npm registry, checked against a pinned sha256.
+ESPTOOL_JS_VERSION := 0.5.4
+ESPTOOL_JS_SHA256  := 2a896d5e520ea9b6ea9900223c2460df797c3b2287f441daa4e50168a50b17e6
+ESPTOOL_JS_DIR     := .cache/esptool-js-$(ESPTOOL_JS_VERSION)
+esptool-js:
+	@command -v npm >/dev/null 2>&1 || { echo "esptool-js: npm is not installed (it comes with Node.js: https://nodejs.org, or your distribution's nodejs/npm packages)"; exit 1; }
+	@command -v sha256sum >/dev/null 2>&1 || { echo "esptool-js: sha256sum is not installed (coreutils)"; exit 1; }
+	@mkdir -p $(ESPTOOL_JS_DIR) && cd $(ESPTOOL_JS_DIR) && rm -rf package && \
+	 npm pack --silent esptool-js@$(ESPTOOL_JS_VERSION) >/dev/null && tar -xzf esptool-js-$(ESPTOOL_JS_VERSION).tgz && \
+	 echo "$(ESPTOOL_JS_SHA256)  package/bundle.js" | sha256sum -c --quiet - && \
+	 echo "esptool-js $(ESPTOOL_JS_VERSION): harness/$(ESPTOOL_JS_DIR)/package/bundle.js, sha256 as pinned"
+
+# What page/browser_profile.js needs besides a Chrome or Chromium: the driver and
+# local copies of the libraries the web app loads from CDNs. Not in the repository.
+page-deps:
+	@command -v npm >/dev/null 2>&1 || { echo "page-deps: npm is not installed (it comes with Node.js: https://nodejs.org, or your distribution's nodejs/npm packages)"; exit 1; }
+	@mkdir -p .cache/web && npm install --silent --no-audit --no-fund --prefix .cache/web puppeteer-core leaflet@1.9.4 three@0.128.0 mqtt@5.3.0 && \
+	 echo "page-deps: harness/.cache/web/node_modules (puppeteer-core, leaflet 1.9.4, three 0.128.0, mqtt 5.3.0)"
+
+# The web app under a made-up device log: its own JavaScript in Node, then the
+# whole page in a headless Chrome (needs page-deps and a Chrome; says so if not there)
+page-profile:
+	@command -v node >/dev/null 2>&1 || { echo "page-profile: node 18 or later is not installed"; exit 1; }
+	node page/profile_page.js
+	node page/browser_profile.js
+
 clean:
 	rm -f $(BINS) old_batch_size *.so
 
-.PHONY: all check check-quick bench clean
+.PHONY: all check check-quick bench clean esptool-js page-deps page-profile
