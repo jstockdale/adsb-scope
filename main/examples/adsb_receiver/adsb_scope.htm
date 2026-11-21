@@ -321,7 +321,7 @@
 </head>
 <body>
 <div id="topbar">
-  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.8</span></span></div>
+  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.9</span></span></div>
   <div id="stats-bar">
     <div class="stat"><span>AC</span><span class="val live" id="ac-count">0</span></div>
     <div class="stat hm"><span>MSG</span><span class="val" id="msg-count">0</span></div>
@@ -430,12 +430,14 @@
 </div>
 <div id="flash-overlay" onclick="toggleFlash()"></div>
 <div id="flash-panel">
-  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.8</span><button onclick="toggleFlash()" title="Close firmware panel">✕</button></div></div>
+  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.9</span><button onclick="toggleFlash()" title="Close firmware panel">✕</button></div></div>
   <div id="flash-body">
     <div class="flash-row"><span class="fl">Device Version</span><span class="fv" id="flash-dev-ver">–</span></div>
     <div class="flash-row"><span class="fl">Latest Version</span><span class="fv" id="flash-latest-ver">–</span></div>
     <div class="flash-row"><span class="fl">Firmware URL</span><span class="fv" id="flash-fw-url" style="font-size:10px;word-break:break-all">latest.bin</span></div>
     <div class="flash-row"><span class="fl">Status</span><span class="fv" id="flash-status">Ready</span></div>
+    <div class="flash-row"><span class="fl">Serial speed</span><span class="fv"><select id="link-baud-sel" onchange="linkSetWanted(parseInt(this.value,10))" title="Speed the page asks the device for after connecting at 115200. Takes effect at the next connect." style="background:transparent;color:inherit;border:1px solid var(--text-dim);font:inherit;font-size:11px"><option value="115200">115200 (as before)</option><option value="460800">460800</option><option value="921600">921600</option><option value="1500000">1500000</option><option value="2000000">2000000</option></select> <span id="link-baud-now" style="font-size:10px;color:var(--text-dim)"></span></span></div>
+    <div class="flash-row"><span class="fl">Flash speed</span><span class="fv"><select id="flash-speed-sel" onchange="flashSetSpeed(this.value)" title="Speed for flashing from this page. A faster speed is tried first; if the boot loader does not answer at it, 115200 is used." style="background:transparent;color:inherit;border:1px solid var(--text-dim);font:inherit;font-size:11px"><option value="460800">460800, else 115200</option><option value="921600">921600, else 115200</option><option value="115200">115200</option></select></span></div>
     <div id="flash-progress">
       <div id="flash-progress-bar"><div id="flash-progress-fill"></div></div>
       <div id="flash-progress-text">0%</div>
@@ -2485,6 +2487,7 @@ function updSessionInfo(){
   const dur=now-sessStart;
   let html='<span class="sess-on">CONNECTED:</span><span class="sess-on">'+fmtTime(sessStart)+'</span>';
   html+='<span>DURATION:</span><span>'+fmtDur(dur)+'</span>';
+  if(!sessEnd)html+='<span>SERIAL:</span><span>'+linkBaud+' baud</span>';
   if(sessEnd)html+='<span class="sess-off">DISCONNECTED:</span><span class="sess-off">'+fmtTime(sessEnd)+'</span>';
   el.innerHTML=html;
 }
@@ -2876,13 +2879,219 @@ async function toggleSerial(){
     btn.textContent='Connect Serial';btn.classList.remove('connected');
   }
 }
+// ===== LINK (begin): the serial link's speed – docs/UPLINK.md section 9.8 =====
+// The device's console is 115200 baud unless a host asks for more. The page
+// connects at 115200, asks, and from then on sends a keepalive byte every two
+// seconds; when the page goes away the device returns to 115200 by itself.
+//
+// Web Serial can only change speed by closing and reopening the port, and on
+// the T-Display-P4 opening the port restarts the processor (its RTS line is
+// wired to reset). So there are two ways up:
+//   - where opening the port does not restart the device: ask (`baud N`),
+//     reopen at N, confirm (`baud ok`);
+//   - where it does: ask the device to start its next boot at N
+//     (`baud N next`), reopen at N – which is that boot – and confirm.
+// Which one applies is seen from the connect itself: a boot banner right
+// after the port was opened. Anything that goes wrong ends at 115200.
+const LINK_BASE=115200;
+const LINK_RATES=[115200,230400,460800,921600,1500000,2000000];
+let linkBaud=LINK_BASE;     // the speed the port is open at
+let linkState='base';       // base | negotiating | up | off (not wanted, not possible, or given up for this session)
+let linkOpenedAt=0;         // when the port was last opened
+let linkOpenReset=false;    // that open restarted the device (its boot banner followed)
+let linkLastOk=0,linkLastPing=0,linkBusy=false,linkHold=0,linkReopening=false,linkLosses=0,linkDlTries=0;
+let readLoopP=null;
+function linkSleep(ms){return new Promise(r=>setTimeout(r,ms))}
+function linkWanted(){
+  let v=921600;
+  try{v=parseInt(localStorage.getItem('link_baud')||'921600',10)}catch(e){}
+  return LINK_RATES.includes(v)?v:921600;
+}
+function linkSetWanted(v){try{localStorage.setItem('link_baud',String(v))}catch(e){}linkUpdUi()}
+function linkUpdUi(){
+  const el=document.getElementById('link-baud-now');
+  if(el)el.textContent=conn?('now '+linkBaud+(linkState==='negotiating'?' (changing…)':'')):'';
+  const sel=document.getElementById('link-baud-sel');
+  if(sel)sel.value=String(linkWanted());
+  updSessionInfo();
+}
+function linkOnOpen(baud){linkBaud=baud;linkOpenedAt=Date.now();linkOpenReset=false;linkUpdUi()}
+// A line that is not text: what the other end looks like when its speed is not ours
+function linkGarbage(l){
+  let bad=0;
+  for(let i=0;i<l.length;i++){const c=l.charCodeAt(i);if(c===0xFFFD||(c<32&&c!==9&&c!==27))bad++}
+  return bad*10>l.length;
+}
+// The first stop for every received line: the device's keepalive answers are
+// taken out, garbage is dropped. Returns the line to handle, or null.
+function linkLineHook(l){
+  const m=/BAUD: ok (\d+)/.exec(l);
+  if(m){
+    linkLastOk=Date.now();
+    l=l.replace(m[0],'');
+    if(l.replace('adsb>','').trim()==='')return null;
+  }
+  if(/ESP-ROM:esp32|^rst:0x/.test(l)&&Date.now()-linkOpenedAt<5000)linkOpenReset=true;
+  // At 115200 garbage is shown, as before (it is evidence); while the link is
+  // being changed or is fast, it is the device's boot log at 115200 and is dropped.
+  if(l.length&&(linkBaud!==LINK_BASE||linkState==='negotiating')&&linkGarbage(l))return null;
+  // The connect left the device in the ROM's download mode (the DTR/RTS race on
+  // open): restart it with the boot pin released, instead of leaving it there.
+  if(/^waiting for download/.test(l)&&!flashBusy&&Date.now()-linkOpenedAt<8000&&linkDlTries<2){
+    linkDlTries++;
+    addLog('[scope] The device started in download mode – restarting it');
+    (async()=>{
+      try{
+        await port.setSignals({dataTerminalReady:false,requestToSend:true});
+        await linkSleep(120);
+        await port.setSignals({dataTerminalReady:false,requestToSend:false});
+        linkOpenedAt=Date.now();
+      }catch(e){}
+    })();
+  }
+  return l;
+}
+// Close the port and open it again at `baud`. On a T-Display-P4 this restarts the device.
+async function linkReopen(baud){
+  linkReopening=true;
+  try{
+    try{if(reader)await reader.cancel()}catch(e){}
+    try{if(readLoopP)await readLoopP}catch(e){}
+    try{await port.close()}catch(e){}
+    await linkSleep(200);
+    await port.open({baudRate:baud,flowControl:'none'});
+    lb='';
+    await port.setSignals({dataTerminalReady:false,requestToSend:false});
+    linkOnOpen(baud);
+  }finally{linkReopening=false}
+  readLoopP=readLoop();
+}
+// Does a console answer the keepalive at the speed we are at? (Firmware before coh4 does not.)
+async function linkPing(ms){
+  const t0=Date.now();
+  linkLastOk=0;
+  while(conn&&Date.now()-t0<ms){
+    await serialWrite('\x05');
+    for(let i=0;i<10;i++){if(linkLastOk)return true;await linkSleep(50)}
+  }
+  return false;
+}
+// Send `baud ok` until the device confirms at `target`, for up to `ms`.
+async function linkConfirm(target,ms){
+  const t0=Date.now();
+  while(conn&&Date.now()-t0<ms){
+    try{
+      const r=await sendCmdResume('baud ok',1500);
+      if(r&&r.includes('BAUD: up '+target))return true;
+    }catch(e){}
+    await linkSleep(400);
+  }
+  return false;
+}
+async function linkWaitConsole(ms){
+  for(let t=0;t<ms&&conn&&!consoleReady;t+=100)await linkSleep(100);
+  return conn&&consoleReady;
+}
+// Called when the console is ready after a connect: bring the link up to the
+// speed the setting asks for, if the device can. pingMs: how long to wait for
+// the console to answer the keepalive first.
+async function linkStart(pingMs){
+  const want=linkWanted();
+  if(!conn||linkState!=='base'||linkBaud!==LINK_BASE||want<=LINK_BASE||flashBusy||linkHold>0)return;
+  linkState='negotiating';linkUpdUi();
+  let ok=false,why='';
+  try{
+    if(!(await linkPing(pingMs||3000))){
+      linkState='off';linkUpdUi();
+      addLog('[scope] Serial stays at 115200 baud (this firmware cannot change speed)');
+      return;
+    }
+    // Where the speed can be tried without restarting the device, a second, lower one is tried too
+    const tries=want>460800?[want,460800]:[want];
+    for(let i=0;i<tries.length&&!ok&&conn;i++){
+      const rate=tries[i];
+      if(linkOpenReset){
+        // Opening the port restarts this device: have it start its next boot at the new speed
+        const r=await sendCmdResume('baud '+rate+' next',3000);
+        if(!r||!r.includes('BAUD: next '+rate)){why='the device did not take the request';break}
+        addLog('[scope] Serial: reopening at '+rate+' baud – the device restarts once more and comes up at that speed');
+        consoleReady=false;
+        await linkReopen(rate);
+        ok=await linkConfirm(rate,45000);
+        if(!ok)why='no confirmation at '+rate+' baud after the restart';
+        break;
+      }
+      const r=await sendCmdResume('baud '+rate,3000);
+      if(!r||!r.includes('BAUD: switching to '+rate)){why='the device did not take the request';break}
+      await linkReopen(rate);
+      ok=await linkConfirm(rate,3500);
+      if(ok)break;
+      // Not confirmed: this speed does not work here, or the reopen restarted the
+      // device after all. Back to 115200 and see which. (The device itself returns
+      // to 115200 five seconds after the request.)
+      await linkReopen(LINK_BASE);
+      await linkSleep(3000);
+      if(linkOpenReset){
+        if(!(await linkWaitConsole(45000))){why='the device did not come back';break}
+        i--;continue;   // the same speed again, by way of a restart
+      }
+      why='no confirmation at '+rate+' baud';
+    }
+  }catch(e){why=e.message||String(e)}
+  if(!conn)return;
+  if(ok){
+    linkState='up';linkLastOk=linkLastPing=Date.now();consoleReady=true;linkUpdUi();
+    addLog('[scope] Serial link up at '+linkBaud+' baud');
+    return;
+  }
+  addLog('[scope] Serial stays at 115200 baud ('+(why||'not confirmed')+')');
+  if(linkBaud!==LINK_BASE){
+    try{await linkReopen(LINK_BASE)}catch(e){addLog('[scope] Serial error: '+e.message)}
+  }
+  linkState='off';
+  linkUpdUi();
+}
+// The device stopped answering at the fast speed: it restarted, or it went back
+// to 115200 because it did not hear us. Meet it there.
+async function linkLost(){
+  if(linkState!=='up')return;
+  linkState='off';linkLosses++;
+  addLog('[scope] Serial: no answer at '+linkBaud+' baud – reopening at 115200');
+  try{await linkReopen(LINK_BASE)}catch(e){addLog('[scope] Serial error: '+e.message);return}
+  if(linkLosses>2){linkUpdUi();return}
+  await linkSleep(3000);                       // a boot banner, if the reopen restarted the device
+  if(!(await linkWaitConsole(45000)))return;
+  linkState='base';
+  linkStart(25000);                            // it may still be starting
+}
+// Keepalive, once a second and with every received line (a tab in the
+// background has its timers slowed; incoming data is not).
+function linkTick(){
+  if(!conn||linkReopening||flashBusy||linkState!=='up')return;
+  const now=Date.now();
+  if(cmdWaiting||linkHold>0){linkBusy=true;return}       // a command or an upload is the keepalive
+  if(linkBusy){linkBusy=false;linkLastOk=now}
+  if(now-linkLastPing>=2000){linkLastPing=now;serialWrite('\x05').catch(()=>{})}
+  if(now-linkLastOk>8000)linkLost();
+}
+// Leaving: tell the device, so that it is back at 115200 at once and not after its timeout.
+async function linkGoodbye(){
+  if(linkState==='up'||linkState==='negotiating'){
+    try{await serialWrite('\x04');await linkSleep(60)}catch(e){}
+  }
+  linkState='base';linkBaud=LINK_BASE;linkLosses=0;linkDlTries=0;
+}
+// Seconds a transfer of `kb` kilobytes takes at the current speed (10 bits a byte)
+function linkTransferSecs(kb){return Math.ceil(kb*1024/(linkBaud/10))}
+// ===== LINK (end) =====
 async function serialConnect(){
   if(!('serial' in navigator)){alert('WebSerial not supported. Use Chrome/Edge.');return}
   try{
     if(!port)port=await navigator.serial.requestPort();
-    await port.open({baudRate:115200,flowControl:'none'});
+    await port.open({baudRate:LINK_BASE,flowControl:'none'});
     lb=''; // reset line buffer on (re)connect
     await port.setSignals({dataTerminalReady:false,requestToSend:false});
+    linkState='base';linkLosses=0;linkDlTries=0;linkOnOpen(LINK_BASE);
     conn=true;sessStart=new Date();sessEnd=null;consoleReady=false;updSessionInfo();document.getElementById('connect-btn').textContent='Disconnect';document.getElementById('connect-btn').classList.add('connected');
     addLog('[scope] Serial connected – device may reboot (DTR race), waiting for data...');
     fetchLatestVersion(); // check for firmware updates
@@ -2897,8 +3106,10 @@ async function serialConnect(){
           if(r){r.split('\n').forEach(l=>parse(l))}
         }catch(e){/* device busy or not responding – not critical */}
       }
+      // The console is up: ask for a faster serial link if the setting wants one
+      if(conn&&consoleReady)linkStart();
     })();
-    readLoop();
+    readLoopP=readLoop();
   }catch(e){
     addLog('[scope] Serial error: '+e.message);
     // Clean up stale port so next Connect click re-triggers browser picker
@@ -2909,17 +3120,21 @@ async function serialConnect(){
 }
 async function readLoop(){
   const dc=new TextDecoder();
-  while(conn&&port?.readable){
+  while(conn&&port?.readable&&!linkReopening){
     reader=port.readable.getReader();
     try{while(true){const{value,done}=await reader.read();if(done)break;if(!value)continue;lb+=dc.decode(value,{stream:true});let i;while((i=lb.indexOf('\n'))!==-1){const l=lb.substring(0,i).replace(/\r$/,'');lb=lb.substring(i+1);if(l.length>0)handleLine(l)}
+      if(lb.length>65536)lb=''; // the other end is at another speed: no line ends in that
       if(cmdWaiting&&lb.includes('adsb>')){const pi=lb.indexOf('adsb>');lb=lb.substring(pi+5);if(cmdSkipPrompts>0){cmdSkipPrompts--;cmdBuf=[];}else{const val=cmdBuf.join('\n');cmdBuf=[];cmdForceResolve(val);}}
     }}
     catch(e){if(conn)addLog('[scope] Read error: '+e.message)}
     finally{try{reader.releaseLock()}catch(e){}}
+    if(linkReopening)return; // linkReopen() closes the port and starts a new loop
     if(conn)await new Promise(r=>setTimeout(r,500));
   }
+  if(linkReopening)return;
   // readLoop exited unexpectedly — clean up and reset UI
   if(conn){
+    linkState='base';linkBaud=LINK_BASE;
     conn=false;sessEnd=new Date();consoleReady=false;cmdForceResolve(null);
     updSessionInfo();
     addLog('[scope] Device lost — click Connect to reconnect');
@@ -2948,7 +3163,9 @@ function cmdForceResolve(val){
 }
 function handleLine(l){
   l=stripAnsi(l);
-  lastSerialMs=Date.now();
+  l=linkLineHook(l);   // keepalive answers out, wrong-speed garbage dropped
+  if(l===null)return;
+  linkTick();          // the keepalive also rides on incoming data
   lastSerialMs=Date.now();
   // Track device UTC from serial timestamps
   const _dts=parseDeviceTs(l);
@@ -2998,7 +3215,10 @@ function waitLogReplay(timeoutMs){
     setTimeout(()=>{if(_logReplayResolve===res){_logReplayResolve=null;res()}},timeoutMs||5000);
   });
 }
-async function serialWrite(t){if(!conn||!port?.writable)return;const w=port.writable.getWriter();try{await w.write(new TextEncoder().encode(t))}finally{w.releaseLock()}}
+let serialWriteQ=Promise.resolve();
+async function serialWriteNow(t){if(!conn||!port?.writable)return;const w=port.writable.getWriter();try{await w.write(new TextEncoder().encode(t))}finally{w.releaseLock()}}
+// One write at a time, in the order asked for (getWriter() throws while another write holds the lock)
+function serialWrite(t){const p=serialWriteQ.then(()=>serialWriteNow(t));serialWriteQ=p.catch(()=>{});return p}
 async function sendCmd(cmd,inactMs){
   cmdInactivityMs=inactMs||10000;
   if(!conn)throw new Error('Not connected');
@@ -3173,12 +3393,12 @@ function parseSizeKB(s){
   if(m[2]==='KB')return v;
   return v/1024;
 }
-function transferTime(kb){return Math.ceil(kb/10)} // ~10 KB/s at 115200 baud
+function transferTime(kb){return linkTransferSecs(kb)} // 11.5 KB/s at 115200 baud, 92 at 921600
 async function fileDL(name,size){
   const kb=parseSizeKB(size);
   const secs=transferTime(kb);
   if(secs>120){
-    if(!confirm(name+' is '+size+'. Transfer will take ~'+Math.ceil(secs/60)+' minutes at 115200 baud. Continue?'))return;
+    if(!confirm(name+' is '+size+'. Transfer will take ~'+Math.ceil(secs/60)+' minutes at '+linkBaud+' baud. Continue?'))return;
   }
   const st=document.getElementById('files-status');
   st.dataset.dl='Downloading '+name;st.dataset.est=kb;
@@ -3196,7 +3416,7 @@ async function fileReplay(name,size){
   const kb=parseSizeKB(size);
   const secs=transferTime(kb);
   if(secs>120){
-    if(!confirm(name+' is '+size+'. Transfer will take ~'+Math.ceil(secs/60)+' minutes at 115200 baud. Continue?'))return;
+    if(!confirm(name+' is '+size+'. Transfer will take ~'+Math.ceil(secs/60)+' minutes at '+linkBaud+' baud. Continue?'))return;
   }
   const st=document.getElementById('files-status');
   st.dataset.dl='Loading '+name;st.dataset.est=kb;
@@ -3215,6 +3435,7 @@ async function fileDel(name){
   catch(e){document.getElementById('files-status').textContent='Failed: '+e.message}
 }
 async function discon(){
+  await linkGoodbye(); // the device goes back to 115200 at once
   conn=false;sessEnd=new Date();consoleReady=false;updSessionInfo();
   const btn=document.getElementById('connect-btn');
   btn.textContent='Connect Serial';btn.classList.remove('connected');
@@ -3679,6 +3900,23 @@ async function fetchFirmware(url){
   }
 }
 
+// Speeds to flash at, in the order to try them. A faster speed that got no
+// answer from the bootloader is not tried again until the setting is chosen anew.
+function flashWanted(){
+  let v=460800;
+  try{v=parseInt(localStorage.getItem('flash_baud')||'460800',10)}catch(e){}
+  return [115200,460800,921600].includes(v)?v:460800;
+}
+function flashSpeeds(){
+  const v=flashWanted();
+  let bad='';
+  try{bad=localStorage.getItem('flash_fast_failed')||''}catch(e){}
+  return (v>115200&&bad!==String(v))?[v,115200]:[115200];
+}
+function flashSetSpeed(v){try{localStorage.setItem('flash_baud',String(v));localStorage.removeItem('flash_fast_failed')}catch(e){}flashUpdUi()}
+function flashFastWorked(ok){try{if(ok)localStorage.removeItem('flash_fast_failed');else localStorage.setItem('flash_fast_failed',String(flashWanted()))}catch(e){}}
+function flashUpdUi(){const sel=document.getElementById('flash-speed-sel');if(sel)sel.value=String(flashWanted())}
+
 async function doFlash(binData){
   const mod=await loadEsptool();
   if(!mod)return false;
@@ -3721,63 +3959,80 @@ async function doFlash(binData){
     }
   }
 
-  // Create transport and loader – esptool-js opens the port itself
-  flashLog('Connecting to bootloader...','fl-info');
-  flashStatus('Connecting...','');
+  // Create transport and loader – esptool-js opens the port itself.
+  //
+  // Speed: esptool-js changes speed by closing and reopening the port, and on
+  // the T-Display-P4 opening the port restarts the processor – out of the
+  // loader. So the speed is not changed: the port is opened at the speed to
+  // flash at from the start, and the ROM loader takes its speed from the sync
+  // packets it is sent (esptool's serial protocol: "the sync packets can be
+  // sent at any baud rate"). If the loader does not answer at a faster speed,
+  // or the write fails there, the whole thing is done again at 115200.
   flashLog('If device does not respond: hold BOOT, press RESET, release BOOT.','fl-info');
-
-  let transport,loader,chip;
-  try{
-    transport=new mod.Transport(flashPort,true);
-    loader=new mod.ESPLoader({
-      transport,
-      baudrate:115200,     // keep same as ROM – USB-CDC ignores baud rate
-      romBaudrate:115200,
-      terminal:{
-        clean(){},
-        writeLine(d){if(d&&d.trim())flashLog(d.trim())},
-        write(d){}
-      }
-    });
-    chip=await loader.main();
-    flashLog('Connected: '+chip,'fl-ok');
-  }catch(e){
-    flashLog('Bootloader connection failed: '+e.message,'fl-err');
-    flashLog('Try: hold BOOT → press RESET → release BOOT → click Flash again.','fl-info');
-    flashStatus('Failed','warn');
-    try{await transport.disconnect()}catch(ex){}
-    try{await flashPort.close()}catch(ex){}
-    flashBusy=false;document.getElementById('flash-go-btn').disabled=false;
-    return false;
-  }
-
-  // Flash
-  flashLog('Erasing and writing flash...','fl-info');
-  flashStatus('Flashing...','');
-  flashProgress(0);
   const binaryStr=Array.from(new Uint8Array(binData)).map(b=>String.fromCharCode(b)).join('');
+  const speeds=flashSpeeds();
+  let transport=null,loader=null,flashed=false;
+  for(let si=0;si<speeds.length&&!flashed;si++){
+    const spd=speeds[si],last=si+1>=speeds.length;
+    let stage='connect';
+    try{
+      flashLog('Connecting to bootloader at '+spd+' baud...','fl-info');
+      flashStatus('Connecting...','');
+      transport=new mod.Transport(flashPort,true);
+      loader=new mod.ESPLoader({
+        transport,
+        baudrate:spd,        // the same as romBaudrate: no speed change, so no reopen
+        romBaudrate:spd,
+        terminal:{
+          clean(){},
+          writeLine(d){if(d&&d.trim())flashLog(d.trim())},
+          write(d){}
+        }
+      });
+      const chip=await loader.main();
+      flashLog('Connected: '+chip+' at '+spd+' baud','fl-ok');
 
-  try{
-    await loader.writeFlash({
-      fileArray:[{data:binaryStr,address:FW_OFFSET}],
-      flashSize:'keep',
-      flashMode:'keep',
-      flashFreq:'keep',
-      eraseAll:false,
-      compress:true,
-      reportProgress(fileIndex,written,total){
-        const pct=Math.round(written/total*100);
-        flashProgress(pct);
-        flashStatus('Flashing... '+pct+'%','');
+      stage='write';
+      flashLog('Erasing and writing flash...','fl-info');
+      flashStatus('Flashing...','');
+      flashProgress(0);
+      const t0=Date.now();
+      await loader.writeFlash({
+        fileArray:[{data:binaryStr,address:FW_OFFSET}],
+        flashSize:'keep',
+        flashMode:'keep',
+        flashFreq:'keep',
+        eraseAll:false,
+        compress:true,
+        reportProgress(fileIndex,written,total){
+          const pct=Math.round(written/total*100);
+          flashProgress(pct);
+          flashStatus('Flashing... '+pct+'%','');
+        }
+      });
+      flashLog('Flash complete in '+Math.round((Date.now()-t0)/1000)+' s at '+spd+' baud','fl-ok');
+      flashProgress(100);
+      flashed=true;
+      if(spd>115200)flashFastWorked(true);
+    }catch(e){
+      if(!last){
+        flashLog((stage==='connect'?'No answer from the bootloader':'Write failed')+' at '+spd+' baud ('+e.message+') – again at '+speeds[si+1],'fl-info');
+        if(stage==='connect')flashFastWorked(false);
+      }else if(stage==='connect'){
+        flashLog('Bootloader connection failed: '+e.message,'fl-err');
+        flashLog('Try: hold BOOT → press RESET → release BOOT → click Flash again.','fl-info');
+      }else{
+        flashLog('Flash failed: '+e.message,'fl-err');
       }
-    });
-    flashLog('Flash complete!','fl-ok');
-    flashProgress(100);
-  }catch(e){
-    flashLog('Flash failed: '+e.message,'fl-err');
+    }
+    if(!flashed){
+      try{await transport.disconnect()}catch(ex){}
+      try{await flashPort.close()}catch(ex){}
+      if(!last)await new Promise(r=>setTimeout(r,800));
+    }
+  }
+  if(!flashed){
     flashStatus('Failed','warn');
-    try{await transport.disconnect()}catch(ex){}
-    try{await flashPort.close()}catch(ex){}
     flashBusy=false;document.getElementById('flash-go-btn').disabled=false;
     return false;
   }
@@ -3800,15 +4055,17 @@ async function doFlash(binData){
     try{
       flashLog('Reconnecting...','fl-info');
       port=flashPort;
-      await port.open({baudRate:115200,flowControl:'none'});
+      await port.open({baudRate:LINK_BASE,flowControl:'none'});
       await port.setSignals({dataTerminalReady:false,requestToSend:false});
+      linkState='base';linkLosses=0;linkDlTries=0;linkOnOpen(LINK_BASE);
       conn=true;
       document.getElementById('connect-btn').textContent='Disconnect';
       document.getElementById('connect-btn').classList.add('connected');
       deviceVersion='';
       addLog('[scope] Reconnected after firmware update');
       fetchLatestVersion();
-      readLoop();
+      readLoopP=readLoop();
+      (async()=>{if(await linkWaitConsole(60000))linkStart()})();
       flashLog('Reconnected! Waiting for boot...','fl-ok');
       // Post-flash: check for aircraft database on SD card
       checkAndInstallAircraftDb();
@@ -4003,6 +4260,7 @@ async function serialSendFile(fileData,sdPath,onProgress,onLog){
   const fileCrc=crc32hex(new Uint8Array(fileData));
   log('Uploading '+sdPath+' ('+((total/1024/1024).toFixed(1))+' MB, CRC32:'+fileCrc+')...','fl-info');
 
+  linkHold++; // no keepalive bytes inside the upload; the device counts the upload itself
   try{
 
   while(offset<total){
@@ -4127,6 +4385,7 @@ async function serialSendFile(fileData,sdPath,onProgress,onLog){
   log('Upload complete: '+sdPath,'fl-ok');
   return true;
   }finally{
+    linkHold--;
     // ALWAYS return firmware to log mode, even on error — prevents
     // device from staying stuck in command/recv mode
     try{
@@ -5352,7 +5611,7 @@ function updateLabels3d(){
   });
 }
 
-initMap();syncPanelH();setInterval(tick,1000);fetchLatestVersion();
+initMap();syncPanelH();setInterval(tick,1000);setInterval(linkTick,1000);linkUpdUi();flashUpdUi();fetchLatestVersion();
 function posZoom(){const h=document.getElementById('panel').offsetHeight;const b=(h+12)+'px';document.getElementById('zoom-ctrl').style.bottom=b;document.getElementById('legend').style.bottom=b;const ae=document.getElementById('ae-slider');if(ae)ae.style.bottom=b;const ci=document.getElementById('cam-mode-ind');if(ci)ci.style.bottom=b;const ch=document.getElementById('cam-help');if(ch)ch.style.bottom=b}
 function posTopbar(){
   const tb=document.getElementById('topbar').offsetHeight;
