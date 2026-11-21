@@ -258,6 +258,15 @@ TaskHandle_t Ethernet_Task_Handle = NULL;
 TaskHandle_t At_Task_Handle = NULL;
 TaskHandle_t Sleep_Task_Handle = NULL;
 TaskHandle_t Adsb_App_Task_Handle = NULL;
+// The app tasks refresh a window while it is open and wait while it is
+// closed. They are told through these flags and a task notification, and
+// park themselves at the top of their loop, where they hold no lock. Up to
+// coh3 the window's callback suspended the task from outside
+// (vTaskSuspend), wherever it was – including while it held the aircraft
+// table's lock, which stopped the decoder at its next message until the
+// window was opened again.
+static volatile bool s_adsb_app_open = false;
+static volatile bool s_meshy_app_open = false;
 TaskHandle_t Meshy_App_Task_Handle = NULL;
 TaskHandle_t Scope_App_Task_Handle = NULL;
 TaskHandle_t Iis_Transmission_Data_Stream_Task = NULL;
@@ -1881,7 +1890,6 @@ void device_at_task(void *arg)
 void device_adsb_app_task(void *arg)
 {
     printf("device_adsb_app_task start\n");
-    vTaskSuspend(NULL);  // suspend self until ADS-B app opens
 
     // Buffers for formatting — allocated once on task stack
     static char stats_buf[512];
@@ -1893,6 +1901,13 @@ void device_adsb_app_task(void *arg)
 
     while (1)
     {
+        if (!s_adsb_app_open)
+        {
+            // Window closed: wait here until it opens (no lock is held)
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+
         if (esp_log_timestamp() > cycle_time)
         {
             if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::ADSB)
@@ -1972,7 +1987,8 @@ void device_adsb_app_task(void *arg)
 void device_meshy_app_task(void *arg)
 {
     printf("device_meshy_app_task start\n");
-    vTaskSuspend(NULL);  // suspend self until Meshy app opens
+    // Nothing is allocated until the window is opened for the first time
+    while (!s_meshy_app_open) ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
     static char stats_buf[256];
     static const size_t MSG_BUF_SIZE = 65536;  // 64KB — enough for 1000 messages
@@ -1990,6 +2006,13 @@ void device_meshy_app_task(void *arg)
 
     while (1)
     {
+        if (!s_meshy_app_open)
+        {
+            // Window closed: wait here until it opens (no lock is held)
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+
         if (esp_log_timestamp() > cycle_time)
         {
             if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::MESHY)
@@ -3002,19 +3025,17 @@ void System_Ui_Callback_Init(void)
     System_Ui->_win_adsb_status_callback = [](bool status)
     {
         if (Adsb_App_Task_Handle == NULL) return;
+        s_adsb_app_open = status;
         if (status == true)
-            vTaskResume(Adsb_App_Task_Handle);
-        else
-            vTaskSuspend(Adsb_App_Task_Handle);
+            xTaskNotifyGive(Adsb_App_Task_Handle);
     };
 
     System_Ui->_win_meshy_status_callback = [](bool status)
     {
         if (Meshy_App_Task_Handle == NULL) return;
+        s_meshy_app_open = status;
         if (status == true)
-            vTaskResume(Meshy_App_Task_Handle);
-        else
-            vTaskSuspend(Meshy_App_Task_Handle);
+            xTaskNotifyGive(Meshy_App_Task_Handle);
     };
 
     System_Ui->_win_scope_status_callback = [](bool status)
