@@ -149,7 +149,7 @@ static volatile int      s_bias_pending = -1;     // -1 none, 0 off, 1 on: appli
 // speed of the console (docs/UPLINK.md 2.2). Lines now go into this queue
 // and a low-priority task writes them. When the console cannot keep up the
 // queue fills and lines are dropped and counted; the decoder never waits.
-#define ADSB_LOGQ_BYTES      16384   // power of two; about 1.4 s of console output at 115200 baud
+#define ADSB_LOGQ_BYTES      16384   // power of two; about 1.4 s of console output at 115200 baud, 0.18 s at 921600
 #define ADSB_LOG_LINE_MAX    400
 #define ADSB_LOG_TASK_STACK  (6 * 1024)
 #define ADSB_LOG_TASK_PRIO   2
@@ -2940,18 +2940,31 @@ static void adsb_logq_printf(const char *fmt, ...)
 // would take a whole core from the display whenever the log is busy, so
 // the writer keeps an estimate of when the FIFO will have room for the
 // next line and sleeps until then. It still fills the UART completely.
+// The console's speed is a property of the session (serial_console_baud():
+// 115200 unless a host has asked for more), so the estimate is made per
+// line. It sleeps in whole ticks (1 ms): at 921600 baud, where the FIFO
+// empties in 1.4 ms, that is 450 to 500 lines a second.
 #ifdef CONFIG_ESP_CONSOLE_UART_BAUDRATE
-#define ADSB_LOG_UART_BYTE_US (10000000 / CONFIG_ESP_CONSOLE_UART_BAUDRATE)
+#define ADSB_LOG_UART         1
 #define ADSB_LOG_UART_FIFO    127
+// microseconds that n characters take on the wire (10 bits each)
+static inline int64_t adsb_log_wire_us(uint32_t n, uint32_t baud) { return ((int64_t)n * 10000000LL) / (int64_t)baud; }
 #endif
 
 static void adsb_log_task(void *arg)
 {
     static char line[ADSB_LOG_LINE_MAX];
-#ifdef ADSB_LOG_UART_BYTE_US
+#ifdef ADSB_LOG_UART
     int64_t drain_at = 0;   // when the bytes written so far will have left the FIFO
+    uint32_t at_baud = 0;   // the speed that estimate was made at
 #endif
     for (;;) {
+        // The console has just changed speed and the host has not confirmed
+        // it yet: what is written now would be lost. Lines wait in the queue.
+        if (serial_console_link_quiet()) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
         uint32_t tail = atomic_load_explicit(&s_logq_tail, memory_order_relaxed);
         uint32_t head = atomic_load_explicit(&s_logq_head, memory_order_acquire);
         if (head == tail) {
@@ -2965,14 +2978,16 @@ static void adsb_log_task(void *arg)
         logq_read(tail + 2, line, len);
         line[len] = '\0';
         atomic_store_explicit(&s_logq_tail, tail + 2 + len, memory_order_release);
-#ifdef ADSB_LOG_UART_BYTE_US
+#ifdef ADSB_LOG_UART
         const uint32_t out = len + 1;   // + the CR the console adds
+        const uint32_t baud = serial_console_baud();
+        if (baud != at_baud) { at_baud = baud; drain_at = 0; }   // the FIFO was emptied for the change
         if (serial_console_log_enabled()) {
             int64_t now = esp_timer_get_time();
             if (drain_at < now) drain_at = now;
             // Room for the whole line, or an empty FIFO for a longer one
             const uint32_t need = out < ADSB_LOG_UART_FIFO ? out : ADSB_LOG_UART_FIFO;
-            int64_t room_at = drain_at - (int64_t)(ADSB_LOG_UART_FIFO - need) * ADSB_LOG_UART_BYTE_US;
+            int64_t room_at = drain_at - adsb_log_wire_us(ADSB_LOG_UART_FIFO - need, baud);
             if (room_at > now) vTaskDelay(pdMS_TO_TICKS((uint32_t)((room_at - now + 999) / 1000)));
         }
 #endif
@@ -2981,13 +2996,13 @@ static void adsb_log_task(void *arg)
         if (serial_console_print("%s", line)) {
             s_log_lines_total++;
             s_log_bytes_total += len + 1;   // + the CR the console adds
-#ifdef ADSB_LOG_UART_BYTE_US
+#ifdef ADSB_LOG_UART
             int64_t now = esp_timer_get_time();
             if (drain_at < now) drain_at = now;
-            drain_at += (int64_t)out * ADSB_LOG_UART_BYTE_US;
+            drain_at += adsb_log_wire_us(out, baud);
             // On return at most a FIFO's worth is still waiting
-            if (drain_at > now + (int64_t)ADSB_LOG_UART_FIFO * ADSB_LOG_UART_BYTE_US)
-                drain_at = now + (int64_t)ADSB_LOG_UART_FIFO * ADSB_LOG_UART_BYTE_US;
+            if (drain_at > now + adsb_log_wire_us(ADSB_LOG_UART_FIFO, baud))
+                drain_at = now + adsb_log_wire_us(ADSB_LOG_UART_FIFO, baud);
 #endif
         }
     }

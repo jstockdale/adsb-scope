@@ -29,6 +29,16 @@ bool serial_console_log_enabled(void);
 // Returns true if the line was printed.
 bool serial_console_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+// The console's speed now, in baud. It starts at 115200 and changes only
+// while a host has asked for more (the `baud` command; console_link.h).
+#include <stdint.h>
+uint32_t serial_console_baud(void);
+
+// True while the console has just changed speed and the host has not yet
+// confirmed it at the new one: lines written now would be lost, so the log
+// writer holds them.
+bool serial_console_link_quiet(void);
+
 // Format a device timestamp into buf: "[2026-03-28 20:45:36.127Z] " after GPS fix,
 // or "[boot+818.793] " before. Returns bytes written (not counting NUL).
 // Uses gettimeofday for ms precision. No floats. Safe for tight stacks.

@@ -63,6 +63,14 @@
 #include "sd_logger.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "console_link.h"
+#include "sdkconfig.h"
+#if CONFIG_ESP_CONSOLE_UART
+#include "hal/uart_ll.h"
+#include "esp_private/periph_ctrl.h"
+#include "esp_private/esp_clk.h"
+#include "esp_rom_sys.h"
+#endif
 
 static const char *CONSOLE_TAG = "CONSOLE";
 
@@ -235,6 +243,260 @@ bool serial_console_print(const char *fmt, ...) {
 }
 
 // ---------------------------------------------------------------------------
+// Console speed (console_link.h; docs/UPLINK.md section 9.8)
+// ---------------------------------------------------------------------------
+static console_link_t s_link = { .baud = CONSOLE_LINK_BASE_BAUD };
+static volatile uint32_t s_link_baud = CONSOLE_LINK_BASE_BAUD;   // for other tasks
+static volatile bool s_link_quiet = false;                       // for the log writer
+static uint32_t s_link_apply = 0;        // `baud` asked for this speed: the task loop sets it after the prompt
+static int64_t  s_link_next_armed_us = 0; // when a request for the next start was stored (0: none)
+
+uint32_t serial_console_baud(void) { return s_link_baud; }
+bool serial_console_link_quiet(void) { return s_link_quiet; }
+
+#define LINK_NVS_NS   "console"
+#define LINK_NVS_KEY  "baud_next"
+
+// Store (baud != 0) or remove (0) the speed for the next start.
+static bool link_next_store(uint32_t baud) {
+    nvs_handle_t h;
+    if (nvs_open(LINK_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e = baud ? nvs_set_u32(h, LINK_NVS_KEY, baud) : nvs_erase_key(h, LINK_NVS_KEY);
+    if (e == ESP_ERR_NVS_NOT_FOUND) e = ESP_OK;
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    return e == ESP_OK;
+}
+
+// The speed stored for this start, removed as it is read: it counts once.
+static uint32_t link_next_take(void) {
+    nvs_handle_t h;
+    uint32_t baud = 0;
+    if (nvs_open(LINK_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return 0;
+    if (nvs_get_u32(h, LINK_NVS_KEY, &baud) == ESP_OK) {
+        nvs_erase_key(h, LINK_NVS_KEY);
+        nvs_commit(h);
+    } else {
+        baud = 0;
+    }
+    nvs_close(h);
+    return baud;
+}
+
+#if CONFIG_ESP_CONSOLE_UART
+#define CONSOLE_UART_HW  UART_LL_GET_HW(CONFIG_ESP_CONSOLE_UART_NUM)
+
+// The console UART is clocked from the crystal (the ROM sets it up so, and
+// ESP-IDF's start-up code computes its divider from that: cpu_start.c).
+static uint32_t console_uart_clock_hz(void) { return (uint32_t)esp_clk_xtal_freq(); }
+
+// Set the console UART's speed. Other tasks' output is held while the
+// transmitter empties at the old speed. False (and nothing changed) if the
+// UART is not clocked as this code assumes: its divider must read back as
+// the speed the console is known to be at.
+static bool console_uart_set_baud(uint32_t baud) {
+    uart_dev_t *hw = CONSOLE_UART_HW;
+    const uint32_t clk = console_uart_clock_hz();
+    const uint32_t now_at = uart_ll_get_baudrate(hw, clk);
+    const uint32_t expect = console_link_actual_baud(clk, s_link_baud);
+    if (now_at < expect - expect / 50 || now_at > expect + expect / 50) {
+        printf("  BAUD: not changed – the console UART reads back as %lu baud where %lu was expected (clock %lu Hz)\n",
+               (unsigned long)now_at, (unsigned long)expect, (unsigned long)clk);
+        return false;
+    }
+    flockfile(stdout);
+    fflush(stdout);
+    for (int i = 0; i < 2000 && !uart_ll_is_tx_idle(hw); i++) esp_rom_delay_us(100);   // a full FIFO at 115200 is 11 ms
+    esp_rom_delay_us(200);   // the stop bit of the last character
+    PERIPH_RCC_ATOMIC() {
+        uart_ll_set_baudrate(hw, baud, clk);
+    }
+    // What was received before the change was received at the old speed.
+    // After a reset into a remembered speed that is whatever the host sent
+    // during the boot, at its speed while this UART was still at 115200:
+    // arbitrary bytes, which must not be read as input (one of them could
+    // be the goodbye byte).
+    uart_ll_rxfifo_rst(hw);
+    { uint8_t junk[32]; while (read(STDIN_FILENO, junk, sizeof(junk)) > 0) {} }
+    s_link_baud = baud;
+    funlockfile(stdout);
+    return true;
+}
+
+// Measure the speed of what arrives, with the UART's own pulse counters,
+// whatever speed the UART is set to. A diagnostic: it answers whether a host
+// that opens the port at a higher speed could be recognised without being
+// told (see UPLINK.md 9.8). The host sends a run of 'U' (alternating bits).
+static void cmd_baud_probe(int ms) {
+    uart_dev_t *hw = CONSOLE_UART_HW;
+    if (ms < 200) ms = 200;
+    if (ms > 10000) ms = 10000;
+    printf("  BAUD: probe for %d ms – send 'U' characters now, at any speed\n", ms);
+    fflush(stdout);
+    uart_ll_set_autobaud_en(hw, false);
+    uart_ll_set_autobaud_en(hw, true);    // the counters start again
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    const uint32_t edges = uart_ll_get_rxd_edge_cnt(hw);
+    const uint32_t lo = uart_ll_get_low_pulse_cnt(hw), hi = uart_ll_get_high_pulse_cnt(hw);
+    const uint32_t pos = uart_ll_get_pos_pulse_cnt(hw), neg = uart_ll_get_neg_pulse_cnt(hw);
+    uart_ll_set_autobaud_en(hw, false);
+    // What arrived meanwhile was received at the wrong speed
+    { uint8_t junk[64]; while (read(STDIN_FILENO, junk, sizeof(junk)) > 0) {} }
+    const uint32_t clk = console_uart_clock_hz();
+    const uint32_t est = (lo + hi) ? (uint32_t)(2ull * clk / (lo + hi)) : 0;
+    printf("  BAUD: probe edges=%lu low=%lu high=%lu pos=%lu neg=%lu clock=%lu est=%lu\n",
+           (unsigned long)edges, (unsigned long)lo, (unsigned long)hi, (unsigned long)pos,
+           (unsigned long)neg, (unsigned long)clk, (unsigned long)est);
+}
+#else
+static bool console_uart_set_baud(uint32_t baud) {
+    (void)baud;
+    printf("  BAUD: this build's console is not a UART – its speed cannot be changed\n");
+    return false;
+}
+static void cmd_baud_probe(int ms) { (void)ms; printf("  BAUD: this build's console is not a UART\n"); }
+#endif
+
+static void link_publish(void) {
+    s_link_quiet = console_link_quiet(&s_link);
+}
+
+// Go back to 115200 and say why, at 115200.
+static void link_fall_back(console_link_why_t why, uint32_t from) {
+    console_uart_set_baud(s_link.baud);
+    link_publish();
+    switch (why) {
+        case CONSOLE_LINK_WHY_NO_CONFIRM:
+            printf("BAUD: no 'baud ok' at %lu – back to %lu\n", (unsigned long)from, (unsigned long)s_link.baud);
+            break;
+        case CONSOLE_LINK_WHY_SILENT:
+            printf("BAUD: host silent for %d s – back to %lu\n",
+                   (int)(CONSOLE_LINK_SILENT_US / 1000000), (unsigned long)s_link.baud);
+            break;
+        default:
+            printf("BAUD: host left – back to %lu\n", (unsigned long)s_link.baud);
+            break;
+    }
+    fflush(stdout);
+}
+
+// Deadlines; called when the console task has nothing to read.
+static void link_poll(void) {
+    const int64_t now = esp_timer_get_time();
+    console_link_why_t why;
+    const uint32_t from = s_link.baud;
+    if (console_link_poll(&s_link, now, &why) == CONSOLE_LINK_SET_BAUD) link_fall_back(why, from);
+    link_publish();
+    if (s_link_next_armed_us && now - s_link_next_armed_us > CONSOLE_LINK_NEXT_ARMED_US) {
+        s_link_next_armed_us = 0;
+        link_next_store(0);
+        printf("BAUD: no reset followed – the request for the next start is dropped\n");
+        fflush(stdout);
+    }
+}
+
+// The host's keepalive byte: answered in either mode.
+static void link_keepalive(void) {
+    console_link_heard(&s_link, esp_timer_get_time());
+    printf("BAUD: ok %lu\n", (unsigned long)s_link.baud);
+    fflush(stdout);
+}
+
+// The host's goodbye byte.
+static void link_goodbye(void) {
+    const uint32_t from = s_link.baud;
+    if (console_link_goodbye(&s_link) == CONSOLE_LINK_SET_BAUD) link_fall_back(CONSOLE_LINK_WHY_GOODBYE, from);
+    link_publish();
+}
+
+// A speed asked for by `baud`: set after the reply and the prompt have been
+// written, so that the host reads both at the old speed.
+static void link_apply_pending(void) {
+    if (!s_link_apply) return;
+    const uint32_t to = s_link_apply;
+    s_link_apply = 0;
+    if (!console_uart_set_baud(to)) {
+        // Not changed: the state machine goes back to where the UART is
+        console_link_init(&s_link);
+        s_link.baud = s_link_baud;
+        if (s_link_baud != CONSOLE_LINK_BASE_BAUD) s_link.state = CONSOLE_LINK_STAY;
+    }
+    link_publish();
+}
+
+static void cmd_baud(const char *arg1, const char *arg2) {
+    const int64_t now = esp_timer_get_time();
+    if (!arg1) {
+        const uint32_t *rates;
+        const int n = console_link_rates(&rates);
+        printf("  Console: %lu baud, %s", (unsigned long)s_link.baud, console_link_state_name(s_link.state));
+        if (s_link.state == CONSOLE_LINK_UP)
+            printf(" (falls back to %u if the host is silent for %d s; %lld s left)", CONSOLE_LINK_BASE_BAUD,
+                   (int)(CONSOLE_LINK_SILENT_US / 1000000), (long long)((s_link.deadline_us - now) / 1000000));
+        printf("\n  Speeds:  ");
+        for (int i = 0; i < n; i++) printf("%lu%s", (unsigned long)rates[i], i + 1 < n ? " " : "\n");
+        printf("  Since start: %lu changes, %lu confirmed; back to %u after no confirmation %lu, host silent %lu, host left %lu\n",
+               (unsigned long)s_link.n_switch, (unsigned long)s_link.n_up, CONSOLE_LINK_BASE_BAUD,
+               (unsigned long)s_link.n_no_confirm, (unsigned long)s_link.n_silent, (unsigned long)s_link.n_goodbye);
+        printf("  baud <speed>        change, then send 'baud ok' at the new speed within %d s and a keepalive (byte 0x05) every few seconds\n"
+               "  baud <speed> stay   change and stay (a person at a terminal): until 'baud %u' or a reset\n"
+               "  baud <speed> next   start at <speed> after the next reset, once (for hosts whose port open resets the device)\n"
+               "  baud probe [ms]     measure the speed of what arrives (diagnostic)\n",
+               (int)(CONSOLE_LINK_CONFIRM_US / 1000000), CONSOLE_LINK_BASE_BAUD);
+        return;
+    }
+    if (strcmp(arg1, "ok") == 0) {
+        if (console_link_confirm(&s_link, now)) printf("  BAUD: up %lu\n", (unsigned long)s_link.baud);
+        else printf("  BAUD: nothing to confirm (%lu baud, %s)\n", (unsigned long)s_link.baud, console_link_state_name(s_link.state));
+        link_publish();
+        return;
+    }
+    if (strcmp(arg1, "probe") == 0) {
+        cmd_baud_probe(arg2 ? atoi(arg2) : 1500);
+        return;
+    }
+    const uint32_t baud = (arg1[0] >= '0' && arg1[0] <= '9') ? (uint32_t)strtoul(arg1, NULL, 10) : 0;
+    if (!console_link_rate_allowed(baud)) {
+        printf("  BAUD: error: '%s' is not a speed this console offers ('baud' lists them)\n", arg1);
+        return;
+    }
+    if (arg2 && strcmp(arg2, "next") == 0) {
+        if (baud == CONSOLE_LINK_BASE_BAUD) {
+            s_link_next_armed_us = 0;
+            if (link_next_store(0)) printf("  BAUD: next start at %u (the default)\n", CONSOLE_LINK_BASE_BAUD);
+            else printf("  BAUD: error: could not remove the stored request\n");
+        } else if (link_next_store(baud)) {
+            s_link_next_armed_us = now;
+            printf("  BAUD: next %lu – a reset within %d s starts the console at %lu, once\n",
+                   (unsigned long)baud, (int)(CONSOLE_LINK_NEXT_ARMED_US / 1000000), (unsigned long)baud);
+        } else {
+            printf("  BAUD: error: could not store the request\n");
+        }
+        return;
+    }
+    const bool stay = arg2 && strcmp(arg2, "stay") == 0;
+    if (arg2 && !stay) {
+        printf("  BAUD: error: '%s' – use 'stay' or 'next', or nothing\n", arg2);
+        return;
+    }
+    const int act = console_link_request(&s_link, baud, stay, now);
+    if (act == CONSOLE_LINK_SET_BAUD) {
+        if (s_link.state == CONSOLE_LINK_PENDING)
+            printf("  BAUD: switching to %lu – send 'baud ok' at that speed within %d s\n",
+                   (unsigned long)baud, (int)(CONSOLE_LINK_CONFIRM_US / 1000000));
+        else
+            printf("  BAUD: switching to %lu\n", (unsigned long)baud);
+        s_link_apply = baud;   // after the prompt (serial_console_task)
+    } else if (s_link.state == CONSOLE_LINK_PENDING) {
+        printf("  BAUD: already at %lu – send 'baud ok' within %d s\n",
+               (unsigned long)baud, (int)(CONSOLE_LINK_CONFIRM_US / 1000000));
+    } else {
+        printf("  BAUD: already at %lu (%s)\n", (unsigned long)baud, console_link_state_name(s_link.state));
+    }
+    link_publish();
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 static void print_prompt(void) {
@@ -306,6 +568,7 @@ static void cmd_help(void) {
         "  \033[33m── Config ──\033[0m\n"
         "  \033[32mtimezone\033[0m [auto|UTC±N] show or set timezone\n"
         "  \033[32mheartbeat\033[0m [on|off|5-255] show/set console heartbeat\n"
+        "  \033[32mbaud\033[0m [<speed> [stay|next]|ok|probe]  console speed for this session (always starts at 115200)\n"
         "  \033[32mntp\033[0m [server] [poll_s]  show/set NTP config\n"
         "  \033[32mgps\033[0m [basic|strict]  show/set GPS time integrity mode\n"
         "\n"
@@ -700,9 +963,9 @@ static void cmd_adsb(const char *subcmd) {
                    (unsigned long)st.ring_fill_pct, (unsigned long)st.ring_max_pct,
                    (unsigned long)st.ring_dropped, (unsigned long)st.stream_gaps);
 #ifdef CONFIG_ESP_CONSOLE_UART_BAUDRATE
-            printf("  Log:       %lu lines/s, %lu B/s written (console carries %d B/s); dropped %lu, %lu in the last 5 s\n",
+            printf("  Log:       %lu lines/s, %lu B/s written (console carries %lu B/s at %lu baud); dropped %lu, %lu in the last 5 s\n",
                    (unsigned long)st.log_lines_s, (unsigned long)st.log_bytes_s,
-                   CONFIG_ESP_CONSOLE_UART_BAUDRATE / 10,
+                   (unsigned long)(serial_console_baud() / 10), (unsigned long)serial_console_baud(),
                    (unsigned long)st.log_dropped, (unsigned long)st.log_dropped_win);
 #else
             printf("  Log:       %lu lines/s, %lu B/s written; dropped %lu, %lu in the last 5 s\n",
@@ -1288,6 +1551,7 @@ static int recv_read_line(char *buf, int buf_size, int64_t timeout_us) {
                 continue;
             }
             s_recv_reads++;
+            console_link_heard(&s_link, esp_timer_get_time());   // an upload keeps a fast link up
             int gap = (int)(esp_timer_get_time() - last_data);
             if (gap > s_recv_max_gap_us) s_recv_max_gap_us = gap;
             s_recv_rx_pos = 0;
@@ -2652,6 +2916,9 @@ static void dispatch_command(char *line) {
             }
         }
 
+    } else if (strcmp(cmd, "baud") == 0) {
+        cmd_baud(arg1, arg2);
+
     } else if (strcmp(cmd, "gps") == 0) {
         extern void time_manager_set_integrity_mode_fn(int mode);
         if (!arg1 || arg1[0] == '\0') {
@@ -2697,6 +2964,19 @@ static void serial_console_task(void *arg) {
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
+    // The console's speed: 115200, unless the host asked before the reset
+    // for a faster start (`baud <speed> next`), which counts once.
+    console_link_init(&s_link);
+    {
+        const uint32_t next = link_next_take();
+        if (next && next != CONSOLE_LINK_BASE_BAUD && console_link_rate_allowed(next)) {
+            printf("BAUD: starting at %lu, as asked before the reset – 'baud ok' is due within %d s\n",
+                   (unsigned long)next, (int)(CONSOLE_LINK_BOOT_CONFIRM_US / 1000000));
+            if (console_uart_set_baud(next)) console_link_boot(&s_link, next, esp_timer_get_time());
+        }
+        link_publish();
+    }
+
     ESP_LOGI(CONSOLE_TAG, "Serial console ready (Ctrl+C for command mode)");
     {char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
     printf("%sCONSOLE: Serial console ready\n", _ts);}
@@ -2708,6 +2988,8 @@ static void serial_console_task(void *arg) {
         int n = read(STDIN_FILENO, &ch, 1);
 
         if (n <= 0) {
+            link_poll();   // console speed: confirmation and keepalive deadlines
+
             // Heartbeat in log mode
             if (s_mode == MODE_LOG && g_settings.heartbeat_enabled &&
                 esp_log_timestamp() >= heartbeat_next) {
@@ -2755,6 +3037,10 @@ static void serial_console_task(void *arg) {
             continue;
         }
 
+        // The host's keepalive and goodbye bytes, in either mode
+        if (ch == CONSOLE_LINK_KEEPALIVE) { link_keepalive(); continue; }
+        if (ch == CONSOLE_LINK_GOODBYE)   { link_goodbye();   continue; }
+
         if (s_mode == MODE_LOG) {
             // In log mode, only listen for Ctrl+C
             if (ch == CTRL_C) {
@@ -2776,9 +3062,12 @@ static void serial_console_task(void *arg) {
         } else if (ch == '\r' || ch == '\n') {
             printf("\n");
             s_cmd_buf[s_cmd_len] = '\0';
+            console_link_heard(&s_link, esp_timer_get_time());   // a command is the host
             dispatch_command(s_cmd_buf);
+            console_link_heard(&s_link, esp_timer_get_time());   // ... and so is the end of a long one
             s_cmd_len = 0;
             if (s_mode == MODE_CMD) print_prompt();
+            link_apply_pending();   // `baud <speed>`: change now, after the reply and the prompt
         } else if (ch == 0x7F || ch == 0x08) {
             // Backspace
             if (s_cmd_len > 0) {
