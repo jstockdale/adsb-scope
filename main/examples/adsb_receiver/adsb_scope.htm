@@ -321,7 +321,7 @@
 </head>
 <body>
 <div id="topbar">
-  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.9</span></span></div>
+  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.10</span></span></div>
   <div id="stats-bar">
     <div class="stat"><span>AC</span><span class="val live" id="ac-count">0</span></div>
     <div class="stat hm"><span>MSG</span><span class="val" id="msg-count">0</span></div>
@@ -430,13 +430,14 @@
 </div>
 <div id="flash-overlay" onclick="toggleFlash()"></div>
 <div id="flash-panel">
-  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.9</span><button onclick="toggleFlash()" title="Close firmware panel">✕</button></div></div>
+  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.10</span><button onclick="toggleFlash()" title="Close firmware panel">✕</button></div></div>
   <div id="flash-body">
     <div class="flash-row"><span class="fl">Device Version</span><span class="fv" id="flash-dev-ver">–</span></div>
     <div class="flash-row"><span class="fl">Latest Version</span><span class="fv" id="flash-latest-ver">–</span></div>
     <div class="flash-row"><span class="fl">Firmware URL</span><span class="fv" id="flash-fw-url" style="font-size:10px;word-break:break-all">latest.bin</span></div>
     <div class="flash-row"><span class="fl">Status</span><span class="fv" id="flash-status">Ready</span></div>
     <div class="flash-row"><span class="fl">Serial speed</span><span class="fv"><select id="link-baud-sel" onchange="linkSetWanted(parseInt(this.value,10))" title="Speed the page asks the device for after connecting at 115200. Takes effect at the next connect." style="background:transparent;color:inherit;border:1px solid var(--text-dim);font:inherit;font-size:11px"><option value="115200">115200 (as before)</option><option value="460800">460800</option><option value="921600">921600</option><option value="1500000">1500000</option><option value="2000000">2000000</option></select> <span id="link-baud-now" style="font-size:10px;color:var(--text-dim)"></span></span></div>
+    <div class="flash-row"><span class="fl">Settings</span><span class="fv"><label title="Leave the settings partition (settings, WiFi, the Meshtastic identity and key) unwritten when flashing. The device's partition table is read first; if its settings are not where the new firmware expects them, the page asks before it resets them." style="cursor:pointer"><input type="checkbox" id="flash-keep" onchange="flashSetKeep(this.checked)" checked> keep when flashing</label></span></div>
     <div class="flash-row"><span class="fl">Flash speed</span><span class="fv"><select id="flash-speed-sel" onchange="flashSetSpeed(this.value)" title="Speed for flashing from this page. A faster speed is tried first; if the boot loader does not answer at it, 115200 is used." style="background:transparent;color:inherit;border:1px solid var(--text-dim);font:inherit;font-size:11px"><option value="460800">460800, else 115200</option><option value="921600">921600, else 115200</option><option value="115200">115200</option></select></span></div>
     <div id="flash-progress">
       <div id="flash-progress-bar"><div id="flash-progress-fill"></div></div>
@@ -3752,6 +3753,8 @@ let latestVersion=null; // {version, date, url} from latest.version.json
 const FW_BASE='https://adsb-scope.offx1.com/';
 const FW_URL=FW_BASE+'latest.bin';
 const FW_OFFSET=0x0;  // merged binary (bootloader+partition+app)
+const FW_BOOT_OFFSET=0x2000; // where the boot loader sits in it (ESP32-P4)
+const FW_PT_OFFSET=0x8000;   // ... and the partition table
 let flashBusy=false, esptoolMod=null;
 
 async function fetchLatestVersion(){
@@ -3900,6 +3903,49 @@ async function fetchFirmware(url){
   }
 }
 
+// --- Keeping the settings when flashing ---
+// The merged image is written from 0x0 and covers everything up to the end of
+// the application, so it also covers the settings partition (NVS: settings,
+// WiFi, the Meshtastic identity and key) with 0xFF. To keep the settings the
+// same image is written in two pieces, around that partition. Where the
+// partition is comes from the image's own partition table, and the device's
+// table is read first: the settings are only "kept" if the device has them
+// where the new firmware will look for them.
+function flashKeepWanted(){let v='1';try{v=localStorage.getItem('flash_keep')||'1'}catch(e){}return v!=='0'}
+function flashSetKeep(on){try{localStorage.setItem('flash_keep',on?'1':'0')}catch(e){}flashUpdUi()}
+// A partition table (ESP-IDF's binary format, 32 bytes an entry) at `off` in `u8`:
+// how many entries, the first NVS data partition and the first application.
+function flashParseTable(u8,off){
+  const out={entries:0,nvs:null,app:null};
+  const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
+  for(let p=off;p+32<=u8.length&&p<off+0xC00;p+=32){
+    if(dv.getUint16(p,true)!==0x50AA)break;   // entries start AA 50; the checksum entry EB EB and the end FF FF do not
+    const type=u8[p+2],sub=u8[p+3],offset=dv.getUint32(p+4,true),size=dv.getUint32(p+8,true);
+    let label='';for(let i=0;i<16&&u8[p+12+i];i++)label+=String.fromCharCode(u8[p+12+i]);
+    out.entries++;
+    if(type===1&&sub===2&&!out.nvs)out.nvs={offset,size,label};
+    if(type===0&&!out.app)out.app={offset,size,label};
+  }
+  return out;
+}
+function flashHex(n){return '0x'+n.toString(16)}
+// What to write for this image. keep: leave the settings partition out.
+// Returns {parts:[{address,data}], keep, nvs, merged, error}.
+function flashPlan(img,keep){
+  const t=flashParseTable(img,FW_PT_OFFSET);
+  const merged=img.length>FW_PT_OFFSET+32&&img[FW_BOOT_OFFSET]===0xE9&&t.entries>0;
+  const plan={parts:[{address:FW_OFFSET,data:img}],keep:false,nvs:t.nvs,merged,error:''};
+  if(!keep)return plan;
+  if(!merged){plan.error='This file is not a merged image for this board (no boot loader at '+flashHex(FW_BOOT_OFFSET)+' or no partition table at '+flashHex(FW_PT_OFFSET)+'), so the settings partition cannot be found in it. Choose the merged image, or untick "Keep settings".';return plan}
+  const n=t.nvs;
+  if(!n||n.offset%0x1000||n.size%0x1000||n.size===0||n.offset<FW_PT_OFFSET+0x1000||n.offset+n.size>img.length){
+    plan.error='The image\'s partition table has no usable settings (NVS) partition; untick "Keep settings" to flash it.';return plan}
+  plan.parts=[{address:FW_OFFSET,data:img.subarray(0,n.offset)},{address:n.offset+n.size,data:img.subarray(n.offset+n.size)}].filter(p=>p.data.length>0);
+  plan.keep=true;
+  return plan;
+}
+function flashBinStr(u8){let s='';for(let i=0;i<u8.length;i+=0x8000)s+=String.fromCharCode.apply(null,u8.subarray(i,i+0x8000));return s}
+
 // Speeds to flash at, in the order to try them. A faster speed that got no
 // answer from the bootloader is not tried again until the setting is chosen anew.
 function flashWanted(){
@@ -3915,7 +3961,7 @@ function flashSpeeds(){
 }
 function flashSetSpeed(v){try{localStorage.setItem('flash_baud',String(v));localStorage.removeItem('flash_fast_failed')}catch(e){}flashUpdUi()}
 function flashFastWorked(ok){try{if(ok)localStorage.removeItem('flash_fast_failed');else localStorage.setItem('flash_fast_failed',String(flashWanted()))}catch(e){}}
-function flashUpdUi(){const sel=document.getElementById('flash-speed-sel');if(sel)sel.value=String(flashWanted())}
+function flashUpdUi(){const sel=document.getElementById('flash-speed-sel');if(sel)sel.value=String(flashWanted());const k=document.getElementById('flash-keep');if(k)k.checked=flashKeepWanted()}
 
 async function doFlash(binData){
   const mod=await loadEsptool();
@@ -3969,7 +4015,16 @@ async function doFlash(binData){
   // sent at any baud rate"). If the loader does not answer at a faster speed,
   // or the write fails there, the whole thing is done again at 115200.
   flashLog('If device does not respond: hold BOOT, press RESET, release BOOT.','fl-info');
-  const binaryStr=Array.from(new Uint8Array(binData)).map(b=>String.fromCharCode(b)).join('');
+  const img=new Uint8Array(binData);
+  let plan=flashPlan(img,flashKeepWanted());
+  if(!plan.error&&!plan.merged&&!confirm('This file does not look like a merged image for this board (no boot loader at '+flashHex(FW_BOOT_OFFSET)+'). Writing it at 0x0 will most likely leave the device unable to start. Write it anyway?'))plan.error='Not a merged image – not written.';
+  if(plan.error){
+    flashLog(plan.error,'fl-err');
+    flashStatus('Failed','warn');
+    flashBusy=false;document.getElementById('flash-go-btn').disabled=false;
+    return false;
+  }
+  let planChecked=!plan.keep,cancelled=false;
   const speeds=flashSpeeds();
   let transport=null,loader=null,flashed=false;
   for(let si=0;si<speeds.length&&!flashed;si++){
@@ -3992,25 +4047,56 @@ async function doFlash(binData){
       const chip=await loader.main();
       flashLog('Connected: '+chip+' at '+spd+' baud','fl-ok');
 
+      // Keeping the settings: are the device's where this firmware will look for them?
+      if(!planChecked){
+        let dev=null;
+        try{dev=flashParseTable(await loader.readFlash(FW_PT_OFFSET,0xC00),0)}
+        catch(e){flashLog('Could not read the device\'s partition table ('+e.message+') – the settings partition is left unwritten all the same','fl-info')}
+        const n=plan.nvs;
+        if(dev&&dev.entries===0){
+          flashLog('The device has no partition table: there are no settings to keep.','fl-info');
+        }else if(dev&&!(dev.nvs&&dev.nvs.offset===n.offset&&dev.nvs.size===n.size)){
+          const where=dev.nvs?('at '+flashHex(dev.nvs.offset)+' ('+dev.nvs.size/1024+' kB)'):'missing';
+          if(confirm('The settings cannot be kept: on this device the settings partition is '+where+', and this firmware expects it at '+flashHex(n.offset)+' ('+n.size/1024+' kB).\n\nOK: flash anyway – settings, WiFi and the Meshtastic identity are reset.\nCancel: do not flash.')){
+            plan=flashPlan(img,false);
+            flashLog('The device\'s settings partition is '+where+', not where this firmware expects it: settings will be reset.','fl-info');
+          }else{
+            cancelled=true;
+            flashLog('Not flashed: the settings could not be kept and the flash was cancelled.','fl-info');
+            break;
+          }
+        }else if(dev){
+          flashLog('Settings partition found at '+flashHex(n.offset)+' ('+n.size/1024+' kB): it will not be written.','fl-ok');
+        }
+        planChecked=true;
+      }
+      if(!plan.str){
+        const total=plan.parts.reduce((a,p)=>a+p.data.length,0);
+        let before=0;
+        plan.str=plan.parts.map(p=>{const f={data:flashBinStr(p.data),address:p.address,from:before/total,share:p.data.length/total};before+=p.data.length;return f});
+      }
+
       stage='write';
       flashLog('Erasing and writing flash...','fl-info');
       flashStatus('Flashing...','');
       flashProgress(0);
       const t0=Date.now();
+      const files=plan.str;
       await loader.writeFlash({
-        fileArray:[{data:binaryStr,address:FW_OFFSET}],
+        fileArray:files.map(f=>({data:f.data,address:f.address})),
         flashSize:'keep',
         flashMode:'keep',
         flashFreq:'keep',
         eraseAll:false,
         compress:true,
         reportProgress(fileIndex,written,total){
-          const pct=Math.round(written/total*100);
+          const f=files[fileIndex]||files[0];
+          const pct=Math.round((f.from+f.share*written/total)*100);
           flashProgress(pct);
           flashStatus('Flashing... '+pct+'%','');
         }
       });
-      flashLog('Flash complete in '+Math.round((Date.now()-t0)/1000)+' s at '+spd+' baud','fl-ok');
+      flashLog('Flash complete in '+Math.round((Date.now()-t0)/1000)+' s at '+spd+' baud – '+(plan.keep?'settings kept ('+flashHex(plan.nvs.offset)+' to '+flashHex(plan.nvs.offset+plan.nvs.size-1)+' not written)':'settings reset'),'fl-ok');
       flashProgress(100);
       flashed=true;
       if(spd>115200)flashFastWorked(true);
@@ -4032,7 +4118,13 @@ async function doFlash(binData){
     }
   }
   if(!flashed){
-    flashStatus('Failed','warn');
+    if(cancelled){
+      // the device is in the boot loader and has not been written: restart it into its firmware
+      try{await loader.hardReset()}catch(e){}
+      try{await transport.disconnect()}catch(ex){}
+      try{await flashPort.close()}catch(ex){}
+    }
+    flashStatus(cancelled?'Cancelled':'Failed','warn');
     flashBusy=false;document.getElementById('flash-go-btn').disabled=false;
     return false;
   }
