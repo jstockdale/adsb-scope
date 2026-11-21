@@ -804,12 +804,18 @@ function updAc(ic,ac){
     ac.lb=L.marker([ac.lat,ac.lon],{icon:mkLbl(ic,ac,c,st),interactive:true}).addTo(map);
     ac.lb.on('click',(e)=>sel0(ic,e.originalEvent));
     ac.mk.on('click',(e)=>sel0(ic,e.originalEvent));
+    ac._mla=ac.lat;ac._mlo=ac.lon;
     ac._ik=hdg+'|'+c+'|'+sel+'|'+st.opacity+'|'+st.gray+'|'+ac.expired+'|'+ac.pinned+'|'+ac.sqk;
     const _li0=lMode==='dist'?(ac.dist!=null?ac.dist.toFixed(1):''):(ac.alt||'');
     ac._lk=(ac.cs||ic)+'|'+c+'|'+sel+'|'+st.opacity+'|'+st.gray+'|'+ac.expired+'|'+ac.pinned+'|'+lMode+'|'+_li0+'|'+ac.sqk;
   }else{
-    ac.mk.setLatLng([ac.lat,ac.lon]);
-    ac.lb.setLatLng([ac.lat,ac.lon]);
+    // Only when it has moved: more than half of the messages carry no position,
+    // and each setLatLng is a style change the browser has to work off.
+    if(ac._mla!==ac.lat||ac._mlo!==ac.lon){
+      ac.mk.setLatLng([ac.lat,ac.lon]);
+      ac.lb.setLatLng([ac.lat,ac.lon]);
+      ac._mla=ac.lat;ac._mlo=ac.lon;
+    }
     const _ik=hdg+'|'+c+'|'+sel+'|'+st.opacity+'|'+st.gray+'|'+ac.expired+'|'+ac.pinned+'|'+ac.sqk;
     if(ac._ik!==_ik){ac.mk.setIcon(mkIcon(hdg,c,sel,st,ic));ac._ik=_ik}
     const _li=lMode==='dist'?(ac.dist!=null?ac.dist.toFixed(1):''):(ac.alt||'');
@@ -1454,7 +1460,18 @@ function addLog(l){
   const el=document.getElementById('log-output');
   if(logPaused.length){for(const pl of logPaused)appendLogLine(el,pl);logPaused=[];}
   appendLogLine(el,l);
-  el.scrollTop=el.scrollHeight;
+  logFollow(el);
+}
+// The log follows its end once per frame, not once per line. Reading
+// scrollHeight straight after changing the page makes the browser lay the page
+// out there and then: per line that was one layout per line - 300 a second at
+// 300 lines a second, 0.6 s of layout per second with the log open, and at
+// 1000 lines a second more than a second per second: the page stood still.
+let _logFollowDue=false;
+function logFollow(el){
+  if(_logFollowDue)return;
+  _logFollowDue=true;
+  requestAnimationFrame(()=>{_logFollowDue=false;el.scrollTop=el.scrollHeight});
 }
 function stripAnsi(s){return s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g,'')}
 function appendLogLine(el,l){
@@ -3963,6 +3980,28 @@ function flashSetSpeed(v){try{localStorage.setItem('flash_baud',String(v));local
 function flashFastWorked(ok){try{if(ok)localStorage.removeItem('flash_fast_failed');else localStorage.setItem('flash_fast_failed',String(flashWanted()))}catch(e){}}
 function flashUpdUi(){const sel=document.getElementById('flash-speed-sel');if(sel)sel.value=String(flashWanted());const k=document.getElementById('flash-keep');if(k)k.checked=flashKeepWanted()}
 
+// Into the loader. esptool-js 0.5.4's main() hands the baud rate to connect()
+// as the number of attempts, so with a loader that does not answer it does not
+// come back (115200 attempts). Its steps are done here with a number of our
+// own (three at a faster speed that has 115200 behind it, ten at the last);
+// an attempt takes one to four seconds.
+async function flashEnter(loader,attempts){
+  if(typeof loader.connect!=='function'||typeof loader.runStub!=='function')return loader.main();
+  await loader.connect('default_reset',attempts);
+  const chip=loader.chip&&typeof loader.chip.getChipDescription==='function'?await loader.chip.getChipDescription(loader):'device';
+  if(loader.chip&&typeof loader.chip.postConnect==='function')await loader.chip.postConnect(loader);
+  await loader.runStub();
+  return chip;
+}
+// Out of the loader and into the firmware: a pulse on RTS (the reset line)
+// with DTR released, on the port itself. esptool-js 0.5.4 has no hardReset()
+// any more, and its after('hard_reset') releases RTS without asserting it first.
+async function flashRestart(p){
+  await p.setSignals({dataTerminalReady:false,requestToSend:true});
+  await new Promise(r=>setTimeout(r,100));
+  await p.setSignals({dataTerminalReady:false,requestToSend:false});
+}
+
 async function doFlash(binData){
   const mod=await loadEsptool();
   if(!mod)return false;
@@ -4026,14 +4065,19 @@ async function doFlash(binData){
   }
   let planChecked=!plan.keep,cancelled=false;
   const speeds=flashSpeeds();
-  let transport=null,loader=null,flashed=false;
+  let transport=null,loader=null,flashed=false,fastNoAnswer=false;
   for(let si=0;si<speeds.length&&!flashed;si++){
     const spd=speeds[si],last=si+1>=speeds.length;
     let stage='connect';
     try{
       flashLog('Connecting to bootloader at '+spd+' baud...','fl-info');
       flashStatus('Connecting...','');
-      transport=new mod.Transport(flashPort,true);
+      // esptool-js's trace (second argument) hex-dumps every byte both ways to the
+      // console and keeps it all in memory - tens of megabytes for one image.
+      // Off unless asked for: localStorage.setItem('flash_trace','1')
+      let trace=false;try{trace=localStorage.getItem('flash_trace')==='1'}catch(e){}
+      transport=new mod.Transport(flashPort,trace);
+      if(!trace)transport.trace=function(){};   // 0.5.4 traces what it reads whether asked to or not
       loader=new mod.ESPLoader({
         transport,
         baudrate:spd,        // the same as romBaudrate: no speed change, so no reopen
@@ -4044,8 +4088,9 @@ async function doFlash(binData){
           write(d){}
         }
       });
-      const chip=await loader.main();
+      const chip=await flashEnter(loader,last?10:3);
       flashLog('Connected: '+chip+' at '+spd+' baud','fl-ok');
+      if(fastNoAnswer)flashFastWorked(false);   // the loader answers at this speed and did not at the faster one
 
       // Keeping the settings: are the device's where this firmware will look for them?
       if(!planChecked){
@@ -4103,7 +4148,7 @@ async function doFlash(binData){
     }catch(e){
       if(!last){
         flashLog((stage==='connect'?'No answer from the bootloader':'Write failed')+' at '+spd+' baud ('+e.message+') – again at '+speeds[si+1],'fl-info');
-        if(stage==='connect')flashFastWorked(false);
+        if(stage==='connect')fastNoAnswer=true;
       }else if(stage==='connect'){
         flashLog('Bootloader connection failed: '+e.message,'fl-err');
         flashLog('Try: hold BOOT → press RESET → release BOOT → click Flash again.','fl-info');
@@ -4120,7 +4165,7 @@ async function doFlash(binData){
   if(!flashed){
     if(cancelled){
       // the device is in the boot loader and has not been written: restart it into its firmware
-      try{await loader.hardReset()}catch(e){}
+      try{await flashRestart(flashPort)}catch(e){}
       try{await transport.disconnect()}catch(ex){}
       try{await flashPort.close()}catch(ex){}
     }
@@ -4131,7 +4176,7 @@ async function doFlash(binData){
 
   // Reset
   flashLog('Resetting device...','fl-info');
-  try{await loader.hardReset()}catch(e){
+  try{await flashRestart(flashPort)}catch(e){
     flashLog('Auto-reset failed – please press RESET button.','fl-info');
   }
 
@@ -5703,7 +5748,46 @@ function updateLabels3d(){
   });
 }
 
+// --- Meter: what the page spends on the device's lines, as the browser sees it ---
+// Off unless asked for: add ?perf=1 to the address, or scopePerf(true) in the
+// console. Every five seconds it writes one line to the log:
+//   [scope] perf: 312 lines/s, 41 ms/s in handleLine (131 us a line), 58 frames/s, worst frame 34 ms, long tasks 0
+// lines/s and the time in handleLine() are the page's work per line; frames
+// and long tasks (the browser's own count of stretches over 50 ms) say whether
+// the page as a whole keeps up - they include style, layout and paint.
+let perfOn=false,perfIv=null,perfObs=null,perfOrig=null;
+const perfC={n:0,ms:0,frames:0,worst:0,lastF:0,longN:0,longMs:0,t0:0};
+function scopePerf(on){
+  on=!!on;
+  if(on===perfOn)return perfOn;
+  perfOn=on;
+  if(!on){
+    if(perfOrig){handleLine=perfOrig;perfOrig=null}
+    if(perfIv){clearInterval(perfIv);perfIv=null}
+    if(perfObs){try{perfObs.disconnect()}catch(e){}perfObs=null}
+    addLog('[scope] perf: meter off');
+    return false;
+  }
+  perfOrig=handleLine;
+  const h=perfOrig;
+  handleLine=function(l){const t=performance.now();try{return h(l)}finally{perfC.ms+=performance.now()-t;perfC.n++}};
+  try{perfObs=new PerformanceObserver(l=>{for(const e of l.getEntries()){perfC.longN++;perfC.longMs+=e.duration}});perfObs.observe({entryTypes:['longtask']})}catch(e){perfObs=null}
+  const frame=ts=>{if(!perfOn)return;if(perfC.lastF)perfC.worst=Math.max(perfC.worst,ts-perfC.lastF);perfC.lastF=ts;perfC.frames++;requestAnimationFrame(frame)};
+  perfC.n=perfC.ms=perfC.frames=perfC.worst=perfC.lastF=perfC.longN=perfC.longMs=0;perfC.t0=performance.now();
+  requestAnimationFrame(frame);
+  perfIv=setInterval(()=>{
+    const s=(performance.now()-perfC.t0)/1000;if(s<=0)return;
+    const msg='[scope] perf: '+Math.round(perfC.n/s)+' lines/s, '+Math.round(perfC.ms/s)+' ms/s in handleLine ('+(perfC.n?Math.round(perfC.ms/perfC.n*1000):0)+' us a line), '
+      +Math.round(perfC.frames/s)+' frames/s, worst frame '+Math.round(perfC.worst)+' ms, long tasks '+perfC.longN+(perfC.longN?' ('+Math.round(perfC.longMs)+' ms)':'')+(perfObs?'':' (not counted by this browser)');
+    perfC.n=perfC.ms=perfC.frames=perfC.worst=perfC.longN=perfC.longMs=0;perfC.t0=performance.now();
+    addLog(msg);
+  },5000);
+  addLog('[scope] perf: meter on - a line here every 5 s; scopePerf(false) turns it off');
+  return true;
+}
+
 initMap();syncPanelH();setInterval(tick,1000);setInterval(linkTick,1000);linkUpdUi();flashUpdUi();fetchLatestVersion();
+try{if(/[?&]perf=1\b/.test(location.search))scopePerf(true)}catch(e){}
 function posZoom(){const h=document.getElementById('panel').offsetHeight;const b=(h+12)+'px';document.getElementById('zoom-ctrl').style.bottom=b;document.getElementById('legend').style.bottom=b;const ae=document.getElementById('ae-slider');if(ae)ae.style.bottom=b;const ci=document.getElementById('cam-mode-ind');if(ci)ci.style.bottom=b;const ch=document.getElementById('cam-help');if(ch)ch.style.bottom=b}
 function posTopbar(){
   const tb=document.getElementById('topbar').offsetHeight;
