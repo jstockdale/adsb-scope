@@ -1,0 +1,7 @@
+decimal text against printf:        3787307 values, 0 differ
+float text against printf(float):   1000000 values, 72 differ, none by more than one in the last digit
+distance against double haversine:  2000000 pairs out to 450 nm, largest difference 0.00052 km (6.2e-07 of the distance beyond 1 km)
+bearing against double haversine:   largest difference 0.00003 degrees (pairs more than 200 m apart)
+printed values that changed:        km to 0.1: 0.021 %   nm to 0.1: 0.011 %   bearing to 1 degree: 0.001 %
+nearest/farthest by rank:           20000 sets of 60, the pick is within 0.00000 km of the true one
+test_fmt: ok (4787307 decimal texts, 2000000 distances, 20000 rankings)

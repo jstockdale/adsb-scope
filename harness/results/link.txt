@@ -1,0 +1,89 @@
+# link/check_fastlog.py: tools/adsb-fastlog.py and the speed protocol against the simulated device
+1. 300 lines a second, logger at 921600
+  ok    logger exits cleanly
+  ok    link came up at 921600
+  ok    no line missing among the last 600 (0 missing)
+  ok    the device's own status is appended, taken at 921600
+  ok    keepalive answers stay out of the log
+  ok    after the logger left, the device is back at 115200 at once
+2. the same traffic, logger kept at 115200
+  ok    at 115200 most lines never arrive (73 % of the last stretch lost)
+3. a link that does not work above 460800
+  ok    921600 is tried, not confirmed, and 460800 comes up
+  ok    no line missing among the last 400 at 460800 (0 missing)
+4. firmware without `baud`
+  ok    recognised as older firmware
+  ok    logged at 115200, boot log included
+5. a device that resets when the port is opened
+  ok    link up at 921600 after the boot
+  ok    the boot log is in the file
+  ok    no line missing among the last 600 (0 missing)
+6. the logger stalls for 12 s (the device falls back), then carries on
+  ok    the logger notices the device has gone back to 115200
+  ok    and brings the link up again
+  ok    no line missing among the last 600 (0 missing)
+7. the probe
+  ok    probe runs and reports: ["sent 'U' at 921600 baud; the device counted 1000 edges and estimates 930232 baud (+0.9 %)"]
+8. a host that must reopen its port (the web page): `baud 921600 next`, on a device that resets on open
+  ok    first open: boot at 115200
+  ok    request stored for the next start
+  ok    second open at 921600: the console comes up readable
+  ok    (its boot log, at 115200, was not)
+  ok    confirmed: up at 921600
+  ok    keepalive answered at 921600
+  ok    silent host: the device is back at 115200 after about 10 s (10.0 s)
+9. the request is made but the host comes back at 115200
+  ok    the device says at 115200 that it is about to start at 921600
+  ok    and comes back to 115200 by itself (11.2 s after the open)
+  ok    usable at 115200 afterwards
+  ok    the next start is at 115200 again
+10. the request is made and no reset follows
+  ok    it is dropped after 15 s
+
+check_fastlog: ok
+
+# link/check_page.js: the web app's serial code against the simulated device
+1. T-Display-P4: opening the port restarts the device; firmware with `baud`
+  ok    the link comes up (state up)
+  ok    the port was opened at 115200, then once more at 921600 (115200, 921600)
+  ok    the page says what it is doing
+  ok    the version read from the first boot log is kept
+  ok    lines arrive at 921600 (1251 in 5 s)
+  ok    none missing among the last 1000 (0)
+  ok    keepalive answers do not reach the log or the parser
+  ok    the boot log at the wrong speed is not shown as garbage
+  ok    no two writes ever met on the port
+  ok    still up after 11 s (the keepalive holds the device at 921600)
+  ok    disconnect leaves the page at 115200
+2. the same traffic with the setting at 115200
+  ok    no negotiation, one open
+  ok    most lines are dropped by the device before they are sent (67 % of the last stretch)
+3. a device that does not restart when the port is opened
+  ok    the link comes up (state up)
+  ok    asked, reopened, confirmed – no restart
+  ok    none missing among the last 500
+4. firmware before coh4
+  ok    the page gives up on a faster speed (state off)
+  ok    the port is not reopened
+  ok    and says why
+  ok    lines keep arriving at 115200
+5. no restart on open, and a link that fails above 460800
+  ok    ends up at 460800 (state up, 460800)
+  ok    921600 tried and not confirmed, back to 115200, then 460800 (115200, 921600, 115200, 460800)
+6. restart on open, and a link that fails above 460800
+  ok    the page gives up after the restart is not confirmed (state off)
+  ok    and is back at 115200 (115200, 921600, 115200)
+  ok    where lines arrive again, readable
+7. the device restarts by itself while the link is up
+  ok    up
+  ok    the page notices within its 8 s
+  ok    and brings the link up again (state up)
+  ok    by way of 115200 (115200, 921600, 115200, 921600)
+  ok    none missing among the last 200
+8. the connect leaves the device in download mode
+  ok    the page sees "waiting for download" and restarts the device
+  ok    and then brings the link up as usual (state up)
+9. writes that meet
+  ok    four writes asked for at once go out one after another
+
+check_page: ok

@@ -18,6 +18,9 @@ harness/sim_gain
 harness/test_fix_c
 harness/test_batch
 harness/test_ring
+harness/test_fmt
+harness/test_link
+harness/sim_device
 harness/old_batch_size
 harness/*.so
 harness/results/work/

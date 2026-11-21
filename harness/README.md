@@ -19,7 +19,7 @@ feeder tests, `../docs/UPLINK.md`.
 | `gen_syndrome_tables.py` | generates `mode_s_syndromes.h`; refuses to emit unless its proofs pass |
 | `host_mode_s.c` | drives the decoder: historical per-chunk path (`--stream 0`) or streaming path (`--stream 1`), all decoder options as flags |
 | `baseline/` | the decoder exactly as of the vendor cut (commit `b8dd639`) + two instrumentation lines – the A/B reference |
-| `Makefile` | `make` builds `host_mode_s`, `host_mode_s_df18off`, `host_mode_s_baseline`, `test_fix_c`, `test_batch`, `test_ring` |
+| `Makefile` | `make` builds `host_mode_s`, `host_mode_s_df18off`, `host_mode_s_baseline`, `test_fix_c`, `test_batch`, `test_ring`, `test_fmt`, `test_link`, `sim_device` |
 | `test_fix_c.c` | exhaustive 1-bit / 2-bit correction tests against the real fixers |
 | `ring/test_ring.c` | the sample ring between USB reader and decoder (`sample_ring.c`): directed cases, a random run against a model, and a two-thread run that overflows it on purpose; part of `make check` |
 | `feeder/test_batch.c`, `feeder/check_feeder.py` | MQTT feeder: per-aircraft batching and the JSON serialiser (`mqtt_batch.c`), every produced message validated with Python's JSON parser; part of `make check` |
@@ -49,6 +49,12 @@ feeder tests, `../docs/UPLINK.md`.
 | `experiments/es_lost_truth.py` | the decoder's squitter error rate (lost / seen) against what the simulator really sent → `results/gain_es_lost_truth.txt` |
 | `gain/sim_gain.c`, `gain/check_gain.sh` | the firmware's gain loop (`gain_ctl.c`) on model receivers; part of `make check` → `results/gain_sim.txt` |
 | `experiments/cost_rv32.py` | what the decoder costs in the device's own instructions: built with the firmware's compiler, run under qemu-riscv32 (needs both) → `results/cost_rv32.txt` |
+| `fmt/test_fmt.c` | number text and great-circle distance without double arithmetic (`adsb_fmt.c`) against `printf` and the old `haversine()`; part of `make check` → `results/fmt.txt` |
+| `link/test_link.c` | the console-speed state machine (`console_link.c`) through its cases; part of `make check` |
+| `link/sim_device.c` | a stand-in for the device's console on a pseudo-terminal, running `console_link.c`: wire speed, garbage on a speed mismatch, reset on open, older firmware, download mode |
+| `link/check_fastlog.py` | `../tools/adsb-fastlog.py` and the bare speed protocol against `sim_device`, ten cases; part of `make check` → `results/link.txt` |
+| `link/check_page.js` | the web app's own script (`adsb_scope.htm`, run in Node) against `sim_device`, nine cases; part of `make check` when Node is installed → `results/link.txt` |
+| `experiments/cost_app_rv32.py` | what a decoded message and a list refresh cost in the device's instructions, before and after coh4 (needs the ESP-IDF toolchain and qemu-riscv32) → `results/cost_app_rv32.txt` |
 | `results/` | CSVs and plot from the runs reported in `docs/DECODER.md` |
 
 ## Checks that need nothing but gcc and Python
@@ -234,6 +240,47 @@ echo "done - results in $R"
 To watch the loop work: `./sim_gain gain/madrid_model.txt --site 21 --hours 1 --log`
 prints its log lines on a model site whose top gain step is 21 dB too hot.
 `--site 0` is a site where the top step is right.
+
+## Around the decoder and the console link (`../docs/UPLINK.md` sections 9.7 and 9.8)
+
+What coh4 added, and how each number in `results/fmt.txt`,
+`results/link.txt` and `results/cost_app_rv32.txt` is made. No recordings
+needed. Three commands, each complete in itself; the first two need gcc,
+make and Python 3, the page test in the second also Node 18 or later
+(without it that one test is skipped, and says so).
+
+```sh
+cd ~/adsb-scope/harness && make check-quick
+```
+
+Seconds. Everything `make check` runs except the two below, including
+`test_fmt` (number text against `printf`, distance and bearing against the
+old double-precision `haversine()`) and `test_link` (the console-speed
+state machine). `./test_fmt --report` prints the figures.
+
+```sh
+cd ~/adsb-scope/harness && make check
+```
+
+About six minutes more: `link/check_fastlog.py` runs
+`../tools/adsb-fastlog.py` and the bare protocol against `sim_device` – a
+stand-in for the device on a pseudo-terminal, running the firmware's own
+`console_link.c` – and `link/check_page.js` runs the web app's own script
+against the same stand-in. If your Python is ESP-IDF's (after `export.sh`),
+add `PYTHON=/usr/bin/python3`.
+
+```sh
+. ~/esp/esp-idf/export.sh && cd ~/adsb-scope/harness && python3 experiments/cost_app_rv32.py
+```
+
+A few minutes. What a decoded message and a list refresh cost in RISC-V
+instructions, before and after; needs ESP-IDF v5.4.1's toolchain and
+qemu-riscv32 (`sudo apt install qemu-user`), and says so if either is
+missing.
+
+To play with the stand-in by hand: `./sim_device --rate 300 --reset-on-open`
+prints the path of a terminal (`/dev/pts/N`); `python3
+../tools/adsb-fastlog.py --port /dev/pts/N --seconds 10` logs from it.
 
 ## Things to know when reading the numbers
 

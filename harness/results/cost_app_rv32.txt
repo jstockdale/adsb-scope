@@ -1,0 +1,28 @@
+text: 42 lines from each version (a list of 40 aircraft, a console line, an SD row); 0 differ
+
+RISC-V instructions (-Og, firmware flags), 80 % of the aircraft with a position
+
+the aircraft list, refreshed twice a second while the ADS-B app is open:
+  aircraft    coh3, all under the lock   coh4 under the lock   coh4 in all
+        25                      0.96 M                 3.7 k        0.17 M
+        50                      1.94 M                 4.9 k        0.34 M
+       100                      4.17 M                 7.5 k        0.72 M
+       150                      6.36 M                10.1 k        1.12 M
+       200                      8.63 M                12.6 k        1.55 M
+       250                     11.06 M                15.2 k        2.01 M
+
+nearest and farthest (status bar and ADS-B app, once a second or more):
+  aircraft    coh3, under the lock   coh4 (two distances of it after the lock)
+        25                  0.72 M                                      17.2 k
+        50                  1.44 M                                      29.4 k
+       100                  3.03 M                                      56.2 k
+       150                  4.50 M                                      81.1 k
+       200                  5.93 M                                     105.3 k
+       250                  7.44 M                                     130.9 k
+
+one decoded message: console line, SD card row, distance for MQTT:
+  aircraft with a position     coh3  199.7 k   coh4  23.1 k   (8.6 times less)
+  aircraft without one         coh3   36.2 k   coh4  17.2 k
+
+at 300 messages a second, all from aircraft with a position: coh3 59.9 M a second, coh4 6.9 M
+(the demodulator itself: 149 M per second of signal, results/cost_rv32.txt)
