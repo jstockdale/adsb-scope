@@ -20,6 +20,7 @@ harness/test_batch
 harness/test_ring
 harness/test_fmt
 harness/test_link
+harness/test_wifi_sup
 harness/sim_device
 harness/old_batch_size
 harness/*.so

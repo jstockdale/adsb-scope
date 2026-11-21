@@ -1,0 +1,13 @@
+1. the order a round tries the saved networks in
+2. a normal connect, and staying there
+3. the link is lost: a round at once, the next candidate when one refuses
+4. nothing in range: it never gives up, and the waits are 1, 2, 4 ... 60, 60 s
+5. a connect that gets no address, a scan that never reports, a disconnect that never reports
+6. up, but nothing gets through
+7. a manual choice
+8. the list is edited while running
+9. the list itself
+10. the radio's power cycle is off unless asked for; asked for, once per period
+11. the clock wraps
+
+test_wifi_sup: ok (293 checks)

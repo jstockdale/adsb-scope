@@ -29,7 +29,7 @@ CC     ?= gcc
 PYTHON ?= python3
 CFLAGS := -std=gnu17 -O2 -Wall
 LDLIBS := -lm
-BINS   := host_mode_s host_mode_s_plain host_mode_s_df18off host_mode_s_baseline test_fix_c test_batch test_ring sim_gain test_fmt test_link sim_device
+BINS   := host_mode_s host_mode_s_plain host_mode_s_df18off host_mode_s_baseline test_fix_c test_batch test_ring sim_gain test_fmt test_link test_wifi_sup sim_device
 
 all: $(BINS)
 
@@ -73,6 +73,9 @@ test_fmt: fmt/test_fmt.c $(APP)/adsb_fmt.c $(APP)/adsb_fmt.h
 test_link: link/test_link.c $(APP)/console_link.c $(APP)/console_link.h
 	$(CC) $(CFLAGS) -Wextra -I$(APP) -o $@ link/test_link.c $(APP)/console_link.c
 
+test_wifi_sup: wifi/test_wifi_sup.c $(APP)/wifi_sup.c $(APP)/wifi_sup.h
+	$(CC) $(CFLAGS) -Wextra -I$(APP) -o $@ wifi/test_wifi_sup.c $(APP)/wifi_sup.c
+
 sim_device: link/sim_device.c $(APP)/console_link.c $(APP)/console_link.h
 	$(CC) $(CFLAGS) -Wextra -I$(APP) -o $@ link/sim_device.c $(APP)/console_link.c
 
@@ -92,6 +95,7 @@ check: all
 	sh gain/check_gain.sh
 	./test_fmt
 	./test_link
+	./test_wifi_sup
 	$(PYTHON) link/check_fastlog.py
 	@if command -v node >/dev/null 2>&1; then node link/check_page_flash.js && node link/check_page.js; \
 	 else echo "SKIPPED: link/check_page_flash.js and link/check_page.js (the web app's own code) - node 18 or later is not installed"; fi
@@ -106,6 +110,7 @@ check-quick: all
 	sh gain/check_gain.sh
 	./test_fmt
 	./test_link
+	./test_wifi_sup
 	@if command -v node >/dev/null 2>&1; then ONLY=1,2,3,4,5,6,10,11 node link/check_page_flash.js; \
 	 else echo "SKIPPED: link/check_page_flash.js (the web app's flashing code) - node 18 or later is not installed"; fi
 
