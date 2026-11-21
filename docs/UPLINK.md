@@ -778,7 +778,7 @@ own `adsb status` and `baud` and says goodbye. Against the simulated
 device with 300 lines a second: none missing at 921600, 73 % never sent at
 115200 (`harness/results/link.txt`).
 
-**The web app** (`adsb_scope.htm`, v1.0.9): "Serial speed" in the
+**The web app** (`adsb_scope.htm`, v1.0.9; v1.0.10 with coh5): "Serial speed" in the
 firmware panel (default 921600; 115200 is the old behaviour), shown in the
 session panel. It also now: queues its writes (a keepalive can no longer
 collide with a command's write on the port), hides the garbage of a boot
@@ -798,6 +798,38 @@ whole thing again at 115200 and does not try the faster speed again until
 the setting is chosen anew. **Whether the ESP32-P4's ROM does this is not
 confirmed** – Espressif's page for the P4 only recommends 115200 – so the
 first flash from the page will show which.
+
+**Keeping the settings when flashing from the page (coh5).** The merged
+image is written from 0x0, so it covered the settings partition with 0xFF:
+every flash from the page reset the settings, the WiFi credentials and the
+Meshtastic identity. With "Settings: keep when flashing" ticked – the
+default; the page remembers the choice – the same image is written in two
+pieces, around the NVS partition, which the page finds in the image's own
+partition table (0x9000, 24 kB). It first reads the device's partition
+table through the loader. If the device has its settings partition in the
+same place – true of the April layout as well as the current one – they
+are kept. If it has them somewhere else, the page says where and asks
+before it writes the whole image and resets them. A device without a
+table has nothing to keep. A file that is not a merged image is refused
+(with the box unticked: questioned), where it used to be written at 0x0
+whatever it was.
+
+Tested with a stand-in for esptool-js that writes into a flash image held
+by the test and erases whole sectors under what it writes
+(`harness/link/check_page_flash.js`, twelve cases, also run on the real
+merged image): the settings partition comes out byte for byte as it was
+and everything else is the new image; the refusals, the question and the
+fall-back to 115200 behave as described. The stand-in has the calls the
+page uses with the signatures of esptool-js 0.5.4, checked against that
+version's source. Its erasing is modelled on esptool's flasher stub,
+which esptool-js runs on the device: `handle_flash_begin` in the stub's
+`stub_write_flash.c` erases the sectors from the first to the last of
+the size it is given, and uses 64 kB block erases only where sixteen
+sectors remain from a 64 kB boundary. Both of the page's pieces begin
+and end on sector boundaries, so by that source nothing between 0x9000
+and 0xEFFF is erased. (The source is the stub's current one; the binary
+that esptool-js 0.5.4 carries was not taken apart.) Not tested: the real
+esptool-js on a device.
 
 **`baud probe [ms]`** is a diagnostic for the next step: it measures the
 speed of what arrives with the UART's pulse counters, whatever the UART is
