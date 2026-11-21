@@ -44,7 +44,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "esp_attr.h"
+#include "wifi_sup.h"          // which saved network, and when to try again
+#include "wifi_hosted_api.h"   // what the console and the UI may ask
 
 // Time manager — must be included before event handler uses esp_sntp / NTP functions
 #include "time_manager.h"
@@ -73,21 +79,152 @@ static const char *WIFI_TAG = "WIFI";
 #define WIFI_CONNECTED_BIT   BIT0
 #define WIFI_FAIL_BIT        BIT1
 
-// Max reconnect attempts before giving up (-1 = infinite)
-#define WIFI_MAX_RETRIES     10
+// Reconnecting is wifi_sup.c's business: it never gives up (rounds of scan +
+// connect, waits of 1, 2, 4 ... 60 s between rounds that connect nowhere).
+// Until coh6 this file retried 10 times with a growing delay inside the event
+// handler - 55 s in all - and then stopped for good.
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
 static EventGroupHandle_t s_wifi_event_group = NULL;
-static int s_wifi_retry_count = 0;
 static volatile bool s_wifi_initialized = false;
 static volatile bool s_wifi_connected = false;
 static volatile bool s_wifi_paused = false;
 static esp_netif_t *s_sta_netif = NULL;
 
 // WiFi credentials (runtime configurable)
-static char s_wifi_ssid[33] = WIFI_SSID;
-static char s_wifi_pass[65] = WIFI_PASS;
+
+// ─── Supervisor: the saved networks and the task that acts on wifi_sup's decisions ───
+typedef enum { WE_START, WE_SCAN_DONE, WE_GOT_IP, WE_DISC, WE_RELOAD, WE_USE, WE_LINK_DEAD, WE_SCAN_REQ } wifi_ev_t;
+typedef struct { uint8_t ev; int8_t arg; } wifi_msg_t;
+#define WIFI_SCAN_MAX 24
+static ws_t s_ws;                              // guarded by s_ws_mu
+static ws_net_t s_nets[WS_MAX_NETS];           // the saved list as last given; guarded by s_ws_mu once it exists
+static int s_n_nets = 0;
+static bool s_ws_started = false;
+static QueueHandle_t s_ws_q = NULL;
+static SemaphoreHandle_t s_ws_mu = NULL;
+static EXT_RAM_BSS_ATTR ws_ap_t s_scan[WIFI_SCAN_MAX];
+static int s_scan_n = 0;
+static uint32_t s_scan_seq = 0;
+static int s_wifi_last_reason = 0;
+
+extern "C" void wifi_hosted_pause(void);
+extern "C" void wifi_hosted_resume(void);
+
+static inline uint32_t wifi_now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+static inline void wifi_post(wifi_ev_t ev, int arg) {
+    if (!s_ws_q) return;
+    wifi_msg_t m = { (uint8_t)ev, (int8_t)arg };
+    xQueueSend(s_ws_q, &m, 0);                 // never blocks: this is called from the event handler
+}
+#define WIFI_SAY(fmt, ...) do { char _ts[32]; log_format_timestamp(_ts, sizeof(_ts)); serial_console_print("%sWIFI: " fmt "\n", _ts, ##__VA_ARGS__); } while (0)
+
+// Carry out one decision. Returns what follows from it when it fails on the spot.
+static ws_cmd_t wifi_sup_exec(ws_cmd_t c) {
+    ws_cmd_t next = { WA_NONE, -1 };
+    switch (c.act) {
+    case WA_SCAN: {
+        wifi_scan_config_t sc = {};
+        sc.show_hidden = true;
+        if (esp_wifi_scan_start(&sc, false) != ESP_OK) {       // cannot scan: an empty scan, so that the round ends and is retried
+            xSemaphoreTake(s_ws_mu, portMAX_DELAY);
+            next = ws_on_scan(&s_ws, NULL, 0, wifi_now_ms());
+            xSemaphoreGive(s_ws_mu);
+        }
+        break;
+    }
+    case WA_CONNECT: {
+        ws_net_t net; int lvl;
+        xSemaphoreTake(s_ws_mu, portMAX_DELAY);
+        net = s_ws.nets[c.net]; lvl = s_ws.seen[c.net];
+        xSemaphoreGive(s_ws_mu);
+        wifi_config_t wc = {};
+        strncpy((char *)wc.sta.ssid, net.ssid, sizeof(wc.sta.ssid));
+        strncpy((char *)wc.sta.password, net.pass, sizeof(wc.sta.password));
+        wc.sta.threshold.authmode = net.pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;   // no password: an open network
+        wc.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+        esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &wc);
+        if (e == ESP_OK) e = esp_wifi_connect();
+        if (lvl != WS_NOT_SEEN) WIFI_SAY("Connecting to %s (%d dBm)", net.ssid, lvl);
+        else                    WIFI_SAY("Connecting to %s (not seen in the scan)", net.ssid);
+        if (e != ESP_OK) {
+            ESP_LOGW(WIFI_TAG, "connect to %s failed at once: %s", net.ssid, esp_err_to_name(e));
+            xSemaphoreTake(s_ws_mu, portMAX_DELAY);
+            next = ws_on_disconnected(&s_ws, wifi_now_ms());
+            xSemaphoreGive(s_ws_mu);
+        }
+        break;
+    }
+    case WA_DISCONNECT:
+        esp_wifi_disconnect();                 // the event that follows (or wifi_sup's 3 s) moves things on
+        break;
+    case WA_POWER_CYCLE:
+        WIFI_SAY("Down for a long time - power-cycling the radio");
+        wifi_hosted_pause();
+        wifi_hosted_resume();                  // STA_START follows and starts the supervisor again
+        break;
+    default: break;
+    }
+    return next;
+}
+
+static void wifi_sup_task(void *arg) {
+    static EXT_RAM_BSS_ATTR wifi_ap_record_t recs[WIFI_SCAN_MAX];
+    for (;;) {
+        wifi_msg_t m = { 0, 0 };
+        ws_cmd_t c = { WA_NONE, -1 };
+        bool got = xQueueReceive(s_ws_q, &m, pdMS_TO_TICKS(1000)) == pdTRUE;
+        uint16_t n_recs = 0;
+        if (got && m.ev == WE_SCAN_DONE) {
+            n_recs = WIFI_SCAN_MAX;
+            if (esp_wifi_scan_get_ap_records(&n_recs, recs) != ESP_OK) n_recs = 0;
+        }
+        bool want_scan = false;
+        uint32_t now = wifi_now_ms();
+        xSemaphoreTake(s_ws_mu, portMAX_DELAY);
+        ws_state_t before = s_ws.state;
+        uint32_t failed_before = s_ws.rounds_failed;
+        if (!got) {
+            if (s_ws_started && !s_wifi_paused) c = ws_tick(&s_ws, now);
+        } else switch (m.ev) {
+            case WE_START: {
+                ws_t old = s_ws;
+                ws_init(&s_ws, s_nets, s_n_nets);
+                if (s_ws_started) { s_ws.cfg = old.cfg; s_ws.ups = old.ups; s_ws.losses = old.losses; }
+                s_ws_started = true;
+                c = ws_start(&s_ws, now);
+                break;
+            }
+            case WE_SCAN_DONE:
+                s_scan_n = n_recs;
+                for (int i = 0; i < n_recs; i++) {
+                    memset(&s_scan[i], 0, sizeof(s_scan[i]));
+                    strncpy(s_scan[i].ssid, (const char *)recs[i].ssid, WS_SSID_MAX);
+                    s_scan[i].rssi = recs[i].rssi;
+                }
+                s_scan_seq++;
+                c = ws_on_scan(&s_ws, s_scan, s_scan_n, now);
+                break;
+            case WE_GOT_IP:    c = ws_on_got_ip(&s_ws, now); break;
+            case WE_DISC:      c = ws_on_disconnected(&s_ws, now); break;
+            case WE_RELOAD:    if (s_ws_started) c = ws_reload(&s_ws, s_nets, s_n_nets, now); break;
+            case WE_USE:       c = ws_use(&s_ws, m.arg, now); break;
+            case WE_LINK_DEAD: c = ws_link_dead(&s_ws, now); break;
+            case WE_SCAN_REQ:  want_scan = (s_ws.state == WS_UP || s_ws.state == WS_WAITING); break;
+        }
+        ws_state_t after = s_ws.state;
+        uint32_t failed = s_ws.rounds_failed, retry = ws_retry_in_ms(&s_ws, now);
+        xSemaphoreGive(s_ws_mu);
+
+        if (before == WS_UP && after != WS_UP)
+            WIFI_SAY("Connection lost (reason %d) - looking for a saved network", s_wifi_last_reason);
+        if (after == WS_WAITING && failed != failed_before && (failed == 1 || failed % 10 == 0))
+            WIFI_SAY("No saved network could be joined - next try in %u s (round %u)", (unsigned)((retry + 500) / 1000), (unsigned)failed);
+        if (want_scan) { wifi_scan_config_t sc = {}; sc.show_hidden = true; esp_wifi_scan_start(&sc, false); }
+        while (c.act != WA_NONE) c = wifi_sup_exec(c);
+    }
+}
 
 // ─── Event Handler ───────────────────────────────────────────────────────────
 
@@ -97,8 +234,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT) {
         switch (event_id) {
             case WIFI_EVENT_STA_START:
-                ESP_LOGI(WIFI_TAG, "STA started, connecting...");
-                esp_wifi_connect();
+                ESP_LOGI(WIFI_TAG, "STA started, looking for a saved network...");
+                wifi_post(WE_START, 0);
+                break;
+
+            case WIFI_EVENT_SCAN_DONE:
+                wifi_post(WE_SCAN_DONE, 0);
                 break;
 
             case WIFI_EVENT_STA_DISCONNECTED: {
@@ -107,18 +248,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                     (wifi_event_sta_disconnected_t *)event_data;
                 ESP_LOGW(WIFI_TAG, "Disconnected (reason=%d)", d->reason);
 
-                if (s_wifi_paused) break; // don't reconnect if intentionally paused
-
-                if (WIFI_MAX_RETRIES < 0 || s_wifi_retry_count < WIFI_MAX_RETRIES) {
-                    s_wifi_retry_count++;
-                    ESP_LOGI(WIFI_TAG, "Reconnect attempt %d/%d",
-                             s_wifi_retry_count, WIFI_MAX_RETRIES);
-                    vTaskDelay(pdMS_TO_TICKS(1000 * s_wifi_retry_count)); // backoff
-                    esp_wifi_connect();
-                } else {
-                    ESP_LOGE(WIFI_TAG, "Max retries reached");
-                    xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-                }
+                s_wifi_last_reason = d->reason;
+                if (s_wifi_paused) break;      // switched off on purpose
+                wifi_post(WE_DISC, 0);         // what happens next is the supervisor's decision; nothing waits in here
                 break;
             }
 
@@ -132,8 +264,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(WIFI_TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        s_wifi_retry_count = 0;
         s_wifi_connected = true;
+        wifi_post(WE_GOT_IP, 0);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
 
         // Log to serial console so webapp can see the IP
@@ -155,14 +287,26 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /**
- * Set WiFi credentials at runtime (before or after init).
- * If called after init, takes effect on next reconnect.
+ * The saved networks, in priority order. May be called before init and at any
+ * time after: the supervisor keeps the connection it has if that network is
+ * still on the list, and looks again if not.
  */
+extern "C" void wifi_hosted_set_networks(const ws_net_t *nets, int n) {
+    if (n > WS_MAX_NETS) n = WS_MAX_NETS;
+    if (s_ws_mu) xSemaphoreTake(s_ws_mu, portMAX_DELAY);
+    memset(s_nets, 0, sizeof(s_nets));
+    for (int i = 0; i < n; i++) s_nets[i] = nets[i];
+    s_n_nets = n;
+    if (s_ws_mu) xSemaphoreGive(s_ws_mu);
+    wifi_post(WE_RELOAD, 0);
+}
+
+/** One network, as before the list existed. */
 static inline void wifi_hosted_set_credentials(const char *ssid, const char *password) {
-    strncpy(s_wifi_ssid, ssid, sizeof(s_wifi_ssid) - 1);
-    s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = '\0';
-    strncpy(s_wifi_pass, password, sizeof(s_wifi_pass) - 1);
-    s_wifi_pass[sizeof(s_wifi_pass) - 1] = '\0';
+    ws_net_t one[1]; int n = 0;
+    memset(one, 0, sizeof(one));
+    ws_list_add(one, &n, ssid, password);
+    wifi_hosted_set_networks(one, n);
 }
 
 /**
@@ -245,7 +389,7 @@ static inline esp_err_t wifi_hosted_init(void) {
         return ESP_OK;
     }
 
-    if (s_wifi_ssid[0] == '\0') {
+    if (s_n_nets == 0) {
         ESP_LOGW(WIFI_TAG, "No SSID configured — skipping WiFi init");
         return ESP_ERR_INVALID_STATE;
     }
@@ -314,20 +458,21 @@ static inline esp_err_t wifi_hosted_init(void) {
 
     // ── 5. Configure and start ──
     {
-        wifi_config_t wifi_config = {};
-        strncpy((char *)wifi_config.sta.ssid, s_wifi_ssid, sizeof(wifi_config.sta.ssid));
-        strncpy((char *)wifi_config.sta.password, s_wifi_pass, sizeof(wifi_config.sta.password));
-        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-        wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+        // The supervisor has to exist before the radio starts: STA_START hands over to it.
+        if (!s_ws_mu) s_ws_mu = xSemaphoreCreateMutex();
+        if (!s_ws_q)  s_ws_q = xQueueCreate(16, sizeof(wifi_msg_t));
+        static bool sup_task_made = false;
+        if (s_ws_mu && s_ws_q && !sup_task_made)
+            sup_task_made = xTaskCreateWithCaps(wifi_sup_task, "wifi_sup", 6144, NULL, 2, NULL, MALLOC_CAP_SPIRAM) == pdPASS;
+        if (!sup_task_made) {
+            ESP_LOGE(WIFI_TAG, "WiFi supervisor could not be created");
+            err = ESP_ERR_NO_MEM;
+            goto fail_event;
+        }
 
         err = esp_wifi_set_mode(WIFI_MODE_STA);
         if (err != ESP_OK) {
             ESP_LOGE(WIFI_TAG, "set_mode failed: %s", esp_err_to_name(err));
-            goto fail_event;
-        }
-        err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-        if (err != ESP_OK) {
-            ESP_LOGE(WIFI_TAG, "set_config failed: %s", esp_err_to_name(err));
             goto fail_event;
         }
         err = esp_wifi_start();
@@ -378,6 +523,7 @@ extern "C" void wifi_hosted_pause(void) {
 
     ESP_LOGI(WIFI_TAG, "Pausing WiFi...");
     s_wifi_paused = true;
+    if (s_ws_mu) { xSemaphoreTake(s_ws_mu, portMAX_DELAY); ws_stop(&s_ws); xSemaphoreGive(s_ws_mu); }
 
     time_manager_stop_ntp();
     esp_wifi_disconnect();
@@ -405,7 +551,6 @@ extern "C" void wifi_hosted_resume(void) {
     vTaskDelay(pdMS_TO_TICKS(200));  // C6 boot time
 
     s_wifi_paused = false;
-    s_wifi_retry_count = 0;
 
     esp_wifi_start();  // will trigger STA_START → connect
     ESP_LOGI(WIFI_TAG, "WiFi resuming, reconnecting...");
@@ -420,6 +565,7 @@ static inline void wifi_hosted_deinit(void) {
 
     ESP_LOGI(WIFI_TAG, "Deinitializing WiFi...");
     s_wifi_paused = true; // prevent reconnect attempts
+    if (s_ws_mu) { xSemaphoreTake(s_ws_mu, portMAX_DELAY); ws_stop(&s_ws); xSemaphoreGive(s_ws_mu); }
 
     time_manager_stop_ntp();
 
@@ -469,4 +615,59 @@ static inline const char *wifi_hosted_get_ip(void) {
         }
     }
     return ip_str;
+}
+
+// ─── For the console and the UI (wifi_hosted_api.h) ─────────────────────────
+
+extern "C" uint8_t wifi_hosted_ui_state(void) {
+    if (!s_wifi_initialized || s_wifi_paused) return 0;
+    return s_wifi_connected ? 2 : 1;
+}
+
+extern "C" void wifi_hosted_get_status(wifi_hosted_status_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->cur = -1;
+    for (int i = 0; i < WS_MAX_NETS; i++) out->seen[i] = WS_NOT_SEEN;
+    out->active = s_wifi_initialized && !s_wifi_paused;
+    out->n = s_n_nets;
+    strcpy(out->ip, "0.0.0.0");
+    if (!s_ws_mu) return;
+    uint32_t now = wifi_now_ms();
+    xSemaphoreTake(s_ws_mu, portMAX_DELAY);
+    out->state = (uint8_t)s_ws.state;
+    out->n = s_ws_started ? s_ws.n : s_n_nets;
+    out->cur = s_ws.cur;
+    if (s_ws.cur >= 0 && s_ws.cur < s_ws.n) strcpy(out->ssid, s_ws.nets[s_ws.cur].ssid);
+    out->retry_in_s = (ws_retry_in_ms(&s_ws, now) + 500) / 1000;
+    out->rounds_failed = s_ws.rounds_failed;
+    out->ups = s_ws.ups; out->losses = s_ws.losses;
+    memcpy(out->seen, s_ws.seen, sizeof(out->seen));
+    xSemaphoreGive(s_ws_mu);
+    if (out->active && s_wifi_connected) {
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) out->rssi = ap.rssi;
+        strncpy(out->ip, wifi_hosted_get_ip(), sizeof(out->ip) - 1);
+    }
+}
+
+extern "C" void wifi_hosted_use(int idx)    { wifi_post(WE_USE, idx); }
+extern "C" void wifi_hosted_link_dead(void) { wifi_post(WE_LINK_DEAD, 0); }
+extern "C" bool wifi_hosted_scan_request(void) {
+    if (!s_wifi_initialized || s_wifi_paused || !s_ws_q) return false;
+    wifi_post(WE_SCAN_REQ, 0);
+    return true;
+}
+extern "C" int wifi_hosted_scan_results(ws_ap_t *out, int max, uint32_t *seq) {
+    if (!s_ws_mu) { if (seq) *seq = 0; return 0; }
+    xSemaphoreTake(s_ws_mu, portMAX_DELAY);
+    int n = s_scan_n < max ? s_scan_n : max;
+    for (int i = 0; i < n; i++) out[i] = s_scan[i];
+    if (seq) *seq = s_scan_seq;
+    xSemaphoreGive(s_ws_mu);
+    return n;
+}
+extern "C" void wifi_hosted_cycle(void) {
+    if (!s_wifi_initialized) return;
+    if (!s_wifi_paused) wifi_hosted_pause();
+    wifi_hosted_resume();
 }

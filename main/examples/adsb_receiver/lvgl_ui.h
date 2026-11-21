@@ -151,6 +151,7 @@ namespace Lvgl_Ui
                 lv_obj_t *time_label;
                 lv_obj_t *battery_icon;
                 lv_obj_t *wifi_signal_icon;
+                lv_obj_t *mqtt_icon;          // an arrow next to the WiFi glyph: MQTT wanted (amber) / feeding (green)
                 lv_obj_t *gps_icon;
                 lv_obj_t *adsb_icon;
                 lv_obj_t *sd_icon;
@@ -583,6 +584,7 @@ namespace Lvgl_Ui
         uint16_t _battery_level = 0;
 
         bool _wifi_connect_status = false;
+        uint8_t _net_wifi = 0, _net_mqtt = 0;   // 0 off, 1 wanted but not there, 2 there
 
         // GPS status
         bool _gps_fix_valid = false;
@@ -751,6 +753,7 @@ namespace Lvgl_Ui
         void set_time(Pcf8563x::Time time);
         void set_battery_level(uint16_t battery_level);
         void set_wifi_connect_status(bool status);
+        void set_net_status(uint8_t wifi, uint8_t mqtt);
         void set_gps_status(bool fix_valid, int sats);
         void set_adsb_status(bool connected, bool error, int aircraft_count);
         void set_sd_status(bool mounted, bool logging, bool msc = false);

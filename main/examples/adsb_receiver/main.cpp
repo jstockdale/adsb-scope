@@ -1163,6 +1163,22 @@ void device_battery_health_task(void *arg)
                 adsb_stats_t stats = adsb_get_stats();
                 System_Ui->set_adsb_status(stats.rtlsdr_connected, stats.rtlsdr_error, stats.active_aircraft);
 
+                // WiFi and MQTT: 0 off, 1 wanted but not there, 2 there
+                {
+                    uint8_t wifi_ui = wifi_hosted_ui_state();
+                    bool mqtt_up = mqtt_feeder_is_connected();
+                    uint8_t mqtt_ui = !g_settings.mqtt_enabled || wifi_ui == 0 ? 0 : (wifi_ui == 2 && mqtt_up ? 2 : 1);
+                    System_Ui->set_net_status(wifi_ui, mqtt_ui);
+
+                    // WiFi says it is connected, MQTT is wanted, and the broker has not
+                    // been reachable for five minutes: the association may be a dead
+                    // one. Have WiFi reconnect, once per five minutes.
+                    static uint32_t broker_down_s = 0;
+                    if (wifi_ui == 2 && g_settings.mqtt_enabled && !mqtt_up) {
+                        if (++broker_down_s >= 300) { broker_down_s = 0; wifi_hosted_link_dead(); }
+                    } else broker_down_s = 0;
+                }
+
                 // SD card status
                 extern bool sd_is_mounted(void);
                 extern bool sd_is_logging(void);
@@ -2887,8 +2903,19 @@ extern "C" void time_manager_print_status_fn(void) { time_manager_print_status()
 extern "C" void time_manager_set_integrity_mode_fn(int mode) { time_manager_set_integrity_mode((gps_integrity_mode_t)mode); }
 extern "C" bool wifi_hosted_is_connected_fn(void) { return wifi_hosted_is_connected(); }
 extern "C" const char *wifi_hosted_get_ip_fn(void) { return wifi_hosted_get_ip(); }
+// The saved networks, from the settings to the WiFi supervisor. Called at start
+// and whenever the console or the UI has edited the list.
+extern "C" void wifi_networks_changed_fn(void) {
+    ws_net_t nets[WS_MAX_NETS];
+    int n = settings_wifi_load(&g_settings, nets);
+    wifi_hosted_set_networks(nets, n);
+}
 extern "C" esp_err_t wifi_hosted_start_fn(void) {
-    wifi_hosted_set_credentials(g_settings.wifi_ssid, g_settings.wifi_pass);
+    wifi_networks_changed_fn();
+    // Switched off earlier in this session ("wifi off"): init has been done, the
+    // radio is paused. Until coh6 this case returned "already initialised" and
+    // WiFi stayed off until the next boot.
+    if (s_wifi_initialized && s_wifi_paused) { wifi_hosted_resume(); return ESP_OK; }
     return wifi_hosted_init();
 }
 extern "C" bool screenshot_save_fn(void) { return screenshot_to_sd(Screen_Mipi_Dpi_Panel, g_screen_width, g_screen_height); }
@@ -4732,7 +4759,7 @@ extern "C" void app_main(void)
     mem_checkpoint("before WiFi");
     if (g_settings.wifi_enabled && g_settings.wifi_ssid[0] != '\0') {
         printf("[WIFI] Initializing (SSID: %s)...\n", g_settings.wifi_ssid);
-        wifi_hosted_set_credentials(g_settings.wifi_ssid, g_settings.wifi_pass);
+        wifi_networks_changed_fn();
         esp_err_t wifi_err = wifi_hosted_init();
         if (wifi_err == ESP_OK) {
             printf("[WIFI] Started — connecting in background\n");

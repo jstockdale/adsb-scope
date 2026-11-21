@@ -64,6 +64,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "console_link.h"
+#include "wifi_hosted_api.h"
 #include "sdkconfig.h"
 #if CONFIG_ESP_CONSOLE_UART
 #include "hal/uart_ll.h"
@@ -555,7 +556,7 @@ static void cmd_help(void) {
         "  \033[32mdiag\033[0m [mark]       everything a field report needs, in one block; mark: restart its checks\n"
         "  \033[32mmeshy\033[0m [on|off|status] Meshtastic radio control\n"
         "  \033[32musb\033[0m [status]          USB host status\n"
-        "  \033[32mwifi\033[0m [on|off|status|ssid <n>|pass <pw>]  WiFi control\n"
+        "  \033[32mwifi\033[0m [on|off|status|list|scan|add <name> [pw]|remove <n>|prio <n> <pos>|use <n>|cycle]  WiFi and its saved networks\n"
         "  \033[32mmqtt\033[0m [on|off|status|server <h>|port <n>|user <u>|pass <p>|id <id>]\n"
         "\n"
         "  \033[33m── Info ──\033[0m\n"
@@ -2554,27 +2555,45 @@ static void dispatch_command(char *line) {
 
     // ── WiFi ──
     } else if (strcmp(cmd, "wifi") == 0) {
-        extern bool wifi_hosted_is_connected_fn(void);
         extern bool wifi_hosted_is_active(void);
-        extern const char *wifi_hosted_get_ip_fn(void);
-        if (!arg1 || strcmp(arg1, "status") == 0) {
-            printf("  WiFi: %s\n", g_settings.wifi_enabled ? "enabled" : "disabled");
-            printf("  SSID: %s\n", g_settings.wifi_ssid[0] ? g_settings.wifi_ssid : "(not set)");
-            printf("  Active: %s  Connected: %s\n",
-                   wifi_hosted_is_active() ? "yes" : "no",
-                   wifi_hosted_is_connected_fn() ? "yes" : "no");
-            if (wifi_hosted_is_connected_fn()) {
-                printf("  IP: %s\n", wifi_hosted_get_ip_fn());
+        extern void wifi_networks_changed_fn(void);
+        extern esp_err_t wifi_hosted_start_fn(void);
+        extern void wifi_hosted_pause(void);
+        ws_net_t nets[WS_MAX_NETS];
+        int n_nets = settings_wifi_load(&g_settings, nets);
+        // "wifi <sub> <rest>": the first word of <rest>, and what follows it
+        char *w1 = arg2, *w2 = NULL, *w_split = NULL;
+        if (w1) { w_split = strchr(w1, ' '); if (w_split) { *w_split = '\0'; w2 = w_split + 1; while (*w2 == ' ') w2++; if (!*w2) w2 = NULL; } }
+
+        if (!arg1 || strcmp(arg1, "status") == 0 || strcmp(arg1, "list") == 0) {
+            wifi_hosted_status_t st;
+            wifi_hosted_get_status(&st);
+            printf("  WiFi: %s", g_settings.wifi_enabled ? "enabled" : "disabled");
+            if (!st.active) printf(g_settings.wifi_enabled ? ", radio off\n" : "\n");
+            else if (st.state == WS_UP) printf(", connected to %s (%d dBm), IP %s\n", st.ssid, st.rssi, st.ip);
+            else if (st.state == WS_WAITING && st.n > 0) printf(", no saved network joined - next try in %u s (round %u)\n", (unsigned)st.retry_in_s, (unsigned)st.rounds_failed);
+            else if (st.state == WS_CONNECTING) printf(", connecting to %s\n", st.ssid);
+            else printf(", %s\n", ws_state_name((ws_state_t)st.state));
+            if (n_nets == 0) printf("  No saved networks. 'wifi add <name> [password]'\n");
+            else {
+                printf("  Saved networks, in priority order (levels from the last scan):\n");
+                for (int i = 0; i < n_nets; i++) {
+                    char lvl[16] = "not seen";
+                    if (st.active && i < st.n && st.seen[i] != WS_NOT_SEEN) snprintf(lvl, sizeof(lvl), "%d dBm", st.seen[i]);
+                    else if (!st.active) lvl[0] = '\0';
+                    printf("   %d  %-32s %-9s %s%s\n", i + 1, nets[i].ssid, lvl, nets[i].pass[0] ? "" : "(open) ",
+                           st.active && st.state == WS_UP && strcmp(st.ssid, nets[i].ssid) == 0 ? "<- connected" : "");
+                }
             }
+            if (st.active) printf("  Connections made: %u, lost: %u\n", (unsigned)st.ups, (unsigned)st.losses);
         } else if (strcmp(arg1, "on") == 0) {
-            if (g_settings.wifi_ssid[0] == '\0') {
-                printf("  No SSID configured. Use 'wifi ssid <name>' first.\n");
+            if (n_nets == 0) {
+                printf("  No network saved. Use 'wifi add <name> [password]' first.\n");
             } else {
                 g_settings.wifi_enabled = true;
                 g_settings_save_pending = true;
-                extern esp_err_t wifi_hosted_start_fn(void);
                 if (!wifi_hosted_is_active()) {
-                    printf("  Starting WiFi (SSID: %s)...\n", g_settings.wifi_ssid);
+                    printf("  Starting WiFi (%d saved network%s)...\n", n_nets, n_nets == 1 ? "" : "s");
                     esp_err_t err = wifi_hosted_start_fn();
                     if (err == ESP_OK) {
                         printf("  WiFi started — connecting in background.\n");
@@ -2588,21 +2607,21 @@ static void dispatch_command(char *line) {
         } else if (strcmp(arg1, "off") == 0) {
             g_settings.wifi_enabled = false;
             g_settings_save_pending = true;
-            extern void wifi_hosted_pause(void);
             if (wifi_hosted_is_active()) wifi_hosted_pause();
             printf("  WiFi disabled.\n");
         } else if (strcmp(arg1, "ssid") == 0) {
+            if (w_split) *w_split = ' ';                  // the whole rest is the name
             if (!arg2) {
                 printf("  SSID: %s\n", g_settings.wifi_ssid[0] ? g_settings.wifi_ssid : "(not set)");
             } else {
                 strncpy(g_settings.wifi_ssid, arg2, sizeof(g_settings.wifi_ssid) - 1);
                 g_settings.wifi_ssid[sizeof(g_settings.wifi_ssid) - 1] = '\0';
                 g_settings_save_pending = true;
-                printf("  SSID set: %s\n", g_settings.wifi_ssid);
+                wifi_networks_changed_fn();
+                printf("  SSID set: %s (network 1 of the list)\n", g_settings.wifi_ssid);
             }
         } else if (strcmp(arg1, "pass") == 0) {
-            // Restore arg split so password can contain spaces
-            if (arg_split) *arg_split = ' ';
+            if (w_split) *w_split = ' ';                  // passwords may contain spaces
             const char *pass_start = arg2 ? arg2 : NULL;
             if (!pass_start) {
                 printf("  Password: %s\n", g_settings.wifi_pass[0] ? "(set)" : "(not set)");
@@ -2610,12 +2629,90 @@ static void dispatch_command(char *line) {
                 strncpy(g_settings.wifi_pass, pass_start, sizeof(g_settings.wifi_pass) - 1);
                 g_settings.wifi_pass[sizeof(g_settings.wifi_pass) - 1] = '\0';
                 g_settings_save_pending = true;
-                printf("  Password set (%d chars)\n", (int)strlen(g_settings.wifi_pass));
+                wifi_networks_changed_fn();
+                printf("  Password set (%d chars) for network 1\n", (int)strlen(g_settings.wifi_pass));
             }
+        } else if (strcmp(arg1, "add") == 0) {
+            // wifi add <name> [password]   or   wifi add "<name with spaces>" [password]
+            if (w_split) *w_split = ' ';
+            char *name = arg2, *pass = NULL;
+            if (name && name[0] == '"') {
+                char *q = strchr(++name, '"');
+                if (q) { *q = '\0'; pass = q + 1; while (*pass == ' ') pass++; }
+                else name = NULL;
+            } else if (name) {
+                pass = strchr(name, ' ');
+                if (pass) { *pass++ = '\0'; while (*pass == ' ') pass++; }
+            }
+            if (!name || !name[0]) {
+                printf("  usage: wifi add <name> [password]     (a name with spaces in \"quotes\"; no password: an open network)\n");
+            } else {
+                bool known = ws_list_find(nets, n_nets, name) >= 0;
+                int idx = ws_list_add(nets, &n_nets, name, pass ? pass : "");
+                if (idx == -1) printf("  The list is full (%d networks). 'wifi remove <n>' first.\n", WS_MAX_NETS);
+                else if (idx < 0) printf("  Not saved: the name must be 1 to 32 characters, the password at most 64.\n");
+                else {
+                    settings_wifi_store(&g_settings, nets, n_nets);
+                    g_settings_save_pending = true;
+                    wifi_networks_changed_fn();
+                    printf("  %s %s as network %d of %d%s\n", known ? "Password changed for" : "Saved", name, idx + 1, n_nets,
+                           (pass && pass[0]) ? "" : " (open, no password)");
+                    if (!g_settings.wifi_enabled) printf("  WiFi is disabled: 'wifi on' to use it.\n");
+                }
+            }
+        } else if (strcmp(arg1, "remove") == 0 || strcmp(arg1, "rm") == 0) {
+            int idx = w1 ? atoi(w1) - 1 : -1;
+            if (idx < 0 || idx >= n_nets) printf("  usage: wifi remove <n>     (n as in 'wifi list', 1 to %d)\n", n_nets);
+            else {
+                printf("  Removed %s\n", nets[idx].ssid);
+                ws_list_remove(nets, &n_nets, idx);
+                settings_wifi_store(&g_settings, nets, n_nets);
+                g_settings_save_pending = true;
+                wifi_networks_changed_fn();
+            }
+        } else if (strcmp(arg1, "prio") == 0) {
+            int from = w1 ? atoi(w1) - 1 : -1, to = w2 ? atoi(w2) - 1 : -1;
+            if (!ws_list_move(nets, n_nets, from, to)) printf("  usage: wifi prio <n> <position>     (both 1 to %d; 1 is tried first)\n", n_nets);
+            else {
+                settings_wifi_store(&g_settings, nets, n_nets);
+                g_settings_save_pending = true;
+                wifi_networks_changed_fn();
+                printf("  %s is now number %d\n", nets[to].ssid, to + 1);
+            }
+        } else if (strcmp(arg1, "use") == 0) {
+            int idx = w1 ? atoi(w1) - 1 : -1;
+            if (idx < 0 || idx >= n_nets) printf("  usage: wifi use <n>     (n as in 'wifi list')\n");
+            else if (!wifi_hosted_is_active()) printf("  WiFi is off.\n");
+            else {
+                wifi_hosted_use(idx);
+                printf("  Switching to %s. It is kept until that connection is lost; the list's order does not change.\n", nets[idx].ssid);
+            }
+        } else if (strcmp(arg1, "scan") == 0) {
+            static ws_ap_t aps[24];
+            uint32_t seq0 = 0, seq = 0;
+            wifi_hosted_scan_results(aps, 0, &seq0);
+            if (!wifi_hosted_scan_request()) printf("  WiFi is off.\n");
+            else {
+                printf("  Scanning...\n");
+                seq = seq0;
+                for (int i = 0; i < 80 && seq == seq0; i++) { vTaskDelay(pdMS_TO_TICKS(100)); wifi_hosted_scan_results(aps, 0, &seq); }
+                if (seq == seq0) printf("  No result (a scan cannot run while a connection is being made - try again).\n");
+                else {
+                    int n = wifi_hosted_scan_results(aps, 24, &seq);
+                    for (int i = 0; i < n; i++)
+                        printf("   %4d dBm  %-32s %s\n", aps[i].rssi, aps[i].ssid[0] ? aps[i].ssid : "(hidden)",
+                               ws_list_find(nets, n_nets, aps[i].ssid) >= 0 ? "saved" : "");
+                    printf("  %d network%s in range.\n", n, n == 1 ? "" : "s");
+                }
+            }
+        } else if (strcmp(arg1, "cycle") == 0) {
+            if (!g_settings.wifi_enabled) printf("  WiFi is disabled.\n");
+            else { printf("  Power-cycling the WiFi radio (C6)...\n"); wifi_hosted_cycle(); }
         } else {
-            printf("  usage: wifi [on|off|status|ssid <name>|pass <password>]\n");
+            printf("  usage: wifi [on|off|status|list|scan|cycle]\n"
+                   "         wifi add <name> [password] | remove <n> | prio <n> <position> | use <n>\n"
+                   "         wifi ssid <name> | pass <password>      (network 1, as before)\n");
         }
-
     // ── NTP ──
     } else if (strcmp(cmd, "ntp") == 0) {
         extern void time_manager_set_ntp_config_fn(const char *server, int32_t poll_s);

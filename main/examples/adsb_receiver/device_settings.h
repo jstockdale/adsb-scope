@@ -20,6 +20,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tz_lookup.h"
+#include "wifi_sup.h"   // ws_net_t, WS_MAX_NETS
 
 #ifdef __cplusplus
 extern "C" {
@@ -107,15 +108,49 @@ typedef struct {
     uint8_t  gain_err_low;         // lower bound of target error rate (percent), default 40
     uint8_t  gain_err_high;        // upper bound of target error rate (percent), default 50
 
+    // ── More WiFi networks (coh6) ──
+    // The saved networks in priority order are wifi_ssid/wifi_pass (the first)
+    // followed by these; an empty name ends the list. Use settings_wifi_load()
+    // and settings_wifi_store(), not the fields.
+    // SETTINGS_VERSION was deliberately NOT bumped for this: the bytes were
+    // zero padding, zero means "no more networks", and a bump would make coh5
+    // and older treat the whole blob as "from newer firmware" and fall back to
+    // defaults - a roll-back would lose every setting. Bump it with the next
+    // field whose default is not zero.
+    struct { char ssid[33]; char pass[65]; } wifi_extra[WS_MAX_NETS - 1];   // 4 x 98 bytes
+
     // ── ADD NEW FIELDS HERE — consume _pad bytes, bump SETTINGS_VERSION ──
 
     // ── Reserved for future fields ──
-    uint8_t  _pad[610];
+    uint8_t  _pad[218];
 } device_settings_t;
 
 // Struct must be exactly 1024 bytes — adjust _pad if this fires
 // (alignment may differ on RISC-V vs x86; the assert catches it)
 _Static_assert(sizeof(device_settings_t) == 1024, "device_settings_t must be 1024 bytes — adjust _pad");
+
+// ─── Saved WiFi networks ─────────────────────────────────────
+// The list as wifi_sup.h wants it, out of the settings and back into them.
+static inline int settings_wifi_load(const device_settings_t *s, ws_net_t *out) {
+    int n = 0;
+    memset(out, 0, sizeof(ws_net_t) * WS_MAX_NETS);
+    if (s->wifi_ssid[0]) ws_list_add(out, &n, s->wifi_ssid, s->wifi_pass);
+    for (int i = 0; i < WS_MAX_NETS - 1; i++) {
+        char ssid[33], pass[65];
+        memcpy(ssid, s->wifi_extra[i].ssid, 33); ssid[32] = '\0';
+        memcpy(pass, s->wifi_extra[i].pass, 65); pass[64] = '\0';
+        if (ssid[0]) ws_list_add(out, &n, ssid, pass);
+    }
+    return n;
+}
+static inline void settings_wifi_store(device_settings_t *s, const ws_net_t *in, int n) {
+    memset(s->wifi_ssid, 0, sizeof(s->wifi_ssid));
+    memset(s->wifi_pass, 0, sizeof(s->wifi_pass));
+    memset(s->wifi_extra, 0, sizeof(s->wifi_extra));
+    if (n > WS_MAX_NETS) n = WS_MAX_NETS;
+    if (n > 0) { strcpy(s->wifi_ssid, in[0].ssid); strcpy(s->wifi_pass, in[0].pass); }
+    for (int i = 1; i < n; i++) { strcpy(s->wifi_extra[i - 1].ssid, in[i].ssid); strcpy(s->wifi_extra[i - 1].pass, in[i].pass); }
+}
 
 // ─── Default values ──────────────────────────────────────────────────────────
 

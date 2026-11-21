@@ -392,6 +392,12 @@ namespace Lvgl_Ui
         _wifi_connect_status = status;
     }
 
+    void System::set_net_status(uint8_t wifi, uint8_t mqtt)
+    {
+        _net_wifi = wifi;
+        _net_mqtt = mqtt;
+    }
+
     void System::add_event_cb_win_return_to_cit(lv_obj_t *obj)
     {
         lv_obj_add_event_cb(obj, [](lv_event_t *e)
@@ -1081,17 +1087,31 @@ namespace Lvgl_Ui
         }
     }
 
+    // WiFi and MQTT in the status bar, as one group:
+    //   WiFi glyph   hidden: WiFi off     grey: on, looking for a network     white: connected
+    //   arrow        hidden: MQTT off     amber: wanted, broker not reached   green: connected to the broker
     void System::status_bar_wifi_connect_status_update(void)
     {
-        if (_wifi_connect_status == true)
+        lv_obj_t *wifi = _registry.status_bar.wifi_signal_icon, *mqtt = _registry.status_bar.mqtt_icon;
+        if (!wifi) return;
+        if (_net_wifi == 0)
         {
-            // 显示wifi信号强度图标
-            lv_obj_remove_flag(_registry.status_bar.wifi_signal_icon, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(wifi, LV_OBJ_FLAG_HIDDEN);
         }
         else
         {
-            // 隐藏wifi信号强度图标
-            lv_obj_add_flag(_registry.status_bar.wifi_signal_icon, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(wifi, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_color(wifi, _net_wifi == 2 ? lv_color_white() : lv_color_hex(0x707070), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        }
+        if (!mqtt) return;
+        if (_net_mqtt == 0 || _net_wifi == 0)
+        {
+            lv_obj_add_flag(mqtt, LV_OBJ_FLAG_HIDDEN);
+        }
+        else
+        {
+            lv_obj_remove_flag(mqtt, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_color(mqtt, _net_mqtt == 2 ? lv_color_hex(0x30D158) : lv_color_hex(0xFFB000), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         }
     }
 
@@ -1125,6 +1145,13 @@ namespace Lvgl_Ui
             lv_obj_update_layout(_registry.status_bar.gps_icon);
             lv_obj_align_to(_registry.status_bar.wifi_signal_icon,
                             _registry.status_bar.gps_icon, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+            // State first (this runs once a second, in the UI's own context), then the arrow next to the glyph
+            status_bar_wifi_connect_status_update();
+            if (_registry.status_bar.mqtt_icon) {
+                lv_obj_update_layout(_registry.status_bar.wifi_signal_icon);
+                lv_obj_align_to(_registry.status_bar.mqtt_icon,
+                                _registry.status_bar.wifi_signal_icon, LV_ALIGN_OUT_LEFT_MID, -3, 0);
+            }
         }
     }
 
@@ -1168,6 +1195,13 @@ namespace Lvgl_Ui
             lv_obj_update_layout(_registry.status_bar.gps_icon);
             lv_obj_align_to(_registry.status_bar.wifi_signal_icon,
                             _registry.status_bar.gps_icon, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+            // State first (this runs once a second, in the UI's own context), then the arrow next to the glyph
+            status_bar_wifi_connect_status_update();
+            if (_registry.status_bar.mqtt_icon) {
+                lv_obj_update_layout(_registry.status_bar.wifi_signal_icon);
+                lv_obj_align_to(_registry.status_bar.mqtt_icon,
+                                _registry.status_bar.wifi_signal_icon, LV_ALIGN_OUT_LEFT_MID, -3, 0);
+            }
         }
     }
 
@@ -1303,6 +1337,11 @@ namespace Lvgl_Ui
         lv_obj_set_style_text_color(_registry.status_bar.wifi_signal_icon, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(_registry.status_bar.wifi_signal_icon, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_label_set_text(_registry.status_bar.wifi_signal_icon, LV_SYMBOL_WIFI);
+
+        // MQTT arrow, left of the WiFi glyph — positioned with it wherever the WiFi glyph is positioned
+        _registry.status_bar.mqtt_icon = lv_label_create(_registry.status_bar.root);
+        lv_obj_set_style_text_font(_registry.status_bar.mqtt_icon, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        lv_label_set_text(_registry.status_bar.mqtt_icon, LV_SYMBOL_UPLOAD);
         status_bar_wifi_connect_status_update();
 
         // Update dynamic icons AFTER all status bar objects exist.
