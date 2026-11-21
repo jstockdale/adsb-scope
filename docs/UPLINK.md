@@ -797,7 +797,37 @@ if the loader does not answer there, or a write fails, the page does the
 whole thing again at 115200 and does not try the faster speed again until
 the setting is chosen anew. **Whether the ESP32-P4's ROM does this is not
 confirmed** – Espressif's page for the P4 only recommends 115200 – so the
-first flash from the page will show which.
+first flash from the page will show which. (As delivered in coh4 the
+fall-back for a loader that does not answer could not work – next
+paragraph.)
+
+**Three things coh4's flashing got wrong (coh5).** coh4's flashing was
+tested against a stand-in for esptool-js that I wrote from the page's
+calls. Run against esptool-js 0.5.4 itself (below), it showed:
+
+- *The fall-back to 115200 could not happen.* `ESPLoader.main()` hands the
+  baud rate to `connect()` in the place of the number of attempts –
+  460800 attempts, each one to four seconds. With a loader that does not
+  answer at the faster speed the page would have stayed at "Connecting"
+  for as long as it was left there. The page now does `main()`'s steps
+  itself (`connect()` with three attempts at a speed that has 115200
+  behind it and ten at the last, then `runStub()`), so it comes back: ten
+  seconds at 460800 before it goes on to 115200 in the test, 45 s in all
+  before "Bootloader connection failed" on a device that never enters its
+  loader. A faster speed is now only written off when the loader then
+  answers at a slower one.
+- *The restart after a flash never ran.* The page called
+  `loader.hardReset()`, which esptool-js 0.5 no longer has; every flash
+  ended with "Auto-reset failed", and the device started the new firmware
+  because the reconnect three seconds later resets it (opening the port
+  does, on this board). `after('hard_reset')`, its replacement, releases
+  RTS without having asserted it. The page now pulses RTS on the port
+  itself, with DTR released.
+- *Every byte was being traced.* The page created the transport with
+  esptool-js's tracing on: a hex dump of everything written and read, to
+  the console and into a string kept in memory – 2.3 MB of text for a
+  365 kB image in the test, some 40 MB for this firmware. Off now
+  (`localStorage.setItem('flash_trace','1')` turns it on).
 
 **Keeping the settings when flashing from the page (coh5).** The merged
 image is written from 0x0, so it covered the settings partition with 0xFF:
@@ -809,27 +839,35 @@ partition table (0x9000, 24 kB). It first reads the device's partition
 table through the loader. If the device has its settings partition in the
 same place – true of the April layout as well as the current one – they
 are kept. If it has them somewhere else, the page says where and asks
-before it writes the whole image and resets them. A device without a
-table has nothing to keep. A file that is not a merged image is refused
-(with the box unticked: questioned), where it used to be written at 0x0
-whatever it was.
+before it writes the whole image and resets them; answered with no, it
+writes nothing and restarts the device. A device without a table has
+nothing to keep. A file that is not a merged image is refused (with the
+box unticked: questioned), where it used to be written at 0x0 whatever it
+was.
 
-Tested with a stand-in for esptool-js that writes into a flash image held
-by the test and erases whole sectors under what it writes
-(`harness/link/check_page_flash.js`, twelve cases, also run on the real
-merged image): the settings partition comes out byte for byte as it was
-and everything else is the new image; the refusals, the question and the
-fall-back to 115200 behave as described. The stand-in has the calls the
-page uses with the signatures of esptool-js 0.5.4, checked against that
-version's source. Its erasing is modelled on esptool's flasher stub,
-which esptool-js runs on the device: `handle_flash_begin` in the stub's
-`stub_write_flash.c` erases the sectors from the first to the last of
-the size it is given, and uses 64 kB block erases only where sixteen
-sectors remain from a 64 kB boundary. Both of the page's pieces begin
-and end on sector boundaries, so by that source nothing between 0x9000
-and 0xEFFF is erased. (The source is the stub's current one; the binary
-that esptool-js 0.5.4 carries was not taken apart.) Not tested: the real
-esptool-js on a device.
+**How the page's flashing is tested (coh5).** `harness/link/check_page_flash.js`
+runs the page's own `doFlash()` with the real esptool-js 0.5.4 bundle –
+the file the page loads from unpkg, fetched by `make esptool-js` and
+checked against a pinned sha256 – against an emulated chip
+(`harness/link/fake_esp.js`): the reset and boot-mode lines, the ROM
+loader's SYNC, READ_REG and MEM commands, the stub's READ_FLASH (with the
+MD5 frame esptool-js leaves unread) and FLASH_DEFL commands, and a flash
+memory that is erased as the stub erases – `handle_flash_begin` in its
+`stub_write_flash.c`: the sectors from the first to the last of the size
+it is given. Thirteen cases, also run on the real merged images: the
+settings partition byte for byte as it was and everything else the new
+image, on the current and the April layout; the two writes the stub is
+given (0x0 + 0x9000, 0xF000 + the rest); the box unticked; settings
+elsewhere with yes and with no; a blank device; a table that cannot be
+read; a ROM loader that does not answer above 115200; a write that stalls
+at 460800; a device that never enters its loader; files that are not
+merged images; and that the device is restarted at the end.
+
+What that leaves: the emulated chip answers at once and at any speed
+unless told not to, so nothing here says whether the ESP32-P4's ROM
+takes 460800 – only that the page copes either way. The stub's erasing
+is taken from its current source; the stub binary inside esptool-js
+0.5.4 was not taken apart. **Not tested: any of it on a device.**
 
 **`baud probe [ms]`** is a diagnostic for the next step: it measures the
 speed of what arrives with the UART's pulse counters, whatever the UART is
@@ -869,3 +907,84 @@ in traffic and the file it writes (the status block at its end says what
 the device sent and dropped at 921600); a connect from the page with the
 browser console's lines that begin `[scope] Serial`; a flash from the
 page, with its log; and `python3 adsb-fastlog.py --probe 921600`.
+
+### 9.9 The web app under load (coh5)
+
+At 115200 the page never saw more than about 115 lines a second. With the
+console at 921600 the device can send 450 to 500, and at 2 Mbaud more –
+so what the page does per line now matters four times as much or more.
+
+**How it was looked at.** Two instruments, both in `harness/page/`, both
+fed the same made-up device log (`fake_log.js`: N aircraft, R lines a
+second, 45 % of them with a position) through the page's `handleLine()`
+in 10 ms portions, as a serial port delivers it:
+
+- `profile_page.js` runs the page's whole script in Node with the
+  browser's objects stubbed, times every top-level function and counts,
+  by name, everything the page asks of the DOM and of Leaflet.
+- `browser_profile.js` loads the page in a real Chrome (headless), its
+  libraries from local copies, and reads Chrome's own counters: script,
+  style and layout time, number of layouts, all main-thread work; frames
+  and long tasks from the page side. It is also the only place where a
+  real browser loads the page: a script error on load fails the run.
+
+`make page-profile` runs both (`make page-deps` once: npm).
+Results: `harness/results/page.txt`.
+
+**What they showed.** The page's own JavaScript is not the problem: 34 to
+74 µs a line, 3 % of a core at 600 lines a second (Node). What it asked
+of the browser per line was: three `getElementById`, two marker moves, a
+log line (one node moved, four properties set) – and
+`el.scrollTop = el.scrollHeight`. Reading `scrollHeight` straight after
+changing the page makes the browser lay the page out there and then. One
+layout per line:
+
+| in Chrome, ms of main-thread work per second | v1.0.9 (coh4) | v1.0.10 |
+| --- | --- | --- |
+| 60 aircraft, 300 lines/s, log closed | 167 (134 layouts/s) | 162 (38) |
+| 60 aircraft, 300 lines/s, log open | 874 (300 layouts/s, 566 ms of layout, 15 long tasks in 10 s) | 281 (20, 51 ms, none) |
+| 150 aircraft, 1000 lines/s, log closed | 364 (453 layouts/s) | 266 (22) |
+| 150 aircraft, 1000 lines/s, log open | **1881** (1000 layouts/s; 1 frame a second, worst frame 3.3 s) | 456 (19; 20 frames a second) |
+
+With the log panel open, v1.0.9 used 87 % of the main thread at 300 lines
+a second and could not keep up at 1000: the page stood still. (Headless
+Chrome renders in software here, so frames per second are lower than on
+a machine with a GPU – 58 with the page idle, about 20 under load in
+either version; the columns to compare are the work.)
+
+**What changed in v1.0.10.**
+
+1. The log follows its end once per frame (`logFollow()`), not once per
+   line. That is the whole difference in the table's "log open" rows.
+2. A marker and its label are moved only when the aircraft's position
+   changed (more than half of the messages carry none).
+3. A meter in the page: `?perf=1` on the address, or `scopePerf(true)`
+   in the console, writes a line to the log every five seconds –
+   `[scope] perf: 300 lines/s, 20 ms/s in handleLine (68 us a line), 21
+   frames/s, worst frame 100 ms, long tasks 1 (54 ms)`. Lines and time
+   in `handleLine()` are the page's work per line; frames and long tasks
+   (the browser's count of stretches over 50 ms) include style, layout
+   and paint. It agrees with Chrome's counters in the test.
+
+**Not done, in the order I would do them** – none is urgent after 1:
+
+- *The parser's order.* `parse()` runs some forty regular expressions for
+  boot, SD, settings and gain lines before it tries the one for an
+  aircraft line, which is what 95 % of the lines are: a third of the
+  page's own time per line (11 of 34 µs). Trying the aircraft line first
+  needs the forty read through for what they must still see.
+- *The log while its panel is closed.* Every line still moves a DOM node
+  and sets four properties that nobody sees. Keeping the text only, and
+  building the nodes when the panel opens, removes that.
+- *The table.* Every message marks it dirty, so once a second all rows
+  are sorted, rewritten and appended again, changed or not. Rewriting
+  the rows that changed and re-appending only when the order did is a
+  layout a second less; it matters with a few hundred aircraft.
+- *Painting.* What is left of the main thread's work under load (some
+  100 ms a second at 300 lines) is mostly paint: markers and SVG trails.
+  Leaflet's canvas renderer for the trails is the thing to try, and
+  `browser_profile.js` can say whether it helps – on a machine with a
+  GPU, since software rendering here exaggerates it.
+
+**Not measured:** a real serial port, a GPU, a phone. The meter is there
+for that.
