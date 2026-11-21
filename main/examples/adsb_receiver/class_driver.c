@@ -14,6 +14,7 @@
 #include "sample_ring.h"
 #include "usb_stream.h"
 #include "gain_ctl.h"
+#include "adsb_fmt.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -23,6 +24,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include "esp_timer.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -160,6 +162,7 @@ static uint32_t s_win_log_lines0 = 0, s_win_log_bytes0 = 0, s_win_log_dropped0 =
 static volatile uint32_t s_log_lines_s = 0, s_log_bytes_s = 0, s_log_dropped_win = 0;
 
 static void adsb_logq_push(const char *line, int len);
+static bool adsb_logq_has_room(uint32_t len);
 static void adsb_logq_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // ---- Observation mark (adsb_stats_mark) ----
@@ -649,10 +652,6 @@ void adsb_set_bias_tee(bool on) {
     }
 }
 
-// Forward declaration — defined below
-static void haversine(double lat1, double lon1, double lat2, double lon2,
-                      double *out_dist_km, double *out_bearing_deg);
-
 // Max range — updated by adsb_get_stats(), referenced by gain logs
 static volatile double s_max_range_nm = 0.0;
 
@@ -663,53 +662,64 @@ adsb_stats_t adsb_get_stats(void) {
     stats.rtlsdr_connected = s_rtlsdr_connected;
     stats.rtlsdr_error = s_rtlsdr_error;
 
-    // Count active aircraft
+    // Count active aircraft and find the nearest and the farthest. Under
+    // the lock only a ranking value is computed for each (single
+    // precision, three trigonometric calls); the two distances are worked
+    // out after it is released. Up to coh3 this was a double-precision
+    // haversine per aircraft inside the lock, which the decoder needs for
+    // every message.
     int count = 0;
     int64_t now = esp_timer_get_time();
-    if (aircraft_mutex) {
-        xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
-        for (int i = 0; i < AIRCRAFT_TABLE_SIZE; i++) {
-            if (aircraft_table[i].active &&
-                (now - aircraft_table[i].last_seen) <= AIRCRAFT_MAX_AGE_US)
-                count++;
-        }
-        xSemaphoreGive(aircraft_mutex);
-    }
-    stats.active_aircraft = count;
-
-    // Find nearest and farthest aircraft
     stats.nearest_icao = 0;
     stats.nearest_dist_nm = 0;
     stats.farthest_dist_nm = 0;
     stats.farthest_icao = 0;
     receiver_pos_t rx = adsb_get_receiver_pos();
-    if (rx.fix_valid && aircraft_mutex) {
-        double best_dist = 1e9;
-        double worst_dist = 0;
+    double near_lat = 0, near_lon = 0, far_lat = 0, far_lon = 0;
+    bool have_near = false, have_far = false;
+    if (aircraft_mutex) {
+        const float cos_rx = rx.fix_valid ? adsb_gc_cos(rx.lat) : 0.0f;
+        float best = 9.0f, worst = -1.0f;
         xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
         for (int i = 0; i < AIRCRAFT_TABLE_SIZE; i++) {
-            if (!aircraft_table[i].active) continue;
-            if (!aircraft_table[i].has_position) continue;
-            if ((now - aircraft_table[i].last_seen) > AIRCRAFT_MAX_AGE_US) continue;
-            double dist_km, brg;
-            haversine(rx.lat, rx.lon, aircraft_table[i].lat, aircraft_table[i].lon, &dist_km, &brg);
-            if (dist_km < best_dist) {
-                best_dist = dist_km;
-                stats.nearest_icao = aircraft_table[i].icao;
-                stats.nearest_dist_nm = dist_km * 0.539957;
-                stats.nearest_alt = aircraft_table[i].altitude;
-                if (aircraft_table[i].callsign[0]) {
-                    strncpy(stats.nearest_callsign, aircraft_table[i].callsign, 8);
-                    stats.nearest_callsign[8] = '\0';
-                }
+            const aircraft_t *a = &aircraft_table[i];
+            if (!a->active) continue;
+            if ((now - a->last_seen) > AIRCRAFT_MAX_AGE_US) continue;
+            count++;
+            if (!rx.fix_valid || !a->has_position) continue;
+            const float rank = adsb_gc_rank(rx.lat, rx.lon, cos_rx, a->lat, a->lon);
+            if (rank < best) {
+                best = rank;
+                have_near = true;
+                near_lat = a->lat;
+                near_lon = a->lon;
+                stats.nearest_icao = a->icao;
+                stats.nearest_alt = a->altitude;
+                // (up to coh3 an aircraft without a callsign was shown
+                // with the callsign of the previous candidate)
+                strncpy(stats.nearest_callsign, a->callsign, 8);
+                stats.nearest_callsign[8] = '\0';
             }
-            if (dist_km > worst_dist) {
-                worst_dist = dist_km;
-                stats.farthest_icao = aircraft_table[i].icao;
-                stats.farthest_dist_nm = dist_km * 0.539957;
+            if (rank > worst) {
+                worst = rank;
+                have_far = true;
+                far_lat = a->lat;
+                far_lon = a->lon;
+                stats.farthest_icao = a->icao;
             }
         }
         xSemaphoreGive(aircraft_mutex);
+    }
+    stats.active_aircraft = count;
+    if (have_near) {
+        float km, brg;
+        adsb_gc(rx.lat, rx.lon, near_lat, near_lon, &km, &brg);
+        stats.nearest_dist_nm = km * 0.539957f;
+    }
+    if (have_far) {
+        float km, brg;
+        adsb_gc(rx.lat, rx.lon, far_lat, far_lon, &km, &brg);
+        stats.farthest_dist_nm = km * 0.539957f;
     }
 
     stats.gain_tenths = R820T_GAINS[s_gain_idx];
@@ -1781,6 +1791,42 @@ void adsb_set_sort(int col, bool ascending) {
     s_sort_asc = ascending;
 }
 
+// One row of the list as copied out of the aircraft table.
+typedef struct {
+    uint32_t icao;
+    char callsign[9];
+    uint8_t has_position;
+    int altitude, speed, heading;
+    double lat, lon;
+    float dist_km;
+} list_row_t;
+
+// The copy is in PSRAM and belongs to the one caller (the ADS-B app task).
+static EXT_RAM_BSS_ATTR list_row_t s_list_rows[AIRCRAFT_TABLE_SIZE];
+
+static int list_row_cmp(const list_row_t *a, const list_row_t *b, adsb_sort_col_t col)
+{
+    switch (col) {
+        case ADSB_SORT_ICAO: return (int)(a->icao > b->icao) - (int)(a->icao < b->icao);
+        case ADSB_SORT_CALL: return strcmp(a->callsign, b->callsign);
+        case ADSB_SORT_ALT:  return (a->altitude > b->altitude) - (a->altitude < b->altitude);
+        case ADSB_SORT_SPD:  return (a->speed > b->speed) - (a->speed < b->speed);
+        case ADSB_SORT_HDG:  return (a->heading > b->heading) - (a->heading < b->heading);
+        case ADSB_SORT_DIST:
+        default:             return (a->dist_km > b->dist_km) - (a->dist_km < b->dist_km);
+    }
+}
+
+// The aircraft list as text, one row per aircraft, sorted.
+//
+// The aircraft table is only copied under its lock; distances, the sort and
+// the text are done after it is released, in single precision and without
+// printf's "%f". Up to coh3 all of it ran inside the lock, with a
+// double-precision haversine per aircraft: 4.2 million instructions for 100
+// aircraft, during which the decoder could not deliver a message
+// (docs/UPLINK.md section 9.7).
+//
+// One caller at a time: the copy is a static buffer.
 int adsb_format_aircraft_list(char *buf, int bufsize) {
     int pos = 0;
     int64_t now = esp_timer_get_time();
@@ -1791,60 +1837,49 @@ int adsb_format_aircraft_list(char *buf, int bufsize) {
         return pos;
     }
 
-    // Collect active aircraft with precomputed sort keys
-    typedef struct { int idx; double dist_km; } ac_entry_t;
-    ac_entry_t entries[AIRCRAFT_TABLE_SIZE];
     int count = 0;
-
     xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
     for (int i = 0; i < AIRCRAFT_TABLE_SIZE; i++) {
-        if (!aircraft_table[i].active) continue;
-        if ((now - aircraft_table[i].last_seen) > AIRCRAFT_MAX_AGE_US) continue;
-        entries[count].idx = i;
-        entries[count].dist_km = 1e9;
-        if (rx.fix_valid && aircraft_table[i].has_position) {
-            double d, b;
-            haversine(rx.lat, rx.lon, aircraft_table[i].lat, aircraft_table[i].lon, &d, &b);
-            entries[count].dist_km = d;
+        const aircraft_t *a = &aircraft_table[i];
+        if (!a->active) continue;
+        if ((now - a->last_seen) > AIRCRAFT_MAX_AGE_US) continue;
+        list_row_t *r = &s_list_rows[count++];
+        r->icao = a->icao;
+        memcpy(r->callsign, a->callsign, sizeof(r->callsign));
+        r->has_position = a->has_position ? 1 : 0;
+        r->altitude = a->altitude;
+        r->speed = a->speed;
+        r->heading = a->heading;
+        r->lat = a->lat;
+        r->lon = a->lon;
+    }
+    xSemaphoreGive(aircraft_mutex);
+
+    // Distances
+    for (int i = 0; i < count; i++) {
+        list_row_t *r = &s_list_rows[i];
+        r->callsign[8] = '\0';
+        r->dist_km = 1e9f;   // no position: sorts last by distance
+        if (rx.fix_valid && r->has_position) {
+            float brg;
+            adsb_gc(rx.lat, rx.lon, r->lat, r->lon, &r->dist_km, &brg);
         }
-        count++;
     }
 
-    // Insertion sort by selected column
-    for (int i = 1; i < count; i++) {
-        ac_entry_t key = entries[i];
-        aircraft_t *ac_key = &aircraft_table[key.idx];
+    // Insertion sort of an index by the selected column (stable, as before)
+    const adsb_sort_col_t col = s_sort_col;
+    const bool asc = s_sort_asc;
+    uint16_t order[AIRCRAFT_TABLE_SIZE];
+    for (int i = 0; i < count; i++) {
         int j = i - 1;
         while (j >= 0) {
-            aircraft_t *ac_j = &aircraft_table[entries[j].idx];
-            int cmp = 0;
-            switch (s_sort_col) {
-                case ADSB_SORT_ICAO:
-                    cmp = (int)(ac_j->icao > ac_key->icao) - (int)(ac_j->icao < ac_key->icao);
-                    break;
-                case ADSB_SORT_CALL:
-                    cmp = strcmp(ac_j->callsign, ac_key->callsign);
-                    break;
-                case ADSB_SORT_ALT:
-                    cmp = (ac_j->altitude > ac_key->altitude) - (ac_j->altitude < ac_key->altitude);
-                    break;
-                case ADSB_SORT_SPD:
-                    cmp = (ac_j->speed > ac_key->speed) - (ac_j->speed < ac_key->speed);
-                    break;
-                case ADSB_SORT_HDG:
-                    cmp = (ac_j->heading > ac_key->heading) - (ac_j->heading < ac_key->heading);
-                    break;
-                case ADSB_SORT_DIST:
-                default:
-                    cmp = (entries[j].dist_km > key.dist_km) - (entries[j].dist_km < key.dist_km);
-                    break;
-            }
-            if (!s_sort_asc) cmp = -cmp;
+            int cmp = list_row_cmp(&s_list_rows[order[j]], &s_list_rows[i], col);
+            if (!asc) cmp = -cmp;
             if (cmp <= 0) break;
-            entries[j + 1] = entries[j];
+            order[j + 1] = order[j];
             j--;
         }
-        entries[j + 1] = key;
+        order[j + 1] = (uint16_t)i;
     }
 
     if (count == 0) {
@@ -1852,16 +1887,15 @@ int adsb_format_aircraft_list(char *buf, int bufsize) {
     }
 
     for (int e = 0; e < count && pos < bufsize - 80; e++) {
-        aircraft_t *ac = &aircraft_table[entries[e].idx];
+        const list_row_t *ac = &s_list_rows[order[e]];
         char call[9] = "--------";
         if (ac->callsign[0]) {
             snprintf(call, sizeof(call), "%-8s", ac->callsign);
         }
 
-        double dist_nm = entries[e].dist_km * 0.539957;
         char dist_str[12] = "   --";
-        if (rx.fix_valid && ac->has_position && entries[e].dist_km < 1e8) {
-            snprintf(dist_str, sizeof(dist_str), "%5.1f", dist_nm);
+        if (rx.fix_valid && ac->has_position && ac->dist_km < 1e8f) {
+            adsb_put_fixed_f(dist_str, sizeof(dist_str), ac->dist_km * 0.539957f, 1, 5, ' ');
         }
 
         char alt_str[12] = "  ----";
@@ -1883,30 +1917,13 @@ int adsb_format_aircraft_list(char *buf, int bufsize) {
             "%06lX %-8s%s %s %s %s\n",
             (unsigned long)ac->icao, call, alt_str, spd_str, hdg_str, dist_str);
     }
-    xSemaphoreGive(aircraft_mutex);
 
     return count;
 }
 
-// Great-circle distance (km) and initial bearing (degrees) using haversine
-static void haversine(double lat1, double lon1, double lat2, double lon2,
-                      double *dist_km, double *bearing_deg) {
-    double d2r = M_PI / 180.0;
-    double rlat1 = lat1 * d2r, rlat2 = lat2 * d2r;
-    double dlat = (lat2 - lat1) * d2r;
-    double dlon = (lon2 - lon1) * d2r;
-
-    double a = sin(dlat/2) * sin(dlat/2) +
-               cos(rlat1) * cos(rlat2) * sin(dlon/2) * sin(dlon/2);
-    double c = 2 * atan2(sqrt(a), sqrt(1 - a));
-    *dist_km = 6371.0 * c;
-
-    double y = sin(dlon) * cos(rlat2);
-    double x = cos(rlat1) * sin(rlat2) - sin(rlat1) * cos(rlat2) * cos(dlon);
-    double brg = atan2(y, x) * 180.0 / M_PI;
-    if (brg < 0) brg += 360.0;
-    *bearing_deg = brg;
-}
+// Great-circle distance and bearing: adsb_gc() in adsb_fmt.c (single
+// precision). The double-precision haversine() that was here cost about
+// 38,000 instructions a call on this processor.
 
 #include "sd_logger.h"
 
@@ -2060,7 +2077,13 @@ static void sd_log_buf_timestamp(void) {
     if (n > 0) sd_log_buf_pos += n;
 }
 
-static void sd_log_aircraft(aircraft_t *ac, const struct mode_s_msg *mm) {
+// One CSV row. Called by the decoder task after it has released the
+// aircraft lock, with its own copy of the aircraft and the receiver position
+// and range it has already worked out for the console line. The text is the
+// same as before; the numbers are written without printf's "%f"
+// (adsb_fmt.h), which was most of the cost of a row.
+static void sd_log_aircraft(const aircraft_t *ac, const struct mode_s_msg *mm,
+                            const receiver_pos_t *rxp, float range_km, float bearing) {
     // Don't write to SD while USB MSC owns the card
     extern bool sd_msc_is_active_fn(void);
     if (sd_msc_is_active_fn()) return;
@@ -2135,10 +2158,7 @@ static void sd_log_aircraft(aircraft_t *ac, const struct mode_s_msg *mm) {
         sd_log_flush();
     }
 
-    receiver_pos_t rx = adsb_get_receiver_pos();
-    double range_km = 0, bearing = 0;
-    if (rx.fix_valid && ac->has_position)
-        haversine(rx.lat, rx.lon, ac->lat, ac->lon, &range_km, &bearing);
+    const receiver_pos_t rx = *rxp;
 
     // Write to PSRAM buffer (not to disk)
     sd_log_buf_timestamp();
@@ -2152,32 +2172,36 @@ static void sd_log_aircraft(aircraft_t *ac, const struct mode_s_msg *mm) {
 
     if (mm) {
         int msglen = mm->msgbits / 8;
-        for (int i = 0; i < msglen && sd_log_buf_pos < SD_LOG_BUFSIZE - 4; i++) {
-            n = snprintf(sd_log_buf + sd_log_buf_pos, 3, "%02X", mm->msg[i]);
-            if (n > 0) sd_log_buf_pos += n;
-        }
+        if (msglen > 14) msglen = 14;
+        sd_log_buf_pos += adsb_put_hex(sd_log_buf + sd_log_buf_pos, SD_LOG_BUFSIZE - sd_log_buf_pos,
+                                       mm->msg, msglen);
     }
 
-    avail = SD_LOG_BUFSIZE - sd_log_buf_pos;
-    n = snprintf(sd_log_buf + sd_log_buf_pos, avail,
-        ",%06lX,%s,%d,%d,%d,%d,%.5f,%.5f,%04d,%.5f,%.5f,%.1f,%.0f,%d,%.1f\n",
-        (unsigned long)ac->icao,
-        ac->callsign[0] ? ac->callsign : "",
-        ac->altitude,
-        ac->speed,
-        ac->heading,
-        ac->vert_rate,
-        ac->lat,
-        ac->lon,
-        ac->squawk,
-        rx.fix_valid ? rx.lat : 0.0,
-        rx.fix_valid ? rx.lon : 0.0,
-        range_km,
-        bearing,
-        rx.sats,
-        rx.hdop
-    );
-    if (n > 0) sd_log_buf_pos += n;
+    // ",ICAO,callsign,alt,speed,heading,vrate,lat,lon,squawk,rxlat,rxlon,range_km,bearing,sats,hdop"
+    {
+        char *b = sd_log_buf + sd_log_buf_pos;
+        int left = SD_LOG_BUFSIZE - sd_log_buf_pos, w = 0;
+#define SD_PUT(expr) do { int k_ = (expr); if (k_ > 0 && k_ < left - w) w += k_; } while (0)
+        SD_PUT(snprintf(b + w, left - w, ",%06lX,%s,%d,%d,%d,%d,",
+                        (unsigned long)ac->icao, ac->callsign[0] ? ac->callsign : "",
+                        ac->altitude, ac->speed, ac->heading, ac->vert_rate));
+        SD_PUT(adsb_put_fixed(b + w, left - w, ac->lat, 5, 0, ' '));
+        SD_PUT(snprintf(b + w, left - w, ","));
+        SD_PUT(adsb_put_fixed(b + w, left - w, ac->lon, 5, 0, ' '));
+        SD_PUT(snprintf(b + w, left - w, ",%04d,", ac->squawk));
+        SD_PUT(adsb_put_fixed(b + w, left - w, rx.fix_valid ? rx.lat : 0.0, 5, 0, ' '));
+        SD_PUT(snprintf(b + w, left - w, ","));
+        SD_PUT(adsb_put_fixed(b + w, left - w, rx.fix_valid ? rx.lon : 0.0, 5, 0, ' '));
+        SD_PUT(snprintf(b + w, left - w, ","));
+        SD_PUT(adsb_put_fixed_f(b + w, left - w, range_km, 1, 0, ' '));
+        SD_PUT(snprintf(b + w, left - w, ","));
+        SD_PUT(adsb_put_fixed_f(b + w, left - w, bearing, 0, 0, ' '));
+        SD_PUT(snprintf(b + w, left - w, ",%d,", rx.sats));
+        SD_PUT(adsb_put_fixed(b + w, left - w, rx.hdop, 1, 0, ' '));
+        SD_PUT(snprintf(b + w, left - w, "\n"));
+#undef SD_PUT
+        sd_log_buf_pos += w;
+    }
 
     // Periodic flush:
     //   • Buffer nearly full → immediate (safety)
@@ -2239,20 +2263,7 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     aircraft_t *ac = aircraft_get(icao);
     ac->last_seen = esp_timer_get_time();
     ac->msg_count++;
-
-    // Emit aircraft database info on first message for a new ICAO.
-    // Separate log line so we don't change the ADS-B data format.
-    // Webapp and firmware scope cache this for detail display.
-    if (ac->msg_count == 1 && aircraft_db_ready()) {
-        aircraft_db_entry_t db;
-        if (aircraft_db_lookup(icao, &db)) {
-            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
-            adsb_logq_printf("%sICAO: %06lX|%s|%s|%s|%s|%s|%s|%c\n",
-                _ts, (unsigned long)icao,
-                db.reg, db.typecode, db.mfr, db.model, db.owner, db.op_icao,
-                db.ac_class ? db.ac_class : '?');
-        }
-    }
+    const bool first_msg = (ac->msg_count == 1);
 
     // --- Update aircraft state from this message ---
 
@@ -2504,69 +2515,102 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         ac->squawk = mm->identity;
     }
 
-    // --- Print one-line summary with full known state ---
+    // Update message statistics
+    s_total_messages++;
+    s_msg_count_window++;
+    {
+        int64_t now_us = esp_timer_get_time();
+        int64_t elapsed = now_us - s_msg_window_start;
+        if (elapsed >= 1000000LL) {  // 1 second window
+            s_msg_rate = (float)s_msg_count_window * 1000000.0f / (float)elapsed;
+            s_msg_count_window = 0;
+            s_msg_window_start = now_us;
+        }
+    }
+
+    // The table is up to date. Everything below describes this message to
+    // the console, the SD card and MQTT; it works on a copy, so the lock is
+    // released here. Up to coh3 it was held to the end of the function:
+    // through three double-precision haversines, the text of two lines, and
+    // any SD card write the row triggered – while the display and the
+    // console waited for the aircraft table.
+    const aircraft_t snap = *ac;
+    xSemaphoreGive(aircraft_mutex);
+    ac = NULL;
+
+    // Aircraft database info on the first message for a new ICAO.
+    // Separate log line so we don't change the ADS-B data format.
+    // Webapp and firmware scope cache this for detail display.
+    // (A lookup that is not in the cache reads the SD card.)
+    if (first_msg && aircraft_db_ready()) {
+        aircraft_db_entry_t db;
+        if (aircraft_db_lookup(icao, &db)) {
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            adsb_logq_printf("%sICAO: %06lX|%s|%s|%s|%s|%s|%s|%c\n",
+                _ts, (unsigned long)icao,
+                db.reg, db.typecode, db.mfr, db.model, db.owner, db.op_icao,
+                db.ac_class ? db.ac_class : '?');
+        }
+    }
+
+    // Range and bearing from the receiver: once, in single precision, for
+    // the console line, the SD row and MQTT.
+    const receiver_pos_t rx = adsb_get_receiver_pos();
+    const bool have_range = rx.fix_valid && snap.has_position;
+    float range_km = 0.0f, bearing = 0.0f;
+    if (have_range) adsb_gc(rx.lat, rx.lon, snap.lat, snap.lon, &range_km, &bearing);
+
+    // --- One-line summary with full known state ---
     // The log task writes it with serial_console_print(), so lines are
     // buffered in PSRAM during CMD mode and replayed when returning to LOG mode.
-    {
+    // Not written at all when the queue has no room for it: the line would
+    // be counted as dropped anyway.
+    if (!replayed && !adsb_logq_has_room(ADSB_LOG_LINE_MAX)) {
+        s_log_dropped_total++;   // the console is not keeping up
+    } else if (!replayed) {
     char line[384];
     int pos = 0, avail = sizeof(line);
+#define LINE_PUT(expr) do { int n_ = (expr); if (n_ > 0 && n_ < avail) { pos += n_; avail -= n_; } } while (0)
 
     // Timestamp — shared format with GNSS and Meshy log lines
-    { int n = log_format_timestamp(line + pos, avail);
-      if (n > 0) { pos += n; avail -= n; } }
+    LINE_PUT(log_format_timestamp(line + pos, avail));
 
     // ICAO + callsign
-    { int n = snprintf(line + pos, avail, "%06lX", (unsigned long)icao);
-      if (n > 0) { pos += n; avail -= n; } }
-    if (ac->callsign[0]) {
-        int n = snprintf(line + pos, avail, " %-8s", ac->callsign);
-        if (n > 0) { pos += n; avail -= n; }
-    }
+    LINE_PUT(snprintf(line + pos, avail, "%06lX", (unsigned long)icao));
+    if (snap.callsign[0]) LINE_PUT(snprintf(line + pos, avail, " %-8s", snap.callsign));
 
     // Altitude + velocity
-    if (ac->altitude) {
-        int n = snprintf(line + pos, avail, " %5dft", ac->altitude);
-        if (n > 0) { pos += n; avail -= n; }
-    }
-    if (ac->speed) {
-        int n = snprintf(line + pos, avail, " %3dkt %03d°", ac->speed, ac->heading);
-        if (n > 0) { pos += n; avail -= n; }
-    }
-    if (ac->vert_rate) {
-        int n = snprintf(line + pos, avail, " %+dfpm", ac->vert_rate);
-        if (n > 0) { pos += n; avail -= n; }
-    }
+    if (snap.altitude)  LINE_PUT(snprintf(line + pos, avail, " %5dft", snap.altitude));
+    if (snap.speed)     LINE_PUT(snprintf(line + pos, avail, " %3dkt %03d°", snap.speed, snap.heading));
+    if (snap.vert_rate) LINE_PUT(snprintf(line + pos, avail, " %+dfpm", snap.vert_rate));
 
-    // Position + distance from receiver
-    if (ac->has_position) {
-        int n = snprintf(line + pos, avail, " (%.4f%c,%.4f%c)",
-            fabs(ac->lat), ac->lat >= 0 ? 'N' : 'S',
-            fabs(ac->lon), ac->lon >= 0 ? 'E' : 'W');
-        if (n > 0) { pos += n; avail -= n; }
-        receiver_pos_t rx = adsb_get_receiver_pos();
+    // Position + distance from receiver: " (37.8044N,122.2712W) 12.3nm@045°"
+    if (snap.has_position) {
+        LINE_PUT(snprintf(line + pos, avail, " ("));
+        LINE_PUT(adsb_put_fixed(line + pos, avail, fabs(snap.lat), 4, 0, ' '));
+        LINE_PUT(snprintf(line + pos, avail, "%c,", snap.lat >= 0 ? 'N' : 'S'));
+        LINE_PUT(adsb_put_fixed(line + pos, avail, fabs(snap.lon), 4, 0, ' '));
+        LINE_PUT(snprintf(line + pos, avail, "%c)", snap.lon >= 0 ? 'E' : 'W'));
         if (rx.fix_valid) {
-            double dist_km, brg;
-            haversine(rx.lat, rx.lon, ac->lat, ac->lon, &dist_km, &brg);
-            double dist_nm = dist_km * 0.539957;
-            n = snprintf(line + pos, avail, " %.1fnm@%03.0f°", dist_nm, brg);
-            if (n > 0) { pos += n; avail -= n; }
+            LINE_PUT(snprintf(line + pos, avail, " "));
+            LINE_PUT(adsb_put_fixed_f(line + pos, avail, range_km * 0.539957f, 1, 0, ' '));
+            LINE_PUT(snprintf(line + pos, avail, "nm@"));
+            LINE_PUT(adsb_put_fixed_f(line + pos, avail, bearing, 0, 3, '0'));
+            LINE_PUT(snprintf(line + pos, avail, "°"));
         }
     }
 
     // Squawk
-    if (ac->squawk) {
-        int n = snprintf(line + pos, avail, " SQK:%04d", ac->squawk);
-        if (n > 0) { pos += n; avail -= n; }
-    }
+    if (snap.squawk) LINE_PUT(snprintf(line + pos, avail, " SQK:%04d", snap.squawk));
 
     // Raw hex (compact, at end)
-    { int n = snprintf(line + pos, avail, " [");
-      if (n > 0) { pos += n; avail -= n; } }
-    int msglen = mm->msgbits / 8;
-    for (int i = 0; i < msglen && avail > 3; i++) {
-        int n = snprintf(line + pos, avail, "%02X", mm->msg[i]);
-        if (n > 0) { pos += n; avail -= n; }
+    LINE_PUT(snprintf(line + pos, avail, " ["));
+    {
+        int msglen = mm->msgbits / 8;
+        if (msglen > 14) msglen = 14;
+        LINE_PUT(adsb_put_hex(line + pos, avail, mm->msg, msglen));
     }
+#undef LINE_PUT
     if (avail > 2) { line[pos++] = ']'; line[pos++] = '\n'; line[pos] = '\0'; }
 
     // Queued for the log task, never written here: the decoder must not
@@ -2576,47 +2620,30 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 
     if (!replayed) {
         int64_t t_sd = esp_timer_get_time();
-        sd_log_aircraft(ac, mm);
+        sd_log_aircraft(&snap, mm, &rx, range_km, bearing);
         s_sdlog_busy_us += (uint32_t)(esp_timer_get_time() - t_sd);
     }
 
     // Queue aircraft update for MQTT feeder (returns immediately if not connected)
-    {
+    if (!replayed) {
         mqtt_aircraft_t mqac = {0};
         snprintf(mqac.icao, sizeof(mqac.icao), "%06lX", (unsigned long)icao);
-        if (ac->callsign[0])
-            strncpy(mqac.callsign, ac->callsign, sizeof(mqac.callsign) - 1);
-        mqac.lat = ac->lat;
-        mqac.lon = ac->lon;
-        mqac.alt_ft = ac->altitude;
-        mqac.speed_kt = (int16_t)ac->speed;
-        mqac.heading_deg = (int16_t)ac->heading;
-        mqac.vert_rate_fpm = (int16_t)ac->vert_rate;
-        mqac.has_pos = ac->has_position ? true : false;
+        if (snap.callsign[0])
+            strncpy(mqac.callsign, snap.callsign, sizeof(mqac.callsign) - 1);
+        mqac.lat = snap.lat;
+        mqac.lon = snap.lon;
+        mqac.alt_ft = snap.altitude;
+        mqac.speed_kt = (int16_t)snap.speed;
+        mqac.heading_deg = (int16_t)snap.heading;
+        mqac.vert_rate_fpm = (int16_t)snap.vert_rate;
+        mqac.has_pos = snap.has_position ? true : false;
         mqac.ts_us = esp_timer_get_time();
-        // Compute distance/bearing from receiver
-        receiver_pos_t rx = adsb_get_receiver_pos();
-        if (rx.fix_valid && ac->has_position) {
-            double dist_km, brg;
-            haversine(rx.lat, rx.lon, ac->lat, ac->lon, &dist_km, &brg);
-            mqac.dist_nm = (float)(dist_km * 0.539957);
-            mqac.bearing_deg = (int16_t)brg;
+        if (have_range) {
+            mqac.dist_nm = range_km * 0.539957f;
+            mqac.bearing_deg = (int16_t)bearing;
         }
-        if (!replayed) mqtt_feeder_update_aircraft(&mqac);
+        mqtt_feeder_update_aircraft(&mqac);
     }
-
-    // Update message statistics
-    s_total_messages++;
-    s_msg_count_window++;
-    int64_t now_us = esp_timer_get_time();
-    int64_t elapsed = now_us - s_msg_window_start;
-    if (elapsed >= 1000000LL) {  // 1 second window
-        s_msg_rate = (float)s_msg_count_window * 1000000.0f / (float)elapsed;
-        s_msg_count_window = 0;
-        s_msg_window_start = now_us;
-    }
-
-    xSemaphoreGive(aircraft_mutex);
 }
 
 // ============================================================
@@ -2881,6 +2908,18 @@ static void adsb_logq_push(const char *line, int len)
     logq_write(head + 2, line, (uint32_t)len);
     atomic_store_explicit(&s_logq_head, head + 2 + (uint32_t)len, memory_order_release);
     xTaskNotifyGive(s_log_task_hdl);
+}
+
+// Room in the queue for a line of `len` characters? (Asked before the text
+// of a line is built: at 300 messages a second on a 115200 baud console two
+// lines in three were built and then dropped.) True when there is no queue,
+// where lines are written directly.
+static bool adsb_logq_has_room(uint32_t len)
+{
+    if (s_logq == NULL || s_log_task_hdl == NULL) return true;
+    uint32_t head = atomic_load_explicit(&s_logq_head, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&s_logq_tail, memory_order_acquire);
+    return ADSB_LOGQ_BYTES - (head - tail) >= len + 2;
 }
 
 static void adsb_logq_printf(const char *fmt, ...)
@@ -3901,12 +3940,12 @@ void class_driver_client_deregister(void)
 int adsb_get_aircraft_for_scope(scope_aircraft_t *out, int max_count)
 {
     if (!aircraft_mutex || !out || max_count <= 0) return 0;
-    xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
-
-    receiver_pos_t rx = adsb_get_receiver_pos();
-    int64_t now_us = esp_timer_get_time();
+    const receiver_pos_t rx = adsb_get_receiver_pos();
     int count = 0;
 
+    // Copy under the lock; range and bearing after it (single precision).
+    xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
+    int64_t now_us = esp_timer_get_time();
     for (int i = 0; i < AIRCRAFT_TABLE_SIZE && count < max_count; i++) {
         aircraft_t *a = &aircraft_table[i];
         if (!a->active) continue;
@@ -3927,16 +3966,19 @@ int adsb_get_aircraft_for_scope(scope_aircraft_t *out, int max_count)
         s->age_ms = (int32_t)(age_us / 1000);
         s->dist_nm = 0;
         s->bearing_deg = 0;
-
-        if (a->has_position && rx.fix_valid) {
-            double dist_km, brg;
-            haversine(rx.lat, rx.lon, a->lat, a->lon, &dist_km, &brg);
-            s->dist_nm = dist_km * 0.539957;
-            s->bearing_deg = brg;
-        }
         count++;
     }
-
     xSemaphoreGive(aircraft_mutex);
+
+    if (rx.fix_valid) {
+        for (int i = 0; i < count; i++) {
+            scope_aircraft_t *s = &out[i];
+            if (!s->has_position) continue;
+            float km, brg;
+            adsb_gc(rx.lat, rx.lon, s->lat, s->lon, &km, &brg);
+            s->dist_nm = km * 0.539957f;
+            s->bearing_deg = brg;
+        }
+    }
     return count;
 }
