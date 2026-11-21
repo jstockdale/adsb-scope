@@ -48,9 +48,10 @@ This project turns a LILYGO T-Display-P4 development board into a portable ADS-B
 - **ADS-B Scope** – WebSerial-based live map viewer (v1.0.10) with firmware flashing that can keep the device's settings, negotiated serial speed, CSV replay, file browser, Meshy message panel, aircraft database detail cards, helicopter icons, 3D aircraft view, gain control popover, MQTT integration, and a performance meter ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
 - **SD card reliability** – power-cycled on boot via XL9535 GPIO to reset card state machine after hard resets; AXI DMA fence prevents WiFi SDIO bus contention; boot counter and device registry in `/sdcard/adsb_scope.cfg`
 - **Task priority architecture** – FreeRTOS priorities by what must never wait: USB host library (12), sample reader (11), audio DMA (6), serial transfer boost (5), class driver (4), decoder / GPS / console / Meshy RX (3), periodic tasks and the console log writer (2), LVGL rendering (1). The decoder and the console are pinned to core 1. (April's v1.0.8 had six tiers with the USB data path at 4 and the decoder on core 0; the reader/decoder split came with decoder-m1090.)
-- **Status bar** – dynamic icons for GPS (sat count + fix status), ADS-B (aircraft count + connection state), SD card (mounted/logging/USB), and battery level with automatic spacing based on rendered text width
+- **Status bar** – dynamic icons for GPS (sat count + fix status), ADS-B (aircraft count + connection state), SD card (mounted/logging/USB), and battery level with automatic spacing based on rendered text width Since coh6 also a WiFi glyph (grey: looking for a network, white: connected) with an MQTT arrow next to it (amber: broker not reached, green: connected) – not yet seen on a device.
 - **Sample path with a ring and on-device replay** – a reader task at priority 11 only moves USB transfers into a 192-slot sample ring in PSRAM; the decoder task works from the ring. `adsb replay <file>` runs a recorded raw 8-bit I/Q file from the SD card through the same decoder on the device.
 - **Field instruments** – `diag` prints everything a field report needs in one block, `top` each task's CPU use over a second, `adsb status` the receiver's counters, `gain sweep` what each gain step yields (`docs/UPLINK.md` section 9).
+- **WiFi that comes back, and up to five saved networks** – since coh6 a supervisor (`wifi_sup.c`) reconnects for as long as it takes (rounds of scan + connect, waits of 1 to 60 s) instead of giving up after 55 s, and picks among saved networks by priority, then signal; `wifi list / add / remove / prio / use / scan` on the console (`docs/UPLINK.md` 9.10). Not yet run on a device.
 - **Negotiated console speed** – the console always starts at 115200; a host can raise it for as long as it stays connected (`baud 921600`, up to 3 Mbaud) and the device returns to 115200 by itself when the host goes away (`docs/UPLINK.md` 9.8). New in coh4 – not yet run on a device.
 - **Host tools** – `tools/flash-adsb-scope.sh` installs a firmware kit with esptool and keeps the settings whenever the flash layout allows; `tools/adsb-fastlog.py` logs the console to a file at a negotiated speed (`tools/README.md`).
 - **Test and measurement harness** – `harness/`: the decoder against recordings and synthetic signals, the gain loop, the console-speed protocol against a simulated device, the web app's serial code and its flashing (real esptool-js against an emulated chip), and the web app under load in Node and in a headless Chrome (`harness/README.md`).
@@ -73,8 +74,9 @@ This project turns a LILYGO T-Display-P4 development board into a portable ADS-B
 | coh1 – coh3 | soft rescue and coherent second look (on by default since coh2), decoder at half the cost, gain loop on levels and yield | coh2 and coh3: yes – coh3 gave 47 messages/second with 8 aircraft, about 300/second in heavy traffic |
 | coh4 | per-message cost around the decoder cut to an eighth, aircraft lock held for a copy only, console speed negotiated up from 115200, `tools/` | **no** – built, tested on a PC and against a simulated device |
 | coh5 | web app v1.0.10: flashing keeps the settings and works with esptool-js as it is, the log's layout-per-line removed, a meter | **no** – as coh4; the page's flashing is tested with the real esptool-js against an emulated chip, the page itself in a headless Chrome |
+| coh6 | WiFi: reconnects for good, up to five saved networks chosen by priority then signal, WiFi + MQTT indicator in the status bar | **no** – the decisions are tested on a PC with scripted events; nothing that touches the radio has run |
 
-`docs/DECODER.md` and `docs/UPLINK.md` say for each change what was measured, how, and what was not. Branches `r10`, `coh3`, `coh4` and `coh5` stay at those releases; `main` is the latest.
+`docs/DECODER.md` and `docs/UPLINK.md` say for each change what was measured, how, and what was not. Branches `r10`, `coh3`, `coh4`, `coh5` and `coh6` stay at those releases; `main` is the latest.
 
 ## ADS-B Scope
 
@@ -156,7 +158,9 @@ adsb coh [on|off]                coherent second look at frames that fail their 
 diag [mark]                      everything a field report needs, in one block; mark: restart its checks
 meshy [on|off|status]            Meshtastic radio control
 usb [status]                     USB host status
-wifi [on|off|status|ssid <n>|pass <pw>]   WiFi control
+wifi [on|off|status|list|scan|cycle]      WiFi control and state
+wifi add <name> [pw] | remove <n> | prio <n> <pos> | use <n>   saved networks, in priority order (up to 5)
+wifi ssid <n> | pass <pw>                 network 1, as before
 mqtt [on|off|status|server <h>|port <n>|user <u>|pass <p>|id <id>]   MQTT config
 
 ── Info ──
@@ -647,7 +651,7 @@ cd build && esptool.py --chip esp32p4 merge_bin -o ../release.bin \
 
 This repository is the standalone cut (2026-07-29) of what previously lived as the `adsb` branch on a LilyGo T-Display-P4 fork. All third-party code is vendored at recorded pins – see **VENDOR.md**. Local patches and the SD/WiFi coexistence fence are documented in **PATCHES.md**. The full architecture reference (with a dated correction block) is **docs/ARCHITECTURE.md**. Multi-board plans live under **boards/**.
 
-**History.** `main` starts with the history of that fork's `adsb` branch (up to April 2026), continues with one commit that holds the standalone tree as of decoder-m1090 **r10** – the commits between the cut and r10 are not in this repository – and then the **coh** series commit by commit. Branches `r10`, `coh3`, `coh4` and `coh5` stay at those releases. Commits from r10 to coh4 carry an `Original-commit:` line: the hash they had before this history was put together, which is what firmware built before then reports as its version (`git log --grep 7629907` finds coh4, for one).
+**History.** `main` starts with the history of that fork's `adsb` branch (up to April 2026), continues with one commit that holds the standalone tree as of decoder-m1090 **r10** – the commits between the cut and r10 are not in this repository – and then the **coh** series commit by commit. Branches `r10`, `coh3`, `coh4`, `coh5` and `coh6` stay at those releases. Commits from r10 to coh4 carry an `Original-commit:` line: the hash they had before this history was put together, which is what firmware built before then reports as its version (`git log --grep 7629907` finds coh4, for one).
 
 ```
 main/examples/adsb_receiver/   the application (firmware + webapp + tools)
@@ -712,11 +716,11 @@ VENDOR.md / PATCHES.md         provenance and patch mechanism
 31. ~~NVS crash on settings save~~ – fixed: NVS write from PSRAM-stack task crashed on cache disable; now dispatches to internal-RAM helper task
 32. ~~MSC crash on enter~~ – fixed: reordered sd_msc_enter() to stop RTL-SDR before unmounting SD, preventing in-flight SPI DMA from overwriting freed PSRAM
 
-### Next: WiFi and MQTT (agreed 2026-11-21, not started)
+### WiFi and MQTT (coh6 – written, not yet run on a device)
 
-- **WiFi + MQTT indicator in the status bar** – today the bar shows a WiFi glyph when connected and nothing otherwise, and says nothing about MQTT. One group: WiFi state, and whether MQTT is actually feeding
-- **WiFi that comes back** – `wifi_hosted.h` gives up for good after 10 reconnect attempts (55 s in all) and waits inside the event handler while it does; replace with a supervisor that retries forever with capped backoff, notices a link that is up but dead, and can power-cycle the C6
-- **More than one network** – a saved list with a priority order instead of the single SSID in the settings; on loss (and at boot) scan and take the best saved network in range; `wifi list/add/remove` on the console, the settings screen and the web app
+- ~~WiFi + MQTT indicator in the status bar~~ – done in coh6; to be looked at on a device
+- ~~WiFi that comes back~~ – done in coh6 (`wifi_sup.c`); to be tested with a real access point going away and coming back
+- ~~More than one network~~ – done in coh6: five saved networks, priority then signal, console commands. Still open: managing the list from the on-device settings screen (it shows and edits network 1 only) and from the web app (which has no WiFi settings), and whether the radio should be power-cycled automatically after a long outage (`wifi cycle` to try it by hand)
 
 ### Since April 2026
 

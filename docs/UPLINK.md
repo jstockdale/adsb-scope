@@ -988,3 +988,76 @@ either version; the columns to compare are the work.)
 
 **Not measured:** a real serial port, a GPU, a phone. The meter is there
 for that.
+
+### 9.10 WiFi that comes back, more than one network, and an indicator (coh6)
+
+**What was there.** `wifi_hosted.h` answered a disconnect inside the WiFi
+event handler: wait 1 s, connect, wait 2 s, connect ... ten times, 55 s in
+all, then "Max retries reached" and nothing more until a reboot. A device
+carried out of range for a minute never came back, and for those 55 s no
+other network event was handled. `wifi off` followed by `wifi on` did not
+bring WiFi back either (the start function saw "already initialised" and
+returned; the radio stayed paused). The status bar's WiFi glyph was never
+shown at all: nothing called the function that showed it. One network
+could be stored.
+
+**What is there now.**
+
+- *The decisions are in `wifi_sup.c`*, pure C like `console_link.c`: a
+  list of saved networks in priority order and a state machine that is
+  told what happens and answers with at most one thing to do. It never
+  gives up. A round is a scan, then the saved networks in range, best
+  first; a round that connects nowhere is followed by a wait of 1, 2, 4
+  ... 60 s, then 60 s for as long as it takes. A connect that produces no
+  address in 15 s is abandoned. A working link is kept – no roaming;
+  losing it starts a round at once.
+- *Best first* is: the saved networks at or above -80 dBm in list order,
+  then the weaker ones, strongest first. Priority before strength,
+  because a phone's hotspot on the same desk is always the strongest and
+  rarely the one wanted. If none of the saved names is seen but a network
+  that hides its name is, the saved ones are tried by name.
+- *`wifi_hosted.h` carries it out* from a task of its own (`wifi_sup`,
+  priority 2); the event handler only posts to its queue.
+- *Up to five networks* (`WS_MAX_NETS`): the old SSID and password are the
+  first, four more sit in what was padding of the settings blob. The
+  settings version is deliberately not raised – zero bytes mean "no more
+  networks", and raising it would make coh5 and older discard the whole
+  blob on a roll-back.
+- *"Connected but nothing gets through":* when MQTT is wanted, WiFi says
+  connected and the broker has not been reachable for five minutes,
+  WiFi is told to reconnect (once per five minutes).
+- *Console:* `wifi` / `wifi list` (state, the list with each network's
+  level in the last scan), `wifi add <name> [password]` (quotes around a
+  name with spaces; no password: open network), `wifi remove <n>`,
+  `wifi prio <n> <position>`, `wifi use <n>` (switch now; kept until that
+  link is lost), `wifi scan`, `wifi cycle` (power the C6 down and up).
+  `wifi ssid` / `wifi pass` still set network 1. Log lines: `WIFI: Connecting to <name> (-61
+  dBm)`, `WIFI: Connected, IP: ...` (unchanged), `WIFI: Connection lost
+  (reason N)`, `WIFI: No saved network could be joined - next try in 60 s
+  (round 20)` (the first failed round and every tenth).
+- *Status bar:* a WiFi glyph – hidden: WiFi off; grey: on, looking for a
+  network; white: connected – and, when MQTT is enabled, an arrow next to
+  it: amber while the broker is not reached, green while connected to it.
+
+**Not in it.** The radio's power cycle after a long outage exists in
+`wifi_sup.c` and is switched off (`cycle_after_ms = 0`): the usual reason
+for a long outage is being out of range, and whether a C6 power cycle
+under ESP-Hosted comes back cleanly is not known. `wifi cycle` is there
+to find out by hand. Green means "connected to the broker", not "a
+message went out in the last seconds". Passwords are stored as before,
+in plain text in NVS – now up to five of them. The on-device settings
+screen still shows and edits network 1 only.
+
+**Tested:** `harness/wifi/test_wifi_sup.c` drives `wifi_sup.c` with
+scripted events – the order of candidates, four hours with nothing in
+range (still trying, waits 1 to 60 s), loss, a stalled connect, scan and
+disconnect, the dead link, a manual choice, edits of the list while
+connected, the list itself, the millisecond counter's wrap. The firmware
+builds without new warnings. **Not tested: everything that touches the
+radio.** In particular whether ESP-Hosted 2.12.3 passes scans through as
+esp_wifi does natively (`esp_wifi_scan_start` with hidden networks,
+`esp_wifi_scan_get_ap_records`), a scan while associated (`wifi scan`),
+`wifi off` / `wifi on` and `wifi cycle`, and the two glyphs on the
+screen. First things to look at on a device: the `WIFI:` lines after
+boot, `wifi list`, and what happens when the access point is switched
+off for a few minutes and on again.
