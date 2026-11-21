@@ -147,7 +147,7 @@ Requirements: Chrome or Edge (WebSerial API). Connect via USB, click "Connect Se
 
 ## Serial Console
 
-Press **Ctrl+C** over serial (115200 baud) to enter command mode. Type `log` to return to streaming mode. ADS-B and GNSS output is buffered in PSRAM during command mode (up to 500 lines) and replayed when returning to log mode.
+Press **Ctrl+C** over serial (115200 baud; a host can negotiate more for its session with `baud`, see `UPLINK.md` 9.8) to enter command mode. Type `log` to return to streaming mode. ADS-B and GNSS output is buffered in PSRAM during command mode (up to 500 lines) and replayed when returning to log mode.
 
 ```
 help              show available commands

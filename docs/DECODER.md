@@ -891,6 +891,13 @@ the watchdog message returns, it will now name core 1, and `top` taken at
 that moment is the evidence needed. And the real figure: `adsb status`
 prints the decoder's share of a core and the share of air time decoded.
 
+**What followed (coh4).** The 149 M is the demodulator. The decoder task
+also carries what is done with each decoded message, and up to coh3 that
+was 200,000 instructions for a message from an aircraft with a position –
+three double-precision haversines and `printf("%f")` for every number,
+60 M a second at 300 messages a second, 40 % on top of the demodulator.
+It is 23,000 now. `UPLINK.md` section 9.7.
+
 ## 6. Not verified – read before relying on any of this
 
 - **Compiled, not run.** The full firmware builds with ESP-IDF v5.4.1

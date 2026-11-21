@@ -242,6 +242,7 @@ does nothing else; the log line leaves the decoder task; and internal
 DMA-capable RAM, which is short on this board, is not to grow. r9
 (section 7) does this. A faster console (921,600 baud or more) was left
 for later: it needs the web app to open the port at the same speed.
+(Done in coh4, as a speed negotiated for one session: section 9.8.)
 
 ## 6. Aircraft limits (r8)
 
@@ -618,3 +619,221 @@ since r7. In order of weight:
 3. `gain sweep`, twice, and the `GAIN: [Sweep]` lines.
 4. If `task_wdt` appears again: `top`, right then.
 5. A replay, as in section 9.4 step 3, if a recording is on the card.
+
+### 9.7 Around the decoder: what a message costs, and the aircraft table's lock (coh4)
+
+**The report.** With coh3, near 300 messages a second the ADS-B app (the
+list) on the device stopped updating; the Scope app, in the same traffic,
+did not. So the decoder kept up, and what gave way was around it.
+
+**What the two apps do.** The Scope redraws inside the display task,
+times each frame and stretches its own period to match (33 ms to 500 ms
+and beyond): it slows itself under load. The ADS-B app had its own task,
+at priority 2 – above the display task's 1 – on a fixed half-second
+cycle, and on every cycle it took the aircraft table's lock three times:
+twice in `adsb_get_stats()` and once in `adsb_format_aircraft_list()`,
+which held it through a great-circle distance for every aircraft, a sort
+and six `snprintf()` calls per row. The decoder takes the same lock for
+every message.
+
+**What that cost.** The ESP32-P4's FPU is single precision; `double` is
+done in software. One `haversine()` was about 38,000 instructions, and
+`printf("%f")` several thousand more per number. Counted on the device's
+instruction set with the firmware's compiler flags
+(`harness/experiments/cost_app_rv32.py`, `harness/results/cost_app_rv32.txt`;
+instructions, not time – see `DECODER.md` 5.9):
+
+| | coh3 | coh4 |
+| --- | ---: | ---: |
+| list refresh, 100 aircraft, under the lock | 4.17 M | 7.5 k |
+| list refresh, 100 aircraft, in all | 4.17 M | 0.72 M |
+| list refresh, 250 aircraft, under the lock | 11.06 M | 15.2 k |
+| nearest and farthest, 100 aircraft, under the lock | 3.03 M | 56 k |
+| one message from an aircraft with a position: console line, SD row, MQTT distance | 199.7 k | 23.1 k |
+| the same at 300 messages a second | 59.9 M/s | 6.9 M/s |
+
+The last row is in the decoder's own task. The demodulator is 149 M
+instructions per second of signal (`DECODER.md` 5.9), so at 300 messages a
+second the three haversines and the number formatting of each message
+added 40 % to it. That is the larger finding: it is load that grows with
+the message rate, in the task that must keep up, and it is gone.
+
+**What changed in coh4.**
+
+1. `adsb_fmt.c` (new): great-circle distance and bearing in single
+   precision, with the coordinate differences taken in double first, in
+   forms without a difference of nearly equal terms; and decimal text by
+   scaling and rounding. Against the old code (`harness/fmt/test_fmt.c`,
+   `harness/results/fmt.txt`): distance within 0.52 m and bearing within
+   0.00003° over two million pairs out to 450 nm; number text identical to
+   `printf` on 3.8 million values, including exact ties. What is printed
+   changes only where single precision rounds a distance or a bearing the
+   other way: 0.02 % of distances to 0.1 km, 0.001 % of bearings.
+2. `on_msg()` updates the table, takes a copy of the aircraft, and
+   **releases the lock** before it builds the console line, the SD row and
+   the MQTT update. It was held to the end: through three haversines, two
+   lines of text, any SD card write the row triggered, and – on the first
+   message of an aircraft – a lookup in the aircraft database that reads
+   the SD card when it is not in the cache.
+3. One distance per message instead of three, and the console line is not
+   built at all when the log queue has no room for it (it was built and
+   then dropped: two lines in three at 300 messages a second on a 115200
+   baud console).
+4. `adsb_format_aircraft_list()` copies the table under the lock and does
+   everything else after it; `adsb_get_stats()` takes the lock once
+   instead of twice and computes only a ranking value under it;
+   `adsb_get_aircraft_for_scope()` computes range and bearing after it.
+5. Seen on the way: the nearest aircraft, if it had no callsign, was shown
+   with the callsign of an earlier candidate. Fixed.
+
+**A deadlock that was waiting.** Leaving the ADS-B app called
+`vTaskSuspend()` on its task from the display task, wherever the task
+was – including inside the lock. Then the decoder stopped at its next
+message, the status bar's task stopped at its next refresh, and opening
+the Scope would have stopped the display task too; opening the ADS-B app
+again released it. The chance per exit was the share of time the lock was
+held, so it grew with traffic: a few percent at 100 aircraft, 10 to 20 %
+at 250. In coh4 the ADS-B and Meshy app tasks are told through a flag and
+a task notification and park themselves at the top of their loop, where
+they hold nothing. (The factory-test windows inherited from LilyGO's base
+– microphone, IMU, Ethernet, AT – still suspend their tasks from outside.
+They are not part of normal use and were left alone.)
+
+**Not established.** Why the list stopped updating. At the 50 to 100
+aircraft that 300 messages a second corresponds to, the list's own work
+was a few percent of a core twice a second: too little to stall a display
+by itself. The per-message cost (above) and the lock held through SD
+writes are better candidates, and both are removed, but that is an
+argument, not a measurement. If it happens again on coh4: is the touch
+screen still alive, did it follow a change of app, how many aircraft –
+and `top`.
+
+### 9.8 The console's speed (coh4)
+
+**What it is.** The console always starts at 115200 baud. A host that
+wants more asks, and keeps it only while it is there
+(`console_link.h`, `console_link.c`; the commands are in
+`serial_console.c`):
+
+    host    baud 921600                      at 115200, in command mode
+    device  BAUD: switching to 921600 – …    then the prompt, then its UART changes
+    host    changes its own speed; Ctrl+C, baud ok
+    device  BAUD: up 921600
+    host    the byte 0x05 every two seconds  (answered: BAUD: ok 921600)
+    …
+    host    the byte 0x04 when it leaves – or nothing
+
+The device goes back to 115200 if `baud ok` does not arrive at the new
+speed within 5 s (a speed the bridge chip or the cable cannot do costs
+five seconds and nothing else), at once on 0x04, and after 10 s without
+hearing the host. A command counts as hearing the host, at its start and
+at its end, and so does upload data. Both bytes work in log mode and in
+command mode; `BAUD: ok <speed>` is also the answer at 115200, which is
+how a host tells this firmware from an older one without entering command
+mode.
+
+`baud` alone shows the state and the speeds offered: 115200, 230400,
+460800, 921600, 1000000, 1500000, 2000000, 3000000. From the console
+UART's 40 MHz crystal each is within 0.2 % (`harness/link/test_link.c`).
+`baud <speed> stay` is for a person at a terminal: no confirmation and no
+keepalive, until `baud 115200` or a reset. Before the first change the
+firmware reads the UART's divider back and refuses if it is not what
+115200 from the crystal gives, rather than set a speed from a wrong
+assumption about its clock.
+
+**The catch on this board: opening the port resets it.** The USB-C port
+is a UART behind a bridge chip, and its RTS line is wired to the
+processor's reset, DTR to the boot-mode pin. The evidence: in the first
+log from a device (9.6) both plain connects from the web app are followed
+by `rst:0x1 (POWERON)` – the reset pin, not a software or USB reset – one
+of them with `boot:0x307 (DOWNLOAD…)`, and LilyGO's own notes say to
+disable RTS "because the RTS line can reset the P4". (The project's
+README calls the port "USB Serial/JTAG". It cannot be: console input
+works, and in this configuration ESP-IDF takes input from UART0 only.)
+
+Web Serial can change a port's speed only by closing and reopening it.
+So three kinds of host:
+
+- **A program that can change the speed of an open port** (a terminal,
+  `tools/adsb-fastlog.py`): the exchange above, exactly. No reset beyond
+  the one its own open causes.
+- **The web app, on a device that resets when the port is opened:**
+  `baud 921600 next` stores the request for the next start only (NVS,
+  namespace `console`, removed as it is read; dropped after 15 s if no
+  reset follows). The page then reopens at 921600, which is that reset;
+  the firmware starts its console at 921600 and waits 10 s for `baud ok`.
+  One more boot, about 15 s, at every connect that asks for a faster
+  speed. The bootloader's and the early application's text is at 115200
+  and unreadable to the page during that boot; the page keeps the version
+  and device ID it read from the first one.
+- **The web app, where opening does not reset the device:** ask, reopen,
+  confirm. The page tells the two apart by whether a boot banner followed
+  its own connect.
+
+**`tools/adsb-fastlog.py`** (Python 3, nothing else): connects at 115200,
+waits for the console, negotiates (921600 by default, lower speeds if that
+is not confirmed), logs every line to a file, keeps the link alive, finds
+the device again if it restarts, and on the way out appends the device's
+own `adsb status` and `baud` and says goodbye. Against the simulated
+device with 300 lines a second: none missing at 921600, 73 % never sent at
+115200 (`harness/results/link.txt`).
+
+**The web app** (`adsb_scope.htm`, v1.0.9): "Serial speed" in the
+firmware panel (default 921600; 115200 is the old behaviour), shown in the
+session panel. It also now: queues its writes (a keepalive can no longer
+collide with a command's write on the port), hides the garbage of a boot
+log at the wrong speed, and – when a connect leaves the device in the
+ROM's download mode, which the DTR/RTS race on open does now and then –
+pulses RTS with DTR released to restart it, instead of waiting there.
+
+**Flashing from the page.** esptool-js changes speed by closing and
+reopening the port, which on this board would reset the processor out of
+the loader, so the page had been pinned to 115200. It now opens the port
+at the flashing speed from the start and lets the ROM loader take its
+speed from the sync packets (esptool's protocol notes: "the sync packets
+can be sent at any baud rate, and the UART peripheral will detect this").
+Default 460800, where one cycle of the 40 MHz clock is 1.2 % of a bit;
+if the loader does not answer there, or a write fails, the page does the
+whole thing again at 115200 and does not try the faster speed again until
+the setting is chosen anew. **Whether the ESP32-P4's ROM does this is not
+confirmed** – Espressif's page for the P4 only recommends 115200 – so the
+first flash from the page will show which.
+
+**`baud probe [ms]`** is a diagnostic for the next step: it measures the
+speed of what arrives with the UART's pulse counters, whatever the UART is
+set to. If that works on the running device, a page could open the port at
+the fast speed in the first place and be recognised, which would save the
+second boot (at the price of the boot log). `adsb-fastlog.py --probe
+921600` runs it.
+
+**What is tested, and what is not.** The state machine has a unit test
+(`harness/link/test_link.c`, 41 checks). `harness/link/sim_device.c` is a
+stand-in for the device on a pseudo-terminal that runs the same state
+machine, carries baud/10 bytes a second, turns both directions to garbage
+when the two ends' speeds differ, and can reset on open, refuse speeds
+above a limit, play older firmware, or land in download mode. Against it:
+the logger through ten cases (`link/check_fastlog.py`) and **the web app's
+own code** – the page's whole script run in Node, its serial port replaced
+by the pseudo-terminal – through nine (`link/check_page.js`): both ways
+up, older firmware, a speed that does not work with and without reset on
+open, a device that restarts by itself, download mode, writes that meet.
+Results in `harness/results/link.txt`.
+
+None of it has run on hardware. In particular, untested: that the
+console UART is clocked as assumed (the read-back check is there for
+that); that the bridge chip does 921600 and above; what a real reopen does
+to the device; the ROM loader's speed detection; uploads to the device at
+the higher speed (the UART is polled and has a 128-byte receive FIFO,
+which fills in 1.4 ms at 921600; the upload code reads it in a tight loop
+at raised priority, which should do, but has not been tried).
+
+**Limits.** The console UART has no driver: the log writer estimates when
+the transmit FIFO has room and sleeps in whole ticks. At 921600, where
+the FIFO empties in 1.4 ms, that is 450 to 500 lines a second; the wire
+itself would carry about 600.
+
+**Wanted from a first run:** `python3 adsb-fastlog.py` for a few minutes
+in traffic and the file it writes (the status block at its end says what
+the device sent and dropped at 921600); a connect from the page with the
+browser console's lines that begin `[scope] Serial`; a flash from the
+page, with its log; and `python3 adsb-fastlog.py --probe 921600`.

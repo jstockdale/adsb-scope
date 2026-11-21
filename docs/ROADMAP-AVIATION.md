@@ -779,10 +779,12 @@ fi
     seal specification (r11). Unsealed commands are accepted unless the
     device is in strict mode.
 13. **Pass criteria** (5.0). The proposed numbers are starting points.
-14. **Console speed** (r14). 115200 baud caps the log near 80 lines a
-    second. Going faster needs the web app to follow and breaks anything
-    else that reads the port. Worth it, or should the web app get its
-    data another way?
+14. ~~Console speed~~ **Answered** (coh4): the console stays at 115200
+    for anything that opens the port, and a host that wants more
+    negotiates it for its session and loses it when it goes away
+    (`UPLINK.md` section 9.8). Nothing else that reads the port breaks.
+    On this board the web app pays for it with a second boot at connect,
+    because opening the port resets the processor.
 
 ## 7. What I am unsure of
 
