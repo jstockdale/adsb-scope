@@ -119,10 +119,16 @@ typedef struct {
     // field whose default is not zero.
     struct { char ssid[33]; char pass[65]; } wifi_extra[WS_MAX_NETS - 1];   // 4 x 98 bytes
 
+    // ── Meshtastic relay (coh7) ──
+    // 0 (the default, and what the padding held): received packets are not
+    // retransmitted. 1: they are, by the rules of the role (meshtastic_task.cpp).
+    // Zero default, so no version bump - see wifi_extra above.
+    uint8_t  meshy_rebroadcast;
+
     // ── ADD NEW FIELDS HERE — consume _pad bytes, bump SETTINGS_VERSION ──
 
     // ── Reserved for future fields ──
-    uint8_t  _pad[218];
+    uint8_t  _pad[217];
 } device_settings_t;
 
 // Struct must be exactly 1024 bytes — adjust _pad if this fires

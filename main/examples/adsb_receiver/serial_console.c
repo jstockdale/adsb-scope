@@ -554,7 +554,7 @@ static void cmd_help(void) {
         "  \033[32madsb dec\033[0m [default|soft|fix2]  error correction: 1-bit only, + soft rescue, + soft rescue and 2-bit\n"
         "  \033[32madsb coh\033[0m [on|off]    coherent second look at frames that fail their CRC; no argument: show\n"
         "  \033[32mdiag\033[0m [mark]       everything a field report needs, in one block; mark: restart its checks\n"
-        "  \033[32mmeshy\033[0m [on|off|status] Meshtastic radio control\n"
+        "  \033[32mmeshy\033[0m [on|off|status|relay [on|off]|undecoded [on|off]]  Meshtastic radio; relay of received packets (default off); raw log of undecoded packets\n"
         "  \033[32musb\033[0m [status]          USB host status\n"
         "  \033[32mwifi\033[0m [on|off|status|list|scan|add <name> [pw]|remove <n>|prio <n> <pos>|use <n>|cycle]  WiFi and its saved networks\n"
         "  \033[32mmqtt\033[0m [on|off|status|server <h>|port <n>|user <u>|pass <p>|id <id>]\n"
@@ -1006,7 +1006,7 @@ static void cmd_adsb(const char *subcmd) {
     }
 }
 
-static void cmd_meshy(const char *subcmd) {
+static void cmd_meshy(const char *subcmd, const char *arg) {
     extern meshy_stats_t meshy_get_stats(void);
     meshy_stats_t st = meshy_get_stats();
 
@@ -1018,11 +1018,34 @@ static void cmd_meshy(const char *subcmd) {
             printf("  RX:        %lu packets (%lu decoded)\n",
                    (unsigned long)st.rx_packets, (unsigned long)st.rx_decoded);
             printf("  TX:        %lu packets\n", (unsigned long)st.tx_packets);
+            {
+                extern void meshy_relay_stats(uint32_t *sent, uint32_t *yielded, uint32_t *dropped);
+                extern bool meshy_get_log_undecoded(void);
+                uint32_t rs = 0, ry = 0, rd = 0;
+                meshy_relay_stats(&rs, &ry, &rd);
+                if (!g_settings.meshy_rebroadcast) printf("  Relay:     off\n");
+                else printf("  Relay:     on%s - %lu relayed, %lu left to others, %lu dropped\n",
+                            g_settings.meshy_role == 1 ? " (but the role is ClientMute, which never relays)" : "",
+                            (unsigned long)rs, (unsigned long)ry, (unsigned long)rd);
+                if (meshy_get_log_undecoded()) printf("  Raw log:   on (packets that could not be decoded)\n");
+            }
             extern bool meshy_sd_is_active(void);
             printf("  SD log:    %s%s\n",
                    meshy_sd_is_active() ? "active" : "inactive",
                    sd_log_bus_failed() ? " *** SPI BUS FAILED ***" : "");
         }
+    } else if (strcmp(subcmd, "relay") == 0) {
+        if (arg && (strcmp(arg, "on") == 0 || strcmp(arg, "off") == 0)) {
+            g_settings.meshy_rebroadcast = strcmp(arg, "on") == 0;
+            g_settings_save_pending = true;
+        }
+        printf("  Relay (rebroadcast of received packets): %s\n", g_settings.meshy_rebroadcast ? "on" : "off");
+        if (g_settings.meshy_rebroadcast && g_settings.meshy_role == 1) printf("  The role is ClientMute, which never relays.\n");
+    } else if (strcmp(subcmd, "undecoded") == 0) {
+        extern void meshy_set_log_undecoded(bool on);
+        extern bool meshy_get_log_undecoded(void);
+        if (arg && (strcmp(arg, "on") == 0 || strcmp(arg, "off") == 0)) meshy_set_log_undecoded(strcmp(arg, "on") == 0);
+        printf("  Raw log of packets that could not be decoded: %s (until the next reboot)\n", meshy_get_log_undecoded() ? "on" : "off");
     } else if (strcmp(subcmd, "on") == 0) {
         if (st.running) {
             printf("  Meshy is already running\n");
@@ -2282,7 +2305,7 @@ static void dispatch_command(char *line) {
     } else if (strcmp(cmd, "diag") == 0) {
         cmd_diag(arg1);
     } else if (strcmp(cmd, "meshy") == 0) {
-        cmd_meshy(arg1);
+        cmd_meshy(arg1, arg2);
     } else if (strcmp(cmd, "usb") == 0) {
         cmd_usb(arg1);
 

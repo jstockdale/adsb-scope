@@ -679,6 +679,110 @@ static bool configure_radio(void) {
 
 // ─── RX Task ────────────────────────────────────────────────────────────────
 
+// ─── Relay (rebroadcast), and a raw log of what could not be decoded ────────
+//
+// Relay - off unless g_settings.meshy_rebroadcast is set ("meshy relay on"):
+// a packet heard for the first time, not from us, not addressed to us, with
+// hops left, is transmitted again as it is - still encrypted, whether or not
+// we could read it - with its hop limit one lower and our node's last byte as
+// relay_node. By role:
+//   Client      waits longer the better it heard the packet (0 to 2 s by SNR,
+//               plus up to 0.5 s), so that far nodes go first, and gives up
+//               its turn if it hears the packet again meanwhile
+//   ClientMute  never relays
+//   RouterLate  always relays, 3 to 4 s after hearing it
+// This follows Meshtastic's flooding in outline. It is not its contention
+// window: the delays are not derived from slot times.
+//
+// Raw log - off unless "meshy undecoded on" (not kept across a reboot): each
+// packet that neither a channel key nor PKI could open is printed with its
+// header fields and all of its bytes.
+#define MESHY_RELAY_SEEN     64
+#define MESHY_RELAY_PENDING  4
+typedef struct { bool used; uint8_t len; uint32_t from, id, due_ms; uint8_t frame[256]; } meshy_relay_slot_t;
+static struct { uint32_t from, id; } s_relay_seen[MESHY_RELAY_SEEN];
+static int s_relay_seen_n = 0, s_relay_seen_w = 0;
+static meshy_relay_slot_t s_relay[MESHY_RELAY_PENDING];
+static portMUX_TYPE s_relay_mux = portMUX_INITIALIZER_UNLOCKED;   // RX task files, TX task sends
+static uint32_t s_relay_sent = 0, s_relay_yielded = 0, s_relay_dropped = 0;
+static volatile bool s_log_undecoded = false;
+
+extern "C" void meshy_set_log_undecoded(bool on) { s_log_undecoded = on; }
+extern "C" bool meshy_get_log_undecoded(void) { return s_log_undecoded; }
+extern "C" void meshy_relay_stats(uint32_t *sent, uint32_t *yielded, uint32_t *dropped) {
+    if (sent) *sent = s_relay_sent;
+    if (yielded) *yielded = s_relay_yielded;
+    if (dropped) *dropped = s_relay_dropped;
+}
+
+static inline uint32_t meshy_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Every received packet passes here, decoded or not. Header: to, from, id
+// (4 bytes each, little-endian), flags (hop limit in bits 0-2), channel hash,
+// next_hop, relay_node.
+static void meshy_relay_consider(const uint8_t *raw, size_t len, float snr) {
+    if (len < 16 || len > 255) return;
+    uint32_t to = meshy_le32(raw), from = meshy_le32(raw + 4), id = meshy_le32(raw + 8);
+    uint8_t flags = raw[12], hop_limit = flags & 0x07;
+
+    for (int i = 0; i < s_relay_seen_n; i++) {
+        if (s_relay_seen[i].from != from || s_relay_seen[i].id != id) continue;
+        // Heard before: somebody relayed it. A client that was about to gives up its turn.
+        if (g_settings.meshy_role == 0) {
+            bool yielded = false;
+            taskENTER_CRITICAL(&s_relay_mux);
+            for (int k = 0; k < MESHY_RELAY_PENDING; k++)
+                if (s_relay[k].used && s_relay[k].from == from && s_relay[k].id == id) { s_relay[k].used = false; yielded = true; }
+            taskEXIT_CRITICAL(&s_relay_mux);
+            if (yielded) { s_relay_yielded++; MESHY_LOGI("[RELAY] !%08lx id:%08lx heard again - not relayed", (unsigned long)from, (unsigned long)id); }
+        }
+        return;
+    }
+    s_relay_seen[s_relay_seen_w].from = from; s_relay_seen[s_relay_seen_w].id = id;
+    s_relay_seen_w = (s_relay_seen_w + 1) % MESHY_RELAY_SEEN;
+    if (s_relay_seen_n < MESHY_RELAY_SEEN) s_relay_seen_n++;
+
+    if (!g_settings.meshy_rebroadcast || g_settings.meshy_role == 1) return;       // off, or ClientMute
+    if (from == s_session.node_num || to == s_session.node_num || hop_limit == 0) return;
+
+    uint32_t wait_ms;
+    if (g_settings.meshy_role == 2) wait_ms = 3000 + (uint32_t)(rand() % 1000);       // RouterLate
+    else {
+        float w = (snr + 20.0f) / 30.0f;                                              // -20 dB: at once ... +10 dB: 2 s
+        if (w < 0) w = 0;
+        if (w > 1) w = 1;
+        wait_ms = (uint32_t)(w * 2000.0f) + (uint32_t)(rand() % 500);
+    }
+    bool filed = false;
+    taskENTER_CRITICAL(&s_relay_mux);
+    for (int k = 0; k < MESHY_RELAY_PENDING && !filed; k++) {
+        if (s_relay[k].used) continue;
+        memcpy(s_relay[k].frame, raw, len);
+        s_relay[k].frame[12] = (uint8_t)((flags & ~0x07) | (hop_limit - 1));
+        s_relay[k].frame[15] = (uint8_t)(s_session.node_num & 0xFF);
+        s_relay[k].len = (uint8_t)len; s_relay[k].from = from; s_relay[k].id = id;
+        s_relay[k].due_ms = esp_log_timestamp() + wait_ms;
+        s_relay[k].used = true; filed = true;
+    }
+    taskEXIT_CRITICAL(&s_relay_mux);
+    if (!filed) s_relay_dropped++;                                                   // four are waiting already
+}
+
+static void meshy_log_undecoded(const uint8_t *raw, size_t len, float rssi, float snr) {
+    if (len < 16) { MESHY_LOGI("[RX?] %d bytes, shorter than a header", (int)len); }
+    else MESHY_LOGI("[RX?] to:!%08lx from:!%08lx id:%08lx hop:%d/%d ch:0x%02x len:%d rssi:%.0f snr:%.1f",
+                    (unsigned long)meshy_le32(raw), (unsigned long)meshy_le32(raw + 4), (unsigned long)meshy_le32(raw + 8),
+                    raw[12] & 0x07, (raw[12] >> 5) & 0x07, raw[13], (int)len, rssi, snr);
+    char hex[2 * 32 + 1];
+    for (size_t off = 0; off < len; off += 32) {
+        size_t n = len - off < 32 ? len - off : 32;
+        for (size_t i = 0; i < n; i++) snprintf(hex + 2 * i, 3, "%02x", raw[off + i]);
+        MESHY_LOGI("  +%03d %s", (int)off, hex);
+    }
+}
+
 static void meshy_rx_task(void *arg) {
     ESP_LOGI(TAG, "RX task started");
 
@@ -746,6 +850,7 @@ static void meshy_rx_task(void *arg) {
             }
 
             s_stats.rx_packets++;
+            meshy_relay_consider(raw, len, snr);
 
             // Process through Meshtastic protocol
             MeshRxResult result;
@@ -757,6 +862,7 @@ static void meshy_rx_task(void *arg) {
             if (!decoded) {
                 decoded = try_pki_decrypt(raw, len, rssi, snr, &result);
             }
+            if (!decoded && s_log_undecoded) meshy_log_undecoded(raw, len, rssi, snr);
 
             if (decoded) {
                 s_stats.rx_decoded++;
@@ -967,6 +1073,23 @@ static void meshy_tx_task(void *arg) {
     ESP_LOGI(TAG, "TX task started");
 
     while (s_running) {
+        // Relays whose wait is over (meshy_relay_consider files them)
+        for (int k = 0; k < MESHY_RELAY_PENDING; k++) {
+            static uint8_t relay_frame[256];
+            uint8_t relay_len = 0; uint32_t r_from = 0, r_id = 0;
+            taskENTER_CRITICAL(&s_relay_mux);
+            if (s_relay[k].used && (int32_t)(esp_log_timestamp() - s_relay[k].due_ms) >= 0) {
+                relay_len = s_relay[k].len; r_from = s_relay[k].from; r_id = s_relay[k].id;
+                memcpy(relay_frame, s_relay[k].frame, relay_len);
+                s_relay[k].used = false;
+            }
+            taskEXIT_CRITICAL(&s_relay_mux);
+            if (relay_len && g_settings.meshy_rebroadcast && transmit_frame(relay_frame, relay_len)) {
+                s_relay_sent++; s_stats.tx_packets++;
+                MESHY_LOGI("[RELAY] !%08lx id:%08lx hops left %d", (unsigned long)r_from, (unsigned long)r_id, relay_frame[12] & 0x07);
+            }
+        }
+
         static tx_request_t req;
         if (xQueueReceive(s_tx_queue, &req, pdMS_TO_TICKS(200)) == pdTRUE) {
             // ── First TX: send NODEINFO before the text message ──
