@@ -60,6 +60,7 @@ This project turns a LILYGO T-Display-P4 development board into a portable ADS-B
 
 - **WebSerial triggers device reboot** – USB-JTAG auto-reset circuit fires on DTR toggle during port open; handled gracefully (scope reconnects, boot log is parsed). (Since coh4, a closer look: by the build's configuration the console is UART0 behind the board's USB bridge, with USB-Serial-JTAG as output-only secondary, and LilyGO's wiki says the bridge's RTS line can reset the P4 – `docs/UPLINK.md` 9.8. Either way, opening the port resets the device; the web app's speed negotiation and flashing are built around that.)
 - **WiFi requires C6 flash** – ESP-Hosted slave firmware must be flashed to the ESP32-C6 coprocessor manually. WiFi works when configured but is not yet tested end-to-end in the field.
+- **PKI direct messages cannot be decrypted** – the code uses a different cipher than Meshtastic does (Pending Work, item 1); the "PKI DM decryption" bullet above describes code that was never verified against a real device.
 - **Meshy still under heavy development** – PKI DM sending not yet implemented (receive works). Private channel support implemented but still testing. Device does not yet rebroadcast traffic. Operates similar to CLIENT_MUTE role.
 - **coh4 and coh5 have not run on a device** – what they change (per-message cost around the decoder, the aircraft lock, console speed, the web app at v1.0.10) is built, and tested on a PC and against simulated devices only. See **Status**.
 - **Heavy traffic** – in the first field run of coh3 the on-device aircraft list stopped updating at about 300 messages/second while the Scope app carried on. coh4 removes the two likeliest causes; why it happened is not established (`docs/UPLINK.md` 9.7).
@@ -75,8 +76,9 @@ This project turns a LILYGO T-Display-P4 development board into a portable ADS-B
 | coh4 | per-message cost around the decoder cut to an eighth, aircraft lock held for a copy only, console speed negotiated up from 115200, `tools/` | **no** – built, tested on a PC and against a simulated device |
 | coh5 | web app v1.0.10: flashing keeps the settings and works with esptool-js as it is, the log's layout-per-line removed, a meter | **no** – as coh4; the page's flashing is tested with the real esptool-js against an emulated chip, the page itself in a headless Chrome |
 | coh6 | WiFi: reconnects for good, up to five saved networks chosen by priority then signal, WiFi + MQTT indicator in the status bar | **no** – the decisions are tested on a PC with scripted events; nothing that touches the radio has run |
+| coh7 | Meshtastic relay (off by default) and raw log of undecoded packets; home-screen clock no longer overflows with seconds or long month names | **no** – builds; nothing in it has run |
 
-`docs/DECODER.md` and `docs/UPLINK.md` say for each change what was measured, how, and what was not. Branches `r10`, `coh3`, `coh4`, `coh5` and `coh6` stay at those releases; `main` is the latest.
+`docs/DECODER.md` and `docs/UPLINK.md` say for each change what was measured, how, and what was not. Branches `r10` and `coh3` to `coh6` stay at those releases; `main` is the latest.
 
 ## ADS-B Scope
 
@@ -157,6 +159,8 @@ adsb dec [default|soft|fix2]     error correction: 1-bit only, + soft rescue, + 
 adsb coh [on|off]                coherent second look at frames that fail their CRC; no argument: show
 diag [mark]                      everything a field report needs, in one block; mark: restart its checks
 meshy [on|off|status]            Meshtastic radio control
+meshy relay [on|off]             retransmit received packets by the rules of the role (default off)
+meshy undecoded [on|off]         print packets that could not be decoded, header fields and all bytes
 usb [status]                     USB host status
 wifi [on|off|status|list|scan|cycle]      WiFi control and state
 wifi add <name> [pw] | remove <n> | prio <n> <pos> | use <n>   saved networks, in priority order (up to 5)
@@ -651,7 +655,7 @@ cd build && esptool.py --chip esp32p4 merge_bin -o ../release.bin \
 
 This repository is the standalone cut (2026-07-29) of what previously lived as the `adsb` branch on a LilyGo T-Display-P4 fork. All third-party code is vendored at recorded pins – see **VENDOR.md**. Local patches and the SD/WiFi coexistence fence are documented in **PATCHES.md**. The full architecture reference (with a dated correction block) is **docs/ARCHITECTURE.md**. Multi-board plans live under **boards/**.
 
-**History.** `main` starts with the history of that fork's `adsb` branch (up to April 2026), continues with one commit that holds the standalone tree as of decoder-m1090 **r10** – the commits between the cut and r10 are not in this repository – and then the **coh** series commit by commit. Branches `r10`, `coh3`, `coh4`, `coh5` and `coh6` stay at those releases. Commits from r10 to coh4 carry an `Original-commit:` line: the hash they had before this history was put together, which is what firmware built before then reports as its version (`git log --grep 7629907` finds coh4, for one).
+**History.** `main` starts with the history of that fork's `adsb` branch (up to April 2026), continues with one commit that holds the standalone tree as of decoder-m1090 **r10** – the commits between the cut and r10 are not in this repository – and then the **coh** series commit by commit. Branches `r10` and `coh3` to `coh6` stay at those releases. Commits from r10 to coh4 carry an `Original-commit:` line: the hash they had before this history was put together, which is what firmware built before then reports as its version (`git log --grep 7629907` finds coh4, for one).
 
 ```
 main/examples/adsb_receiver/   the application (firmware + webapp + tools)
@@ -675,17 +679,17 @@ VENDOR.md / PATCHES.md         provenance and patch mechanism
 
 ## Pending Work
 
-> Items 1–16 and the struck-through list are as they stood in April 2026 (v1.0.8). Items 3, 4, 12, 13 and 15 were settled on 2026-11-21; the others have **not been re-checked** against the current tree. What has been added since is under "Next" and "Since April 2026" below.
+> Items 1–16 and the struck-through list are as they stood in April 2026 (v1.0.8). Items 3, 4, 12, 13 and 15 were settled on 2026-11-21, items 1, 6, 7 and 9 on 2026-11-27; the others have **not been re-checked** against the current tree. What has been added since is under the headings below.
 
-1. **PKI DM sending** – `buildPkiTx` with recipient pubkey lookup, DM recipient selector in UI
+1. **PKI DM sending** – `buildPkiTx` with recipient pubkey lookup, DM recipient selector in UI. **Blocked (2026-11-27):** the PKI decrypt in `meshtastic_crypto.h` is XChaCha20-Poly1305 with a 16-byte tag; Meshtastic's firmware encrypts these messages with AES-256-CCM, an 8-byte tag and a 4-byte extra nonce appended (`CryptoEngine::encryptCurve25519`). So the receive side cannot have opened a real PKI DM – it was never verified (item 8) – and sending has to start with the right cipher for both directions
 2. **Webapp PKI DM display** – show decrypted DM text in Meshy panel
 3. ~~First WiFi field test~~ – done: WiFi has run on a device (confirmed by John, 2026-11-21)
 4. ~~Flash C6 with ESP-Hosted slave firmware~~ – done on the unit(s) in use – WiFi could not have run otherwise; still a manual step for every new board (Building from Source)
 5. **tz-embedded open source release** – timezone library as standalone repo
-6. **scope_aircraft_t array consolidation** – three separate 64-slot arrays in lvgl_ui.cpp (~10 KB .bss savings)
-7. **Meshy decode-failed packet logging** – log raw bytes for protocol debugging
+6. ~~scope_aircraft_t array consolidation~~ – superseded: the scope's aircraft arrays are two PSRAM allocations of `MAX_SCOPE_AIRCRAFT` entries made at start (`lvgl_ui.cpp`), nothing is left in `.bss` (seen in the code, 2026-11-27)
+7. ~~Meshy decode-failed packet logging~~ – done in coh7: `meshy undecoded on` prints header fields and all bytes of every packet that neither a channel key nor PKI could open (off by default, until the next reboot)
 8. **PKI DM field testing** – verify XChaCha20-Poly1305 with real Meshtastic DMs from other devices
-9. **Meshy rebroadcast** – implement relay behavior for Router/ClientMute roles
+9. ~~Meshy rebroadcast~~ – done in coh7, **off by default** (`meshy relay on`): Client relays after an SNR-weighted wait and yields if it hears the packet again, ClientMute never, RouterLate always and late. Not yet on the air
 10. **Clock sync indicators** – on-device display of GPS-synced vs NTP-synced status
 11. **Multi-chunk recv sessions** – stream chunks without returning to command mode between each; would cut ~10 minutes overhead from 27MB transfers
 12. ~~Webapp retry on RECV_ERR~~ – done: the upload loop in `adsb_scope.htm` retries a failed chunk up to `MAX_RETRIES` times before aborting (seen in the code, 2026-11-21)

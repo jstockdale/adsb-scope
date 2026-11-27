@@ -31,7 +31,7 @@ BUILD="default"         # "default" or "plain"                        (--build)
 BAUD=460800             # try 115200 if the transfer fails            (--baud)
 NVS="keep"              # "keep", or "reset" for a clean install      (--nvs)
 KIT=""                  # unpacked kit folder; empty = look for it    (--kit)
-KIT_NAME="adsb-scope-fw-261118-r10-coh6"   # the folder / tarball looked for
+KIT_NAME="adsb-scope-fw-261118-r10-coh7"   # the folder / tarball looked for
 # -----------------------------------------------------------------------------
 
 adsb_flash_say()  { printf '%s\n' "$*"; }
