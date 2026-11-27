@@ -166,6 +166,7 @@ namespace Lvgl_Ui
                     struct
                     {
                         lv_obj_t *time_label;
+                        lv_obj_t *sec_label;      // ":SS" (and a/p) in the small font when the whole time does not fit in the big one
                         lv_obj_t *month_label;
                         lv_obj_t *week_label;
 
@@ -784,6 +785,7 @@ namespace Lvgl_Ui
         void status_bar_sd_update(void);
 
         void win_home_time_update(void);
+        void home_clock_time_render(void);
 
         void init_status_bar(lv_obj_t *parent);
 

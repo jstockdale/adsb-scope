@@ -897,9 +897,19 @@ namespace Lvgl_Ui
         lv_label_set_text(_registry.win.home.clock.time_label, buffer_time);
         lv_obj_set_style_text_align(_registry.win.home.clock.time_label, LV_TEXT_ALIGN_LEFT, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(_registry.win.home.clock.time_label, &lvgl_font_lineseedkr_rg_120, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
-        lv_obj_set_size(_registry.win.home.clock.time_label, 400, 110);
+        // The width of the page, not 400: "23:59:59" is 486 px in this font and used to wrap
+        // into a second line that the label's height cut off.
+        lv_obj_set_size(_registry.win.home.clock.time_label, _width - 20, 110);
+        lv_label_set_long_mode(_registry.win.home.clock.time_label, LV_LABEL_LONG_CLIP);
         lv_obj_set_style_text_color(_registry.win.home.clock.time_label, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_align_to(_registry.win.home.clock.time_label, tileview_tile_1, LV_ALIGN_TOP_LEFT, 10, 90);
+        // Seconds (and a/p) in the small font, used when the whole time does not fit in the big one
+        _registry.win.home.clock.sec_label = lv_label_create(tileview_tile_1);
+        lv_obj_set_style_text_font(_registry.win.home.clock.sec_label, &lvgl_font_lineseedkr_th_60, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        lv_obj_set_style_text_color(_registry.win.home.clock.sec_label, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        lv_label_set_text(_registry.win.home.clock.sec_label, "");
+        lv_obj_add_flag(_registry.win.home.clock.sec_label, LV_OBJ_FLAG_HIDDEN);
+        home_clock_time_render();
 
         _registry.win.home.clock.month_label = lv_label_create(tileview_tile_1);
 
@@ -951,7 +961,9 @@ namespace Lvgl_Ui
         lv_label_set_text(_registry.win.home.clock.month_label, buffer_month);
         lv_obj_set_style_text_align(_registry.win.home.clock.month_label, LV_TEXT_ALIGN_LEFT, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(_registry.win.home.clock.month_label, &lvgl_font_lineseedkr_th_60, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
-        lv_obj_set_size(_registry.win.home.clock.month_label, 400, 70);
+        // "September 27th" is 440 px: the page's width here too, and no wrapping
+        lv_obj_set_size(_registry.win.home.clock.month_label, _width - 30, 70);
+        lv_label_set_long_mode(_registry.win.home.clock.month_label, LV_LABEL_LONG_CLIP);
         lv_obj_set_style_text_color(_registry.win.home.clock.month_label, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_align_to(_registry.win.home.clock.month_label, _registry.win.home.clock.time_label, LV_ALIGN_OUT_BOTTOM_LEFT, 10, 0);
 
@@ -959,7 +971,8 @@ namespace Lvgl_Ui
         lv_label_set_text(_registry.win.home.clock.week_label, _time.week.c_str());
         lv_obj_set_style_text_align(_registry.win.home.clock.week_label, LV_TEXT_ALIGN_LEFT, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(_registry.win.home.clock.week_label, &lvgl_font_lineseedkr_th_60, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
-        lv_obj_set_size(_registry.win.home.clock.week_label, 400, 50);
+        lv_obj_set_size(_registry.win.home.clock.week_label, _width - 30, 50);
+        lv_label_set_long_mode(_registry.win.home.clock.week_label, LV_LABEL_LONG_CLIP);
         lv_obj_set_style_text_color(_registry.win.home.clock.week_label, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_align_to(_registry.win.home.clock.week_label, _registry.win.home.clock.month_label, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 0);
 
@@ -1233,11 +1246,65 @@ namespace Lvgl_Ui
         }
     }
 
+    // The home screen's time. One label in the 120 px font when the time fits the page's
+    // width in it; when it does not - seconds in 12-hour form, "10:00:00a", is 571 px on a
+    // 540 px screen - hours and minutes stay big and ":SS" with a/p goes next to them in
+    // the 60 px font, on the same baseline. Which of the two is decided by the widest time
+    // the current settings can produce, so the layout does not change with the hour.
+    void System::home_clock_time_render(void)
+    {
+        lv_obj_t *big = _registry.win.home.clock.time_label, *small = _registry.win.home.clock.sec_label;
+        if (!big) return;
+        const lv_font_t *f_big = &lvgl_font_lineseedkr_rg_120, *f_small = &lvgl_font_lineseedkr_th_60;
+        const int avail = _width - 20;
+        char buffer_time[16];
+        bool split = false;
+        if (g_settings.show_seconds && small)
+        {
+            // the widest time these settings can show: every digit the font's widest one
+            char d = '0'; int d_w = 0;
+            for (char c = '0'; c <= '9'; c++)
+            {
+                int w = lv_text_get_width(&c, 1, f_big, 0);
+                if (w > d_w) { d_w = w; d = c; }
+            }
+            char widest[12];
+            if (g_settings.time_24h) snprintf(widest, sizeof(widest), "%c%c:%c%c:%c%c", d, d, d, d, d, d);
+            else                     snprintf(widest, sizeof(widest), "1%c:%c%c:%c%ca", d, d, d, d, d);
+            split = lv_text_get_width(widest, strlen(widest), f_big, 0) > avail;
+        }
+        if (!split)
+        {
+            format_clock_time(_time.hour, _time.minute, buffer_time, sizeof(buffer_time), g_settings.show_seconds ? _time.second : -1);
+            lv_label_set_text(big, buffer_time);
+            if (small) lv_obj_add_flag(small, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
+        char buffer_sec[8];
+        if (g_settings.time_24h)
+        {
+            snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d", _time.hour, _time.minute);
+            snprintf(buffer_sec, sizeof(buffer_sec), ":%02d", _time.second);
+        }
+        else
+        {
+            int h12 = _time.hour % 12;
+            if (h12 == 0) h12 = 12;
+            snprintf(buffer_time, sizeof(buffer_time), "%d:%02d", h12, _time.minute);
+            snprintf(buffer_sec, sizeof(buffer_sec), ":%02d%s", _time.second, _time.hour >= 12 ? "p" : "a");
+        }
+        lv_label_set_text(big, buffer_time);
+        lv_label_set_text(small, buffer_sec);
+        lv_obj_remove_flag(small, LV_OBJ_FLAG_HIDDEN);
+        // right after the big text, baselines level
+        int x = lv_text_get_width(buffer_time, strlen(buffer_time), f_big, 0) + 4;
+        int y = (f_big->line_height - f_big->base_line) - (f_small->line_height - f_small->base_line);
+        lv_obj_align_to(small, big, LV_ALIGN_TOP_LEFT, x, y);
+    }
+
     void System::win_home_time_update(void)
     {
-        char buffer_time[16];
-        format_clock_time(_time.hour, _time.minute, buffer_time, sizeof(buffer_time), g_settings.show_seconds ? _time.second : -1);
-        lv_label_set_text(_registry.win.home.clock.time_label, buffer_time);
+        home_clock_time_render();
 
         std::string month_str = "null";
         switch (_time.month)
